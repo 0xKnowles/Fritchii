@@ -198,7 +198,7 @@ The `release-binaries` workflow uses standard GitHub-hosted runners:
 - `macos-15` produces an Apple Silicon app for macOS 15 or newer. The zip contains `eglantine.app`, including the CLI at `Contents/MacOS/eden-cli`.
 - `windows-2022` produces Windows x86-64 builds, with and without PGO.
 
-Build-input changes pushed to `nx2` or `nx2-experimental` trigger builds and a prerelease. To build another branch, select **Actions > release-binaries > Run workflow** and choose the branch. Clear **Publish the binaries as a GitHub release** to upload artifacts without publishing a release. Workflow artifacts expire after seven days.
+Pull requests targeting `nx2` or `nx2-experimental` trigger builds without publishing a release. Build-input changes pushed to either branch trigger builds and a prerelease. To build another branch, select **Actions > release-binaries > Run workflow** and choose the branch. Clear **Publish the binaries as a GitHub release** to upload artifacts without publishing a release. Manual runs require the workflow to exist on the repository's default branch. Workflow artifacts expire after seven days.
 
 The macOS package bundles Qt, its plugins, MoltenVK, and linked non-system libraries. Packaging checks the extracted archive for ARM64 binaries, bundled dependencies, valid signatures, JIT entitlements, frontend startup, and MoltenVK loading. To package a local macOS build with the same checks:
 
