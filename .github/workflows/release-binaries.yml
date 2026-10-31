@@ -341,7 +341,7 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          cmake --build build/release --target yuzu yuzu-cmd --parallel 2
+          cmake --build build/release --target yuzu yuzu-cmd --parallel 2 -- -k 0
           ccache --show-stats
 
       - name: Package and verify macOS app
@@ -481,6 +481,15 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
+
+      - name: Save macOS compiler cache after failure
+        if: failure() && runner.os == 'macOS'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .ccache
+            .sccache
+          key: objects-${{ matrix.platform }}-${{ github.sha }}
 
   # Publishes every binary as a GitHub pre-release once every platform built: on pushes to nx2
   # and nx2-experimental, and on manual runs unless "Publish the binaries as a GitHub release" is
