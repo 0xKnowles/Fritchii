@@ -50,6 +50,8 @@ jobs:
         include:
           - platform: linux-x86_64
             runner: ubuntu-24.04
+          - platform: macos-arm64
+            runner: macos-15
           # The two -pgo builds are the same programs compiled by clang against Eden's periodically
           # updated profile (https://github.com/Eden-CI/PGO). Windows uses MSYS2's MinGW clang like
           # Eden does; MSVC cannot read an LLVM .profdata file.
@@ -90,6 +92,26 @@ jobs:
           host: linux
           target: desktop
           arch: linux_gcc_64
+          modules: qtcharts
+          cache: true
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          test "$(uname -m)" = arm64
+          brew install autoconf automake boost ccache cmake ffmpeg fmt glslang \
+            libtool libusb lz4 ninja nlohmann-json openssl@3 pkgconf sdl3 \
+            speexdsp zlib zstd
+
+      - name: Install Qt on macOS
+        if: runner.os == 'macOS'
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          host: mac
+          target: desktop
+          arch: clang_64
           modules: qtcharts
           cache: true
 
@@ -181,9 +203,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .cache/cpm
-          key: cpm-${{ runner.os }}-${{ hashFiles('cpmfile.json', 'CMakeLists.txt', 'src/**/CMakeLists.txt') }}
+          key: cpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cpmfile.json', 'CMakeLists.txt', 'src/**/CMakeLists.txt') }}
           restore-keys: |
-            cpm-${{ runner.os }}-
+            cpm-${{ runner.os }}-${{ runner.arch }}-
 
       # The sha in the key makes every run save a fresh cache (actions/cache never saves over an
       # exact hit), and restore-keys seeds it from the newest one of the same platform.
@@ -231,6 +253,30 @@ jobs:
             )
           fi
           cmake -S . -B build/release -G Ninja "${flags[@]}"
+
+      - name: Configure macOS ARM
+        if: runner.os == 'macOS'
+        shell: bash
+        run: >-
+          cmake -S . -B build/release -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_OSX_ARCHITECTURES=arm64
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0
+          -DBUILD_TESTING=OFF
+          -DYUZU_TESTS=OFF
+          -DYUZU_CMD=ON
+          -DYUZU_ROOM=OFF
+          -DYUZU_ROOM_STANDALONE=OFF
+          -DYUZU_USE_BUNDLED_QT=OFF
+          "-DCMAKE_PREFIX_PATH=$QT_ROOT_DIR;$(brew --prefix)"
+          "-DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)"
+          -DYUZU_USE_BUNDLED_SDL3=OFF
+          -DYUZU_USE_BUNDLED_MOLTENVK=ON
+          -DVulkanHeaders_FORCE_BUNDLED=ON
+          -DVulkanUtilityLibraries_FORCE_BUNDLED=ON
+          -DENABLE_UPDATE_CHECKER=OFF
+          -DUSE_DISCORD_PRESENCE=OFF
+          -DUSE_CCACHE=ON
 
       - name: Configure Windows
         if: matrix.platform == 'windows-x86_64'
@@ -281,11 +327,25 @@ jobs:
             "-DCMAKE_CXX_FLAGS=$profile"
 
       - name: Build
-        if: ${{ ! matrix.mingw }}
+        if: ${{ ! matrix.mingw && runner.os != 'macOS' }}
         shell: bash
         run: |
           cmake --build build/release --target yuzu yuzu-cmd --parallel
           if command -v ccache > /dev/null; then ccache --show-stats; else sccache --show-stats; fi
+
+      - name: Build macOS ARM
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          cmake --build build/release --target yuzu yuzu-cmd --parallel 2
+          ccache --show-stats
+
+      - name: Package and verify macOS app
+        if: runner.os == 'macOS'
+        shell: bash
+        run: >-
+          sh tools/macos/package.sh build/release
+          "eglantine-${GITHUB_SHA}-${{ matrix.platform }}.zip"
 
       - name: Build MinGW PGO
         if: matrix.mingw
@@ -408,6 +468,16 @@ jobs:
           compression-level: 0
           retention-days: 7
 
+      - name: Upload macOS binary
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: eglantine-${{ matrix.platform }}-${{ github.sha }}
+          path: eglantine-${{ github.sha }}-${{ matrix.platform }}.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
   # Publishes every binary as a GitHub pre-release once every platform built: on pushes to nx2
   # and nx2-experimental, and on manual runs unless "Publish the binaries as a GitHub release" is
   # unticked.
@@ -434,6 +504,8 @@ jobs:
             name=$(basename "$artifact")
             if compgen -G "$artifact*.AppImage" > /dev/null; then
               cp "$artifact"/*.AppImage dist/
+            elif compgen -G "$artifact*.zip" > /dev/null; then
+              cp "$artifact"/*.zip dist/
             else
               (cd "$artifact" && zip -qr "${GITHUB_WORKSPACE}/dist/${name}.zip" .)
             fi
@@ -454,4 +526,5 @@ jobs:
 
           Windows: extract the zip and run eglantine.exe, or eden-cli.exe from a terminal.
           Linux: make the AppImage executable (chmod +x) and run it; it bundles its libraries and needs glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, Debian 13, Arch).
+          macOS: Apple Silicon and macOS 15 or newer. Extract the zip and move eglantine.app to Applications. The CLI is inside eglantine.app/Contents/MacOS/eden-cli. The app bundles Qt and MoltenVK and is ad-hoc signed, not notarized; macOS may require approval in Privacy & Security. macOS support remains experimental and uses the JIT, not NCE.
           The -pgo builds are the same programs compiled with profile-guided optimization (clang plus Eden's profile); prefer them when your CPU supports it. The Windows PGO build is a MinGW build, so it carries its own DLLs and needs no Visual C++ redistributable."

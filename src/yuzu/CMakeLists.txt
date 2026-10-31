@@ -368,17 +368,17 @@ if (APPLE)
     # Xcode will automatically generate the Assets.car and icns file for us.
     set(_dist "${CMAKE_SOURCE_DIR}/dist")
     if (CMAKE_GENERATOR MATCHES "Xcode")
-        set(_icons "${_dist}/eglantine.icon")
+        set(_icons "${_dist}/eden.icon")
 
-        set_target_properties(eden PROPERTIES
-            XCODE_ATTRIBUTE_ASSETCATALOG_COMPILER_APPICON_NAME eglantine
-            MACOSX_BUNDLE_ICON_FILE eglantine
+        set_target_properties(yuzu PROPERTIES
+            XCODE_ATTRIBUTE_ASSETCATALOG_COMPILER_APPICON_NAME eden
+            MACOSX_BUNDLE_ICON_FILE eden
             # Also force xcode to manage signing for us.
             XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED ON
             XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED ON)
     # Otherwise, we'll use our own.
     else()
-        set(_icons "${_dist}/eglantine.icns" "${_dist}/Assets.car")
+        set(_icons "${_dist}/eden.icns" "${_dist}/Assets.car")
     endif()
 
     set_source_files_properties(${_icons} PROPERTIES
