@@ -114,6 +114,10 @@ static void ParseSwitchFile(const std::filesystem::path& path,
 
 static void LoadNx2Switches(const char* argv0) {
     std::map<std::string, std::string> switches;
+#ifdef __APPLE__
+    ParseSwitchFile(Common::FS::GetBundleDirectory() / "Contents/Resources/nx2_switches.txt",
+                    switches);
+#endif
     std::error_code ec;
     const std::filesystem::path exe = std::filesystem::absolute(argv0, ec);
     if (!ec) {

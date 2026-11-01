@@ -321,9 +321,19 @@ public:
         return features.features.sparseBinding && graphics_family_sparse_binding;
     }
 
-    /// 2D images whose memory can be bound in parts, on the graphics queue.
-    bool IsSparseResidencyImage2DSupported() const {
-        return IsSparseBindingSupported() && features.features.sparseResidencyImage2D;
+    /// Images whose memory can be bound in parts, on the graphics queue.
+    bool IsSparseResidencyImageSupported(VkImageType type) const {
+        if (!IsSparseBindingSupported()) {
+            return false;
+        }
+        switch (type) {
+        case VK_IMAGE_TYPE_2D:
+            return features.features.sparseResidencyImage2D;
+        case VK_IMAGE_TYPE_3D:
+            return features.features.sparseResidencyImage3D;
+        default:
+            return false;
+        }
     }
 
     /// Returns true for tile-based deferred renderers.
