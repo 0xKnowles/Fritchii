@@ -28,7 +28,25 @@ It's written in C++ with portability in mind, with builds for Windows, Linux and
   
 </p>
 
+> [!NOTE]
+> **This is an unofficial fork of Eglantine maintained by Zortos.** It carries fixes that are not in the upstream [Eglantine](https://github.com/Djihads80/Eglantine) repository. Please report problems with this build here, not to the upstream developers.
+
+## About this fork
+
+My priority is getting every game to boot and run. Performance comes second.
+
+Changes in this fork compared to upstream:
+
+- **Memory leak fixed.** Memory use stays around 4-5 GB instead of climbing past 20 GB.
+- **More games boot**, including Welcome Tour.
+- **Games run at normal speed.** The slowdown is gone.
+- **Big performance boost.** Most games run at 60 FPS.
+- **Texture fixes** in several games.
+- **Color fix** for the HDR setting in docked mode.
+- **Graphics fixes.** Video codec fixes are coming soon.
+
 <p align="center">
+  <a href="#about-this-fork">About this fork</a> |
   <a href="#compatibility">Compatibility</a> |
   <a href="#development">Development</a> |
   <a href="#building">Building</a> |
@@ -60,7 +78,9 @@ For information on provided development tooling, see the [Tools directory](./too
 
 ## Download
 
-You can download the latest releases from [here](https://github.com/Djihads80/Eglantine/releases).
+Builds of this fork are on the [releases page](https://github.com/zortos293/eglantine/releases).
+
+Official upstream releases are [here](https://github.com/Djihads80/Eglantine/releases).
 
 ## Support
 
