@@ -41,6 +41,8 @@ struct LoweredNativeCode {
     /// Constant buffer holding the texture handles if the program requires one, otherwise ~0U
     /// (the engine's register value is used).
     u32 texture_bound = ~0U;
+    /// Constant buffer for surface descriptors, when the program needs another than texture_bound.
+    u32 surface_bound = ~0U;
 };
 
 class GenericEnvironment : public Shader::Environment {
@@ -52,6 +54,8 @@ public:
     ~GenericEnvironment() override;
 
     [[nodiscard]] u32 TextureBoundBuffer() const final;
+
+    [[nodiscard]] u32 SurfaceBoundBuffer() const final;
 
     [[nodiscard]] u32 LocalMemorySize() const final;
 
@@ -117,6 +121,7 @@ protected:
 
     u32 local_memory_size{};
     u32 texture_bound{};
+    u32 surface_bound = ~0U; ///< ~0U: unset, surfaces use texture_bound
     u32 shared_memory_size{};
     std::array<u32, 3> workgroup_size{};
 
@@ -261,6 +266,8 @@ public:
 
     [[nodiscard]] u32 TextureBoundBuffer() const override;
 
+    [[nodiscard]] u32 SurfaceBoundBuffer() const override;
+
     [[nodiscard]] std::array<u32, 3> WorkgroupSize() const override;
 
     [[nodiscard]] std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32 bank,
@@ -282,6 +289,7 @@ private:
     u32 local_memory_size{};
     u32 shared_memory_size{};
     u32 texture_bound{};
+    u32 surface_bound = ~0U; ///< ~0U: unset, surfaces use texture_bound
     u32 read_lowest{};
     u32 read_highest{};
     u32 initial_offset{};
