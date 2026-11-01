@@ -15,6 +15,8 @@
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "core/core.h"
+#include "core/device_memory.h"
+#include "core/memory.h"
 #include "core/hle/service/nvdrv/core/container.h"
 #include "core/hle/service/nvdrv/core/heap_mapper.h"
 #include "core/hle/service/nvdrv/core/nvmap.h"
@@ -172,10 +174,18 @@ void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
     Nx2GpuMemoryRegistry::Get().RecordDeviceRange(cpu_address, size, device_address);
     static const bool trace_native_image = std::getenv("EDEN_NX2_IMAGE_TRACE") != nullptr;
     static u32 traced_maps{};
-    if (trace_native_image && size >= 0x100000 && traced_maps++ < 1024) {
+    if (trace_native_image && traced_maps++ < 4096) {
+        auto& smmu = system.Host1x().MemoryManager();
+        const auto* device_pointer = smmu.GetPointer<u8>(device_address);
+        const auto* cpu_pointer = system.ApplicationMemory().GetPointerSilent(cpu_address);
         LOG_INFO(Service_NVDRV, "Native address-space map: owner={} session={} gpu={:#x} "
-                 "cpu={:#x} device={:#x} size={:#x} heap={}", fmt::ptr(this), nx2_session.id,
-                 gpu_address, cpu_address, device_address, size, heap);
+                 "cpu={:#x} device={:#x} size={:#x} heap={} reused={} device_physical={:#x} "
+                 "cpu_physical={:#x} same_backing={}", fmt::ptr(this), nx2_session.id,
+                 gpu_address, cpu_address, device_address, size, heap,
+                 backing != nx2_device_ranges.end(),
+                 device_pointer ? system.DeviceMemory().GetRawPhysicalAddr(device_pointer) : 0,
+                 cpu_pointer ? system.DeviceMemory().GetRawPhysicalAddr(cpu_pointer) : 0,
+                 device_pointer != nullptr && device_pointer == cpu_pointer);
     }
     nx2_gpu_views.Map(gpu_address, cpu_address, size);
     system.GPU().RunInOrder([gmmu = gmmu.get(), gpu_address, device_address, size] {

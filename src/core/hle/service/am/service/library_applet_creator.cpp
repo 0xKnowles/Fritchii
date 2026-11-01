@@ -24,18 +24,6 @@ namespace Service::AM {
 
 namespace {
 
-// Switch 2 titles ask for the Switch 1 applets by new ids.
-AppletId FromNx2AppletId(AppletId applet_id) {
-    switch (applet_id) {
-    case AppletId::SoftwareKeyboardNx2:
-        return AppletId::SoftwareKeyboard;
-    case AppletId::ControllerNx2:
-        return AppletId::Controller;
-    default:
-        return applet_id;
-    }
-}
-
 bool ShouldCreateGuestApplet(AppletId applet_id) {
 #define X(Name, name)                                                                              \
     if (applet_id == AppletId::Name &&                                                             \
@@ -109,6 +97,15 @@ AppletProgramId AppletIdToProgramId(AppletId applet_id) {
     default:
         return static_cast<AppletProgramId>(0);
     }
+}
+
+AppletId FromNx2AppletId(AppletId applet_id) {
+    if (AppletIdToProgramId(applet_id) != static_cast<AppletProgramId>(0)) {
+        return applet_id;
+    }
+    const auto low_byte = static_cast<AppletId>(static_cast<u32>(applet_id) & 0xFF);
+    return AppletIdToProgramId(low_byte) != static_cast<AppletProgramId>(0) ? low_byte
+                                                                         : applet_id;
 }
 
 std::shared_ptr<ILibraryAppletAccessor> CreateGuestApplet(Core::System& system,

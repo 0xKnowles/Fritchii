@@ -92,3 +92,56 @@ TEST_CASE("ReadTraps: mapping changes invalidate cached read areas without armed
     traps.Clear();
     REQUIRE(traps.Generation() > before_clear);
 }
+
+TEST_CASE("ReadTraps: out-of-order read completions preserve later GPU writes",
+          "[core][read_traps][mkw_sync]") {
+    ReadTraps traps;
+    traps.Arm(10, traps.NewGeneration());
+    const u64 first_read = traps.Generation();
+    traps.Arm(10, traps.NewGeneration());
+    const u64 second_read = traps.Generation();
+    traps.Arm(11, traps.NewGeneration());
+
+    REQUIRE(Disarmed(traps, 10, 12, second_read) == std::vector<u64>{10});
+    REQUIRE(Armed(traps) == std::vector<u64>{11});
+    traps.Arm(10, traps.NewGeneration());
+    REQUIRE(Disarmed(traps, 10, 12, first_read).empty());
+    REQUIRE(Armed(traps) == std::vector<u64>{10, 11});
+    REQUIRE(Disarmed(traps, 10, 12, traps.Generation()) == std::vector<u64>{10, 11});
+    REQUIRE(traps.Empty());
+}
+
+TEST_CASE("ReadTraps: old completion cannot disarm a reused mapping",
+          "[core][read_traps][mkw_sync]") {
+    ReadTraps traps;
+    traps.Arm(10, traps.NewGeneration());
+    const u64 old_read = traps.Generation();
+    SECTION("one mapping is retired") {
+        traps.Drop(10, 11);
+    }
+    SECTION("the session is reset") {
+        traps.Clear();
+    }
+    REQUIRE(traps.Empty());
+    traps.Arm(10, traps.NewGeneration());
+    REQUIRE(Disarmed(traps, 10, 11, old_read).empty());
+    REQUIRE(Armed(traps) == std::vector<u64>{10});
+    REQUIRE(Disarmed(traps, 10, 11, traps.Generation()) == std::vector<u64>{10});
+    REQUIRE(traps.Empty());
+}
+
+TEST_CASE("ReadTraps: completing part of a batch does not consume other pages",
+          "[core][read_traps][mkw_sync]") {
+    ReadTraps traps;
+    const u64 first_write = traps.NewGeneration();
+    for (const u64 page : {9, 10, 11, 12}) {
+        traps.Arm(page, first_write);
+    }
+    const u64 read = traps.Generation();
+    traps.Arm(11, traps.NewGeneration());
+    REQUIRE(Disarmed(traps, 10, 12, read) == std::vector<u64>{10});
+    REQUIRE(Armed(traps) == std::vector<u64>{9, 11, 12});
+    REQUIRE(Disarmed(traps, 10, 12, traps.Generation()) == std::vector<u64>{11});
+    REQUIRE(Armed(traps) == std::vector<u64>{9, 12});
+    REQUIRE_FALSE(traps.Empty());
+}

@@ -74,6 +74,26 @@ inline void Nx2ClearGpuWrittenPages() {
     return (g_nx2_gpu_written_pages[page / 64].load(std::memory_order_relaxed) >> (page % 64)) & 1;
 }
 
+template <typename Translate>
+[[nodiscard]] bool Nx2HasGpuWrittenPage(GPUVAddr address, size_t size, Translate&& translate) {
+    if (size == 0) {
+        return false;
+    }
+    const GPUVAddr last = address + size - 1;
+    if (last < address) {
+        return true;
+    }
+    constexpr GPUVAddr mask = (GPUVAddr{1} << Nx2WrittenPageBits) - 1;
+    for (GPUVAddr page = address & ~mask;; page += mask + 1) {
+        if (const auto device = translate(page); device && Nx2IsGpuWritten(*device)) {
+            return true;
+        }
+        if (page == (last & ~mask)) {
+            return false;
+        }
+    }
+}
+
 // NVN2 queues release their progress values into the second page of a two-page GPU-accessible
 // region and GPU acquires read the same offsets in the first page (the CPU polls the second).
 // Something on the console copies one into the other; until that is known, the puller mirrors

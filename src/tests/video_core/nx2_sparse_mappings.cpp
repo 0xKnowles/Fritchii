@@ -56,6 +56,55 @@ struct CleanRegistry {
 
 } // Anonymous namespace
 
+TEST_CASE("Nx2 destroyed memory retires its backing before the CPU address is registered again",
+          "[nx2_mapping]") {
+    CleanRegistry clean;
+    auto& registry = Nx2GpuMemoryRegistry::Get();
+    std::vector<Event> events;
+    Recorder recorder{events};
+
+    registry.Register(0x1200000, 0x3000);
+    registry.RecordDeviceRange(0x1200000, 0x3000, 0x8000000);
+    events.clear();
+    registry.Unregister(0x1200000, 0x3000);
+    CHECK(events == std::vector<Event>{{'u', 0x1200000, 0, 0x3000},
+                                       {'r', 0, 0x1200000, 0x3000}});
+    CHECK_FALSE(registry.DeviceAddressOf(0x1200000));
+
+    events.clear();
+    registry.Register(0x1200000, 0x1000);
+    CHECK(events == std::vector<Event>{{'m', 0x1200000, 0x1200000, 0x1000}});
+    registry.RecordDeviceRange(0x1200000, 0x1000, 0x9000000);
+    CHECK(registry.DeviceAddressOf(0x1200000) == u64{0x9000000});
+}
+
+TEST_CASE("Nx2 destroyed memory retains backing until its last GPU alias and image lease retire",
+          "[nx2_mapping]") {
+    CleanRegistry clean;
+    auto& registry = Nx2GpuMemoryRegistry::Get();
+    std::vector<Event> events;
+    Recorder recorder{events};
+
+    registry.Register(0x1300000, 0x3000);
+    registry.MapAt(0x1400000, 0x1301000, 0x1000);
+    const auto lease = registry.AcquireNative(0x1302000, 0x1000);
+    REQUIRE(lease);
+    registry.RecordDeviceRange(0x1300000, 0x3000, 0xa000000);
+    events.clear();
+    registry.Unregister(0x1300000, 0x3000);
+    CHECK(events == std::vector<Event>{{'u', 0x1300000, 0, 0x2000}});
+    CHECK(registry.DeviceAddressOf(0x1300000) == u64{0xa000000});
+
+    events.clear();
+    registry.Unmap(0x1400000, 0x1000);
+    CHECK(events == std::vector<Event>{{'u', 0x1400000, 0, 0x1000}});
+    events.clear();
+    registry.ReleaseNative(*lease);
+    CHECK(events == std::vector<Event>{{'u', 0x1302000, 0, 0x1000},
+                                       {'r', 0, 0x1300000, 0x3000}});
+    CHECK_FALSE(registry.DeviceAddressOf(0x1300000));
+}
+
 TEST_CASE("Nx2 sparse reservations sit under explicit overlays", "[nx2_mapping]") {
     CleanRegistry clean;
     auto& registry = Nx2GpuMemoryRegistry::Get();

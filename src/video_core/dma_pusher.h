@@ -259,7 +259,7 @@ public:
     const bool ib_enable : 1 = true; ///< IB mode enabled
     bool dma_increment_once : 1 = false;
     bool signal_sync : 1 = false;
-    bool synced : 1 = false;
+    bool synced = false;
 };
 
 } // namespace Tegra

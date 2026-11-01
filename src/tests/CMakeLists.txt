@@ -21,6 +21,8 @@ add_executable(tests
     core/address_space.cpp
     core/page_heap.cpp
     core/read_traps.cpp
+    core/nx2_readback_cache.cpp
+    core/nx2_core_readback_capacity.cpp
     core/nso.cpp
     core/nrr.cpp
     core/ncz_decompressor.cpp
@@ -35,6 +37,7 @@ add_executable(tests
     video_core/nx2_sparse_mappings.cpp
     video_core/nx2_sparse_region.cpp
     video_core/nx2_command_sync.cpp
+    video_core/nx2_command_ranges.cpp
     video_core/physical_alias.cpp
     video_core/ampere_returns.cpp
     video_core/ampere_f2i.cpp
@@ -45,6 +48,7 @@ add_executable(tests
     video_core/ampere_geometry_exit.cpp
     video_core/ampere_uniform_lea.cpp
     video_core/ampere_bindless_tex.cpp
+    video_core/ampere_sured.cpp
     video_core/ampere_release_guards.cpp
     video_core/ampere_release_f2i.cpp
     input_common/calibration_configuration_job.cpp

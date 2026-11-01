@@ -46,8 +46,8 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
       shader_hash{shader_hash_}, spv_module(std::move(spv_module_)) {
     const u32 storage_buffers = Shader::NumDescriptors(info.storage_buffers_descriptors);
     const u32 storage_buffer_limit =
-        std::min(device.GetMaxPerStageDescriptorStorageBuffers(),
-                 device.GetMaxDescriptorSetStorageBuffers());
+        (std::min)(device.GetMaxPerStageDescriptorStorageBuffers(),
+                   device.GetMaxDescriptorSetStorageBuffers());
     if (storage_buffers > storage_buffer_limit) {
         throw Shader::NotImplementedException(
             "Compute shader {:016X} needs {} storage buffers, device supports {}",

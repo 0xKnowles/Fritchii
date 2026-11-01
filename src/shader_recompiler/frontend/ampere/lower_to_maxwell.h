@@ -1003,6 +1003,21 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code, bool geo
                 (u64{1} << 48));
             break;
         }
+        case 0x59f: {
+            const u32 binding = insn.Bits(54, 5), offset = insn.Bits(40, 14);
+            const u32 coordinate = insn.Bits(24, 8), data = insn.Bits(32, 8);
+            const u32 first_reserved = uses_uniform_bank ? 216U : 246U;
+            if (insn.words[2] != 0x0010e000 || insn.Bits(61, 3) != 3 ||
+                insn.Bits(59, 2) || binding >= 18 || offset > 0x1fff ||
+                coordinate >= first_reserved - 1 || (data >= first_reserved && data != 255))
+                return fail(index, "native surface reduction mode");
+            if (result.required_texture_buffer != ~0U && result.required_texture_buffer != binding)
+                return fail(index, "native surface descriptor buffer conflict");
+            result.required_texture_buffer = binding;
+            emit(0xeb40000000000000ULL | predicate | data | (u64{coordinate} << 8) |
+                 (u64{3} << 33) | (u64{offset} << 36) | (u64{1} << 51));
+            break;
+        }
         case 0xb97: { // SULD.P.2D/2D_ARRAY.IGN, direct descriptor, channel mask at 72-75.
             const u32 binding = insn.Bits(54, 5), offset = insn.Bits(40, 14);
             const u32 coordinate = insn.Bits(24, 8);

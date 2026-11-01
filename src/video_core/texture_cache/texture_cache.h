@@ -32,9 +32,15 @@
 #include "video_core/texture_cache/util.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/cache_tracking_diagnostics.h"
 #include "video_core/textures/decoders.h"
 
 namespace VideoCommon {
+
+inline bool NativeDrawDiagnostics() {
+    static const bool enabled = std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS") != nullptr;
+    return enabled;
+}
 
 using Tegra::Texture::TICEntry;
 using Tegra::Texture::TSCEntry;
@@ -810,6 +816,93 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
     std::ranges::sort(images, [this](ImageId lhs, ImageId rhs) {
         return slot_images[lhs].modification_tick < slot_images[rhs].modification_tick;
     });
+    if (gpu_memory->UsesNativeTiling()) {
+        const bool accurate = Settings::IsGPULevelHigh();
+        static std::array<u32, 2> reports{};
+        for (const ImageId image_id : images) {
+            if (reports[accurate] >= 64) {
+                break;
+            }
+            ++reports[accurate];
+            const Image& image = slot_images[image_id];
+            u32 newer_unselected_gpu_overlaps = 0;
+            u32 cpu_modified_overlaps = 0;
+            ForEachImageInRegion(image.cpu_addr, image.guest_size_bytes,
+                                 [&](ImageId other_id, ImageBase& other) {
+                if (other_id == image_id) {
+                    return;
+                }
+                cpu_modified_overlaps += True(other.flags & ImageFlagBits::CpuModified);
+                if (other.modification_tick > image.modification_tick &&
+                    True(other.flags & ImageFlagBits::GpuModified) &&
+                    std::ranges::find(images, other_id) == images.end()) {
+                    ++newer_unselected_gpu_overlaps;
+                }
+            });
+            const auto mapped_first = gpu_memory->GpuToCpuAddress(image.gpu_addr);
+            LOG_INFO(Render_Vulkan,
+                     "Native texture readback: accurate={}, report={}, request={:#x}+{}, gpu={:#x}, "
+                     "cpu={:#x}, mapped_first={:#x}, bytes={}, flags={:#x}, tick={}, type={}, format={}, "
+                     "dimensions={}x{}x{}, levels={}, layers={}, spacing={}, layer_stride={}, "
+                     "newer_unselected_gpu_overlaps={}, cpu_modified_overlaps={}",
+                     accurate, reports[accurate], cpu_addr, size, image.gpu_addr, image.cpu_addr,
+                     mapped_first.value_or(0), image.guest_size_bytes,
+                     static_cast<u32>(image.flags), image.modification_tick,
+                     static_cast<u32>(image.info.type), static_cast<u32>(image.info.format),
+                     image.info.size.width, image.info.size.height, image.info.size.depth,
+                     image.info.resources.levels, image.info.resources.layers,
+                     image.info.tile_width_spacing, image.info.layer_stride,
+                     newer_unselected_gpu_overlaps, cpu_modified_overlaps);
+        }
+    }
+    static const bool batch_downloads = [] {
+        const char* value = std::getenv("EDEN_NX2_TEXTURE_DOWNLOAD_BATCH");
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
+    }();
+    if (batch_downloads && gpu_memory->UsesNativeTiling()) {
+        constexpr size_t MaxBatchBytes = 64_MiB;
+        for (size_t first = 0; first < images.size();) {
+            size_t last = first;
+            size_t batch_bytes = 0;
+            while (last < images.size()) {
+                const size_t bytes =
+                    Common::AlignUp(slot_images[images[last]].unswizzled_size_bytes, 64);
+                if (last != first && bytes > MaxBatchBytes - batch_bytes) {
+                    break;
+                }
+                batch_bytes += bytes;
+                ++last;
+                if (batch_bytes >= MaxBatchBytes) {
+                    break;
+                }
+            }
+            static u32 batch_reports{};
+            if (batch_reports < 8) {
+                ++batch_reports;
+                LOG_INFO(Render_Vulkan, "Experimental texture readback batch: images={}, bytes={}",
+                         last - first, batch_bytes);
+            }
+            auto map = runtime.DownloadStagingBuffer(batch_bytes);
+            for (size_t i = first; i < last; ++i) {
+                Image& image = slot_images[images[i]];
+                const auto copies = FullDownloadCopies(image.info);
+                image.DownloadMemory(map, copies);
+                map.offset += Common::AlignUp(image.unswizzled_size_bytes, 64);
+            }
+            runtime.Finish();
+            size_t offset = 0;
+            for (size_t i = first; i < last; ++i) {
+                Image& image = slot_images[images[i]];
+                const auto copies = FullDownloadCopies(image.info);
+                SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies,
+                             map.mapped_span.subspan(offset, image.unswizzled_size_bytes),
+                             swizzle_data_buffer);
+                offset += Common::AlignUp(image.unswizzled_size_bytes, 64);
+            }
+            first = last;
+        }
+        return;
+    }
     for (const ImageId image_id : images) {
         Image& image = slot_images[image_id];
         auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
@@ -826,6 +919,14 @@ std::optional<VideoCore::RasterizerDownloadArea> TextureCache<P>::GetFlushArea(D
                                                                                u64 size) {
     std::optional<VideoCore::RasterizerDownloadArea> area{};
     ForEachImageInRegion(cpu_addr, size, [&](ImageId, ImageBase& image) {
+        if (True(image.flags & ImageFlagBits::Tracked)) {
+            CacheTrackingDiagnostics::Record(CacheTrackingDiagnostics::Event::TextureTrackedRead,
+                                              cpu_addr, size, image.cpu_addr, image.guest_size_bytes);
+            if (!image.partial_dirty_pages.empty() || !image.partial_remapped.empty()) {
+                CacheTrackingDiagnostics::Record(CacheTrackingDiagnostics::Event::TexturePartialRead,
+                                                  cpu_addr, size, image.cpu_addr, image.guest_size_bytes);
+            }
+        }
         if (False(image.flags & ImageFlagBits::GpuModified)) {
             return;
         }
@@ -1043,7 +1144,7 @@ std::pair<typename P::ImageView*, bool> TextureCache<P>::TryFindFramebufferImage
             }
             if (!VideoCore::Surface::IsViewCompatible(image.info.format, view_format, false, true)) {
                 static u32 rejected_alias_count{};
-                if (std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS") && rejected_alias_count++ < 8) {
+                if (NativeDrawDiagnostics() && rejected_alias_count++ < 8) {
                     LOG_WARNING(HW_GPU, "Ignoring incompatible framebuffer alias: address={:#x}, image={}, view={}",
                                 cpu_addr, image.info.format, view_format);
                 }
@@ -1163,7 +1264,7 @@ void TextureCache<P>::CommitAsyncFlushes() {
         }
 
         if (any_none_dma) {
-            if (std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS") && total_size_bytes >= 64_MiB) {
+            if (NativeDrawDiagnostics() && total_size_bytes >= 64_MiB) {
                 LOG_WARNING(HW_GPU, "Large image readback batch: bytes={}, entries={}, duplicates_removed={}, submitted_batches={}, retained_buffers={}",
                             total_size_bytes, download_ids.size(), redundant_images,
                             committed_downloads.size(), async_buffers_death_ring.size());
@@ -1683,7 +1784,7 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
 template <class P>
 ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config) {
     const bool native = gpu_memory->UsesNativeTiling();
-    if (native && raw_config.BaseLayer() && std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS")) {
+    if (native && raw_config.BaseLayer() && NativeDrawDiagnostics()) {
         static u32 texture_view_traces{};
         if (texture_view_traces++ < 8) {
             LOG_WARNING(HW_GPU, "Native texture view header: address={:#x}, dimensions={}x{}x{}, type={}, legacy_layer={}, raw={:016x}/{:016x}/{:016x}/{:016x}",
@@ -2980,6 +3081,8 @@ bool TextureCache<P>::MarkPartialWrite(ImageBase& image, DAddr cpu_addr, size_t 
         device_memory.UpdatePagesCachedCount((base_page + page) << Core::DEVICE_PAGEBITS,
                                              Core::DEVICE_PAGESIZE, -1);
     }
+    CacheTrackingDiagnostics::Record(CacheTrackingDiagnostics::Event::TexturePartialWrite,
+                                      cpu_addr, size, image.cpu_addr, image.guest_size_bytes);
     image.flags |= ImageFlagBits::CpuModified;
     if (pages.size() > total_pages / 4) {
         // Most of the image changed: untrack it whole and upload it whole.

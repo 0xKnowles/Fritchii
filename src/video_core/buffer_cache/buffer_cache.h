@@ -19,6 +19,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/cache_tracking_diagnostics.h"
 #include "video_core/texture_cache/util.h"
 
 namespace VideoCommon {
@@ -167,6 +168,8 @@ void BufferCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size
 
 template <class P>
 void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size) {
+    CacheTrackingDiagnostics::Record(CacheTrackingDiagnostics::Event::BufferCpuMark,
+                                      device_addr, size);
     if (IsRegionGpuModified(device_addr, size)) {
         ClearDownload(device_addr, size);
         gpu_modified_ranges.Subtract(device_addr, size);
@@ -190,6 +193,8 @@ void BufferCache<P>::CachedWriteMemory(DAddr device_addr, u64 size) {
     tmp_buffer.resize_destructive(size);
     device_memory.ReadBlockUnsafe(device_addr, tmp_buffer.data(), size);
 
+    CacheTrackingDiagnostics::Record(CacheTrackingDiagnostics::Event::BufferInlineRetain,
+                                      device_addr, size, aligned_start, aligned_end - aligned_start);
     InlineMemoryImplementation(device_addr, size, tmp_buffer);
 }
 
@@ -765,6 +770,12 @@ void BufferCache<P>::PopAsyncBuffers() {
                                            end - start);
         });
         async_downloads.Subtract(device_addr, copy.size, [&](DAddr start, DAddr end) {
+            if (uncommitted_gpu_modified_ranges.Intersects(start, end - start) ||
+                std::ranges::any_of(committed_gpu_modified_ranges, [&](const auto& ranges) {
+                    return ranges.Intersects(start, end - start);
+                })) {
+                return;
+            }
             gpu_modified_ranges.Subtract(start, end - start);
         });
     }
@@ -1056,6 +1067,11 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         channel_state->fast_bound_uniform_buffers[stage] |= 1u << binding_index;
         channel_state->uniform_buffer_binding_sizes[stage][binding_index] = size;
         // Stream buffer path to avoid stalling on non-Nvidia drivers or Vulkan
+        if constexpr (!IS_OPENGL) {
+            if (runtime.BindSmallUniformReusing(device_memory, stage, index, device_addr, size)) {
+                return;
+            }
+        }
         const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
         device_memory.ReadBlockUnsafe(device_addr, span.data(), size);
         return;
@@ -1144,9 +1160,7 @@ bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_writt
             const MultiRangeSegment& segment = pool[binding.segment_first + index];
             Buffer& buffer = slot_buffers[segment.buffer_id];
             TouchBuffer(buffer, segment.buffer_id);
-            if (SynchronizeBuffer(buffer, segment.device_addr, segment.size)) {
-                runtime.InvalidateMultiRange(key);
-            }
+            SynchronizeBuffer(buffer, segment.device_addr, segment.size);
             const u32 offset = buffer.Offset(segment.device_addr);
             buffer.MarkUsage(offset, segment.size);
             if (is_written) {
@@ -1154,6 +1168,7 @@ bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_writt
             }
             runtime.PushMultiRangeSource(buffer, offset, segment.size);
         }
+        runtime.InvalidateMultiRange(key);
         return runtime.BindMultiRangeStorageBuffer(key, is_written);
     } else {
         return false;

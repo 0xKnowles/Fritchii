@@ -13,8 +13,8 @@ namespace VideoCommon {
 
 template <typename Translate>
 bool IsSamePhysicalRange(DAddr left, DAddr right, u64 size, Translate&& translate) {
-    if (size == 0 || size > std::numeric_limits<u64>::max() - left ||
-        size > std::numeric_limits<u64>::max() - right ||
+    if (size == 0 || size > (std::numeric_limits<u64>::max)() - left ||
+        size > (std::numeric_limits<u64>::max)() - right ||
         (left & Core::DEVICE_PAGEMASK) != (right & Core::DEVICE_PAGEMASK)) {
         return false;
     }

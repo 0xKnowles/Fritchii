@@ -520,6 +520,7 @@ void KeplerCompute::CallMultiMethod(Core::System& system, u32 method, const u32*
 
 bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& qmd) {
     launch_description = {};
+    launch_description.linked_tsc.Assign((qmd[11] >> 30) & 1);
     launch_description.grid_dim_x.Assign(qmd[12]);
     launch_description.grid_dim_y.Assign(qmd[13] & 0xffff);
     launch_description.grid_dim_z.Assign(qmd[14] & 0xffff);

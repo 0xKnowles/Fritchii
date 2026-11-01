@@ -466,13 +466,13 @@ std::optional<HostLoc> RegAlloc::ValueLocation(const IR::Inst* value) const noex
 }
 
 void RegAlloc::DefineValueImpl(BlockOfCode& code, IR::Inst* def_inst, HostLoc host_loc) noexcept {
-    ASSERT(!ValueLocation(def_inst) && "def_inst has already been defined");
+    DEBUG_ASSERT(!ValueLocation(def_inst) && "def_inst has already been defined");
     LocInfo(host_loc).AddValue(host_loc, def_inst);
-    ASSERT(*ValueLocation(def_inst) == host_loc);
+    DEBUG_ASSERT(*ValueLocation(def_inst) == host_loc);
 }
 
 void RegAlloc::DefineValueImpl(BlockOfCode& code, IR::Inst* def_inst, const IR::Value& use_inst) noexcept {
-    ASSERT(!ValueLocation(def_inst) && "def_inst has already been defined");
+    DEBUG_ASSERT(!ValueLocation(def_inst) && "def_inst has already been defined");
     if (use_inst.IsImmediate()) {
         const HostLoc location = ScratchImpl(code, gpr_order);
         DefineValueImpl(code, def_inst, location);

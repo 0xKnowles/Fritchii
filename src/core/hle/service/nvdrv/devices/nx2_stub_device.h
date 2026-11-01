@@ -58,6 +58,15 @@ public:
         MapAt(address, address, size);
     }
 
+    void Unregister(u64 address, u64 size) {
+        std::scoped_lock lk{mutex};
+        if (!Nx2GpuMappingTable::Valid(address, size)) {
+            return;
+        }
+        pending_releases.try_emplace(std::pair{address, size});
+        Apply(mappings.Unmap(address, size));
+    }
+
     void MapAt(u64 gpu_address, u64 cpu_address, u64 size) {
         std::scoped_lock lk{mutex};
         const auto update = mappings.Map(gpu_address, cpu_address, size);

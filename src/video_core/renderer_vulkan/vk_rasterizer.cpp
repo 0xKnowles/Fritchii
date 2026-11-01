@@ -28,6 +28,7 @@
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/native_query_trace.h"
+#include "video_core/readback_diagnostics.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -1049,14 +1050,20 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
         return;
     }
     if (True(which & VideoCommon::CacheType::TextureCache)) {
+        VideoCommon::ReadbackDiagnostics::Scope diagnostic{
+            VideoCommon::ReadbackDiagnostics::Event::TextureReadback, size};
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.DownloadMemory(addr, size);
     }
     if ((True(which & VideoCommon::CacheType::BufferCache))) {
+        VideoCommon::ReadbackDiagnostics::Scope diagnostic{
+            VideoCommon::ReadbackDiagnostics::Event::BufferReadback, size};
         std::scoped_lock lock{buffer_cache.mutex};
         buffer_cache.DownloadMemory(addr, size);
     }
     if ((True(which & VideoCommon::CacheType::QueryCache))) {
+        VideoCommon::ReadbackDiagnostics::Scope diagnostic{
+            VideoCommon::ReadbackDiagnostics::Event::QueryReadback, size};
         query_cache.FlushRegion(addr, size);
     }
 }
@@ -1079,6 +1086,8 @@ bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheT
 }
 
 VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64 size) {
+    VideoCommon::ReadbackDiagnostics::Scope diagnostic{
+        VideoCommon::ReadbackDiagnostics::Event::FlushArea, size};
     VideoCore::RasterizerDownloadArea result{
         .start_address = Common::AlignDown(addr, Core::DEVICE_PAGESIZE),
         .end_address = Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE),

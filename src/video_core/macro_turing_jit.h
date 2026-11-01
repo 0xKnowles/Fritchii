@@ -23,6 +23,7 @@
 namespace Tegra {
 
 namespace GpfifoCapture {
+bool Configured() noexcept;
 void Flush(const char* reason) noexcept;
 }
 
@@ -105,6 +106,11 @@ public:
                 }
             }();
             return directory;
+        }
+
+        static bool RecordingConfigured() {
+            static const bool configured = !Directory().empty() || GpfifoCapture::Configured();
+            return configured;
         }
 
         static bool Enabled() {
@@ -274,7 +280,8 @@ public:
         state.diagnostic_generation = compiled_generation;
         Thunks<Read, Emit> thunks{read, emit};
         state.user = &thunks;
-        state.emit = &Thunks<Read, Emit>::CallEmit;
+        state.emit = RtDump::Enabled() ? &Thunks<Read, Emit>::CallEmit
+                                       : &Thunks<Read, Emit>::CallEmitUntraced;
         state.read = &Thunks<Read, Emit>::CallRead;
         const Word error = program->entry(&state);
         if (error == None) {
@@ -291,6 +298,9 @@ private:
         static bool CallEmit(State* state, Word method, Word value) {
             const RtDump::Emission emission{state, method, value};
             const RtDump::Scope scope{emission};
+            return CallEmitUntraced(state, method, value);
+        }
+        static bool CallEmitUntraced(State* state, Word method, Word value) {
             const bool ok = static_cast<Thunks*>(state->user)->emit(method, value);
             // MME_DMA_READ_FIFOED appends to the FIFO from inside the emit.
             state->params = state->fifo->data();
