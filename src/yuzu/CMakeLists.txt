@@ -241,10 +241,12 @@ add_executable(yuzu
 
 set_target_properties(yuzu PROPERTIES OUTPUT_NAME "eglantine")
 
-add_custom_command(TARGET yuzu PRE_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${PROJECT_SOURCE_DIR}/dist/nx2_switches.txt" "$<TARGET_FILE_DIR:yuzu>/nx2_switches.txt"
-    VERBATIM)
+if (NOT APPLE)
+    add_custom_command(TARGET yuzu PRE_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${PROJECT_SOURCE_DIR}/dist/nx2_switches.txt" "$<TARGET_FILE_DIR:yuzu>/nx2_switches.txt"
+        VERBATIM)
+endif()
 
 if (YUZU_CRASH_DUMPS)
     target_sources(yuzu PRIVATE
@@ -381,9 +383,9 @@ if (APPLE)
         set(_icons "${_dist}/eden.icns" "${_dist}/Assets.car")
     endif()
 
-    set_source_files_properties(${_icons} PROPERTIES
+    set_source_files_properties(${_icons} "${_dist}/nx2_switches.txt" PROPERTIES
         MACOSX_PACKAGE_LOCATION Resources)
-    target_sources(yuzu PRIVATE ${_icons})
+    target_sources(yuzu PRIVATE ${_icons} "${_dist}/nx2_switches.txt")
 
     set_target_properties(yuzu PROPERTIES MACOSX_BUNDLE TRUE)
     set_target_properties(yuzu PROPERTIES MACOSX_BUNDLE_INFO_PLIST ${CMAKE_CURRENT_SOURCE_DIR}/Info.plist)

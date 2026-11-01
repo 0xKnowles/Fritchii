@@ -12,12 +12,22 @@ trap 'rm -rf "$stage"' EXIT HUP INT TERM
 
 app="$stage/eglantine.app"
 ditto "$build_dir/bin/eglantine.app" "$app"
+rm -f "$app/Contents/MacOS/nx2_switches.txt"
 cp "$build_dir/bin/eden-cli" "$app/Contents/MacOS/eden-cli"
 cp "$source_dir/dist/macos/eglantine.entitlements" "$app/Contents/Resources/"
 test -s "$app/Contents/Frameworks/libMoltenVK.dylib"
 
 "${QT_ROOT_DIR:?QT_ROOT_DIR must point to the Qt installation}/bin/macdeployqt" "$app" \
-    "-executable=$app/Contents/MacOS/eden-cli" -always-overwrite -codesign=-
+    "-executable=$app/Contents/MacOS/eden-cli" -always-overwrite
+
+find "$app/Contents/Frameworks" "$app/Contents/PlugIns" -type f | while IFS= read -r binary; do
+    if file -b "$binary" | grep -q 'Mach-O'; then
+        codesign --force --sign - "$binary"
+    fi
+done
+codesign --force --sign - --entitlements "$app/Contents/Resources/eglantine.entitlements" \
+    "$app/Contents/MacOS/eden-cli"
+codesign --force --sign - --entitlements "$app/Contents/Resources/eglantine.entitlements" "$app"
 
 ditto -c -k --sequesterRsrc --keepParent "$app" "$output"
 ditto -x -k "$output" "$stage/unpacked"
@@ -26,6 +36,7 @@ app="$stage/unpacked/eglantine.app"
 plutil -lint "$app/Contents/Info.plist"
 test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")" = eglantine
 test -s "$app/Contents/Resources/eden.icns"
+test -s "$app/Contents/Resources/nx2_switches.txt"
 test -s "$app/Contents/PlugIns/platforms/libqcocoa.dylib"
 codesign --verify --deep --strict --verbose=2 "$app"
 
