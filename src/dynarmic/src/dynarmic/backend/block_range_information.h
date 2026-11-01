@@ -8,7 +8,7 @@
 
 #pragma once
 
-#include <vector>
+#include <map>
 
 #include <boost/icl/interval_set.hpp>
 #include "common/container/unordered_set.h"
@@ -26,11 +26,11 @@ public:
 
 private:
     struct Range {
-        P first;
         P last;
         IR::LocationDescriptor location;
     };
-    std::vector<Range> ranges;
+    std::multimap<P, Range> ranges;
+    P max_span{};
 };
 
 }  // namespace Dynarmic::Backend

@@ -6,11 +6,15 @@
  * SPDX-License-Identifier: 0BSD
  */
 
+#include <algorithm>
+#include <vector>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include "dynarmic/tests/A64/testenv.h"
 #include "dynarmic/tests/native/testenv.h"
 #include "dynarmic/interface/A64/a64.h"
+#include "dynarmic/backend/block_range_information.h"
 
 using namespace Dynarmic;
 
@@ -208,4 +212,40 @@ TEST_CASE("invalidating a range drops exactly the blocks that overlap it", "[a64
     REQUIRE(run_from(8) == 20);
     REQUIRE(run_from(16) == 30);
     REQUIRE(run_from(24) == 4);
+}
+
+TEST_CASE("block range information only invalidates blocks that overlap the ranges", "[a64]") {
+    using Info = Backend::BlockRangeInformation<u64>;
+    const auto add = [](Info& info, u64 first, u64 last, u64 location) {
+        info.AddRange(boost::icl::discrete_interval<u64>::closed(first, last), IR::LocationDescriptor{location});
+    };
+    const auto invalidate = [](Info& info, std::initializer_list<std::pair<u64, u64>> intervals) {
+        boost::icl::interval_set<u64> set;
+        for (const auto& [first, last] : intervals) {
+            set.add(boost::icl::discrete_interval<u64>::closed(first, last));
+        }
+        std::vector<u64> locations;
+        for (const auto& location : info.InvalidateRanges(set)) {
+            locations.push_back(location.Value());
+        }
+        std::sort(locations.begin(), locations.end());
+        return locations;
+    };
+
+    Info info;
+    add(info, 0x1000, 0x10ff, 1);
+    add(info, 0x1100, 0x1103, 2);
+    add(info, 0x0f00, 0x2000, 3);
+    add(info, 0x3000, 0x3003, 4);
+    add(info, 0x3000, 0x3007, 5);
+
+    REQUIRE(invalidate(info, {{0x1104, 0x1104}}) == std::vector<u64>{3});
+    REQUIRE(invalidate(info, {{0x1104, 0x1104}}).empty());
+    REQUIRE(invalidate(info, {{0x10fc, 0x1100}, {0x3004, 0x3004}}) == std::vector<u64>{1, 2, 5});
+    REQUIRE(invalidate(info, {{0x0, 0xffff}}) == std::vector<u64>{4});
+    REQUIRE(invalidate(info, {{0x0, 0xffff}}).empty());
+
+    add(info, 0x10, 0x13, 6);
+    info.ClearCache();
+    REQUIRE(invalidate(info, {{0x0, 0xffff}}).empty());
 }
