@@ -44,7 +44,7 @@ find "$app" -type f | while IFS= read -r binary; do
     if ! file -b "$binary" | grep -q 'Mach-O'; then
         continue
     fi
-    lipo -verify_arch arm64 "$binary"
+    lipo "$binary" -verify_arch arm64
     otool -arch arm64 -L "$binary" | tail -n +2 | awk '{print $1}' | while IFS= read -r dependency; do
         case "$dependency" in
             /System/Library/* | /usr/lib/*) ;;
