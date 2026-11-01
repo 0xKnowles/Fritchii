@@ -41,10 +41,36 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Every build is named <channel>-build-<run number>: its release tag, its version string, and the
+  # prefix of its release files. The channel is the branch, or pr-<number> for pull requests, which
+  # are never released. The update checker only offers releases from the build's own channel.
+  name:
+    name: Name the build
+    runs-on: ubuntu-24.04
+    outputs:
+      channel: ${{ steps.name.outputs.channel }}
+      tag: ${{ steps.name.outputs.tag }}
+    steps:
+      - id: name
+        shell: bash
+        env:
+          PR_NUMBER: ${{ github.event.number }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            channel="pr-$PR_NUMBER"
+          else
+            channel="${GITHUB_REF_NAME//\//-}"
+          fi
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+          echo "tag=$channel-build-$GITHUB_RUN_NUMBER" >> "$GITHUB_OUTPUT"
+
   build:
     name: ${{ matrix.platform }} binary
+    needs: name
     runs-on: ${{ matrix.runner }}
     env:
+      BUILD_TAG: ${{ needs.name.outputs.tag }}
+      ASSET_NAME: eglantine-${{ needs.name.outputs.tag }}-${{ matrix.platform }}
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_MAXSIZE: 1500M
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
@@ -240,7 +266,10 @@ jobs:
             -DYUZU_USE_BUNDLED_SDL3=ON
             -DVulkanHeaders_FORCE_BUNDLED=ON
             -DVulkanUtilityLibraries_FORCE_BUNDLED=ON
-            -DENABLE_UPDATE_CHECKER=OFF
+            -DENABLE_UPDATE_CHECKER=ON
+            "-DEGLANTINE_UPDATE_REPO=$GITHUB_REPOSITORY"
+            "-DEGLANTINE_BUILD_TAG=$BUILD_TAG"
+            "-DEGLANTINE_BUILD_PLATFORM=${{ matrix.platform }}"
             -DUSE_DISCORD_PRESENCE=OFF
             -DUSE_CCACHE=ON
           )
@@ -278,7 +307,10 @@ jobs:
           -DYUZU_USE_BUNDLED_MOLTENVK=ON
           -DVulkanHeaders_FORCE_BUNDLED=ON
           -DVulkanUtilityLibraries_FORCE_BUNDLED=ON
-          -DENABLE_UPDATE_CHECKER=OFF
+          -DENABLE_UPDATE_CHECKER=ON
+          "-DEGLANTINE_UPDATE_REPO=$GITHUB_REPOSITORY"
+          "-DEGLANTINE_BUILD_TAG=$BUILD_TAG"
+          "-DEGLANTINE_BUILD_PLATFORM=${{ matrix.platform }}"
           -DUSE_DISCORD_PRESENCE=OFF
           -DUSE_CCACHE=ON
 
@@ -295,7 +327,10 @@ jobs:
           -DYUZU_ROOM_STANDALONE=OFF
           -DYUZU_USE_BUNDLED_QT=OFF
           -DYUZU_USE_BUNDLED_SDL3=ON
-          -DENABLE_UPDATE_CHECKER=OFF
+          -DENABLE_UPDATE_CHECKER=ON
+          "-DEGLANTINE_UPDATE_REPO=$GITHUB_REPOSITORY"
+          "-DEGLANTINE_BUILD_TAG=$BUILD_TAG"
+          "-DEGLANTINE_BUILD_PLATFORM=${{ matrix.platform }}"
           -DUSE_DISCORD_PRESENCE=OFF
           -DCMAKE_C_COMPILER_LAUNCHER=sccache
           -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
@@ -321,7 +356,10 @@ jobs:
             -DYUZU_USE_BUNDLED_FFMPEG=ON \
             -DVulkanHeaders_FORCE_BUNDLED=ON \
             -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
-            -DENABLE_UPDATE_CHECKER=OFF \
+            -DENABLE_UPDATE_CHECKER=ON \
+            "-DEGLANTINE_UPDATE_REPO=$GITHUB_REPOSITORY" \
+            "-DEGLANTINE_BUILD_TAG=$BUILD_TAG" \
+            "-DEGLANTINE_BUILD_PLATFORM=${{ matrix.platform }}" \
             -DUSE_DISCORD_PRESENCE=OFF \
             -DUSE_CCACHE=ON \
             -DCMAKE_C_COMPILER=clang \
@@ -348,8 +386,7 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: >-
-          sh tools/macos/package.sh build/release
-          "eglantine-${GITHUB_SHA}-${{ matrix.platform }}.zip"
+          sh tools/macos/package.sh build/release "$ASSET_NAME.zip"
 
       - name: Build MinGW PGO
         if: matrix.mingw
@@ -383,7 +420,7 @@ jobs:
           cp dist/Eglantine.png "$icon"
           export APPIMAGE_EXTRACT_AND_RUN=1
           export QMAKE="$QT_ROOT_DIR/bin/qmake"
-          export LDAI_OUTPUT="eglantine-${GITHUB_SHA}-${{ matrix.platform }}.AppImage"
+          export LDAI_OUTPUT="$ASSET_NAME.AppImage"
           export OUTPUT="$LDAI_OUTPUT"
           "$tools/linuxdeploy-x86_64.AppImage" --appdir AppDir \
             --executable build/release/bin/eglantine \
@@ -448,7 +485,7 @@ jobs:
         if: matrix.platform == 'windows-x86_64'
         uses: actions/upload-artifact@v4
         with:
-          name: eglantine-${{ matrix.platform }}-${{ github.sha }}
+          name: ${{ env.ASSET_NAME }}
           path: build/release/bin/
           if-no-files-found: error
           retention-days: 7
@@ -457,7 +494,7 @@ jobs:
         if: matrix.mingw
         uses: actions/upload-artifact@v4
         with:
-          name: eglantine-${{ matrix.platform }}-${{ github.sha }}
+          name: ${{ env.ASSET_NAME }}
           path: build/release/bin/
           if-no-files-found: error
           retention-days: 7
@@ -466,8 +503,8 @@ jobs:
         if: startsWith(matrix.platform, 'linux')
         uses: actions/upload-artifact@v4
         with:
-          name: eglantine-${{ matrix.platform }}-${{ github.sha }}
-          path: eglantine-${{ github.sha }}-${{ matrix.platform }}.AppImage
+          name: ${{ env.ASSET_NAME }}
+          path: ${{ env.ASSET_NAME }}.AppImage
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
@@ -476,8 +513,8 @@ jobs:
         if: runner.os == 'macOS'
         uses: actions/upload-artifact@v4
         with:
-          name: eglantine-${{ matrix.platform }}-${{ github.sha }}
-          path: eglantine-${{ github.sha }}-${{ matrix.platform }}.zip
+          name: ${{ env.ASSET_NAME }}
+          path: ${{ env.ASSET_NAME }}.zip
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
@@ -496,7 +533,7 @@ jobs:
   # unticked.
   release:
     name: Publish release
-    needs: build
+    needs: [name, build]
     if: github.event_name == 'push' || inputs.publish_release
     runs-on: ubuntu-24.04
     permissions:
@@ -505,7 +542,7 @@ jobs:
       - name: Download binaries
         uses: actions/download-artifact@v4
         with:
-          pattern: eglantine-*-${{ github.sha }}
+          pattern: eglantine-${{ needs.name.outputs.tag }}-*
           path: artifacts
 
       - name: Package release files
@@ -524,20 +561,41 @@ jobs:
             fi
           done
 
+      # The notes list the commits since the channel's previous release; the app shows users the
+      # commits since their own build.
       - name: Create release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ needs.name.outputs.channel }}
+          BUILD_TAG: ${{ needs.name.outputs.tag }}
         run: |
+          set -euo pipefail
           ls -la dist
-          gh release create "build-${GITHUB_RUN_NUMBER}" dist/* \
-            --repo "${GITHUB_REPOSITORY}" \
-            --target "${GITHUB_SHA}" \
-            --prerelease \
-            --title "Eglantine ${GITHUB_REF_NAME} build ${GITHUB_RUN_NUMBER} (${GITHUB_SHA::7})" \
-            --notes "Automatic build of ${GITHUB_REF_NAME} at ${GITHUB_SHA}.
+          previous=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq \
+            '[.[] | select(.tag_name | startswith(env.CHANNEL + "-build-"))][0].tag_name // empty')
+          {
+            if [ -n "$previous" ]; then
+              echo "## Changes since $previous"
+              echo
+              gh api "repos/$GITHUB_REPOSITORY/compare/$previous...$GITHUB_SHA" \
+                --jq '.commits | reverse | .[] | "- \(.commit.message | split("\n")[0]) (\(.sha[0:7]))"'
+              echo
+            fi
+            cat <<'EOF'
+          ## Install
 
           Windows: extract the zip and run eglantine.exe, or eden-cli.exe from a terminal.
           Linux: make the AppImage executable (chmod +x) and run it; it bundles its libraries and needs glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, Debian 13, Arch).
           macOS: Apple Silicon and macOS 15 or newer. Extract the zip and move eglantine.app to Applications. The CLI is inside eglantine.app/Contents/MacOS/eden-cli. The app bundles Qt and MoltenVK and is ad-hoc signed, not notarized; macOS may require approval in Privacy & Security. macOS support remains experimental and uses the JIT, not NCE.
-          The -pgo builds are the same programs compiled with profile-guided optimization (clang plus Eden's profile); prefer them when your CPU supports it. The Windows PGO build is a MinGW build, so it carries its own DLLs and needs no Visual C++ redistributable."
+          The -pgo builds are the same programs compiled with profile-guided optimization (clang plus Eden's profile); prefer them when your CPU supports it. The Windows PGO build is a MinGW build, so it carries its own DLLs and needs no Visual C++ redistributable.
+
+          Eglantine looks for newer builds of its channel at startup and from Help > Check for Updates.
+          EOF
+          } > notes.md
+          gh release create "$BUILD_TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "Eglantine $CHANNEL build $GITHUB_RUN_NUMBER (${GITHUB_SHA::7})" \
+            --notes-file notes.md
