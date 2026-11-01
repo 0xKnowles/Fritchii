@@ -184,7 +184,7 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
 // Image::BindLayers. Only formats uploaded layer by layer: huge ASTC arrays (GPU decode) and
 // formats the host samples as they are.
 [[nodiscard]] bool UsesSparseLayers(const Device& device, const ImageInfo& info, GPUVAddr gpu_addr) {
-    if (!device.IsSparseResidencyImage2DSupported() || info.type != ImageType::e2D ||
+    if (!device.IsSparseResidencyImageSupported(VK_IMAGE_TYPE_2D) || info.type != ImageType::e2D ||
         info.resources.layers <= 1 || info.num_samples != 1 ||
         VideoCore::Surface::GetFormatType(info.format) != VideoCore::Surface::SurfaceType::ColorTexture) {
         return false;
