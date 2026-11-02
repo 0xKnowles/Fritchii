@@ -19,8 +19,6 @@
 #include "shader_recompiler/frontend/ir/program.h"
 
 namespace Shader::Backend::SPIRV {
-void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program);
-
 namespace {
 template <class Func>
 struct FuncTraits {};
