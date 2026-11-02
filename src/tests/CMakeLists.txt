@@ -5,6 +5,11 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 add_executable(tests
+    video_core/ampere_fast_fusion.cpp
+    video_core/ampere_async_copy.cpp
+    video_core/ampere_trap_guards.cpp
+    video_core/async_draw_policy.cpp
+    video_core/multi_range_refresh.cpp
     hid_core/sensor_info.cpp
     common/paged_scalar.cpp
     common/queue_lifetime.cpp

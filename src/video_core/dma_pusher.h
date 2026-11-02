@@ -189,7 +189,7 @@ public:
     /// Whether the entry lies on device pages the GPU has written (NX2).
     bool IsGpuWrittenCommands(GPUVAddr address, size_t size);
     /// Brings command list words the GPU wrote (still only in host buffers) to guest memory.
-    void FlushGpuWrittenCommands(GPUVAddr address, size_t size);
+    bool FlushGpuWrittenCommands(GPUVAddr address, size_t size);
 
 private:
 

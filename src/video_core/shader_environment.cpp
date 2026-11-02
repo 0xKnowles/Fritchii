@@ -29,6 +29,7 @@
 #include "shader_recompiler/environment.h"
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
+#include "shader_recompiler/frontend/ampere/trap_guards.h"
 #include "shader_recompiler/frontend/ampere/program_override.h"
 #include "shader_recompiler/frontend/ampere/program_capture.h"
 #include "shader_recompiler/frontend/ampere/program_address_map.h"
@@ -215,7 +216,15 @@ size_t GenericEnvironment::ReadSizeBytes() const noexcept {
 }
 
 bool GenericEnvironment::CanBeSerialized() const noexcept {
-    return !has_unbound_instructions;
+    return !has_unbound_instructions && (!lowered_native || lowered_native->trap_prefix.empty());
+}
+
+bool GenericEnvironment::HasNativeInstructions() const {
+    return native_source_size || Shader::Ampere::HasNativeAddressMap(code);
+}
+
+bool FileEnvironment::HasNativeInstructions() const {
+    return Shader::Ampere::HasNativeAddressMap(code);
 }
 
 u64 GenericEnvironment::CalculateHash() const {
@@ -384,6 +393,10 @@ void GenericEnvironment::InitializeNativeCode(std::shared_ptr<const LoweredNativ
     if (!lowered) {
         lowered = LowerNativeCode(source_header_size, geometry_stage);
     }
+    if (!Shader::Ampere::VerifyTrapGuards(lowered->trap_prefix, [&](u32 bank, u32 offset) {
+            return ReadTrapGuardConstant(bank, offset);
+        }))
+        throw Shader::Ampere::TrapGuardError{};
     if (lowered->texture_bound != ~0U) {
         // Native TEX carries its cbuf index explicitly; TEXS obtains it from the environment.
         texture_bound = lowered->texture_bound;
@@ -434,7 +447,18 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
         }
         if (status == Shader::Ampere::ProgramCaptureState::Result::Complete) break;
     }
-    auto lowered = Shader::Ampere::LowerToMaxwell(native, geometry_stage, true);
+    std::vector<u32> verified_traps;
+    for (u32 i = 0; i < native.size(); ++i)
+        if (native[i].Bits(0, 12) == 0x95c)
+            verified_traps.push_back(i * sizeof(Instruction));
+    const size_t trap_count = verified_traps.empty() ? 0 : verified_traps.back() / sizeof(Instruction) + 1;
+    if (trap_count && (stage != Shader::Stage::Compute ||
+                      !Shader::Ampere::VerifyTrapGuards(std::span{native}.first(trap_count),
+                                                       [&](u32 bank, u32 offset) {
+                                                           return ReadTrapGuardConstant(bank, offset);
+                                                       })))
+        throw Shader::Ampere::TrapGuardError{};
+    auto lowered = Shader::Ampere::LowerToMaxwell(native, geometry_stage, true, verified_traps);
     // EDEN_NX2_REJECT=<hex address>,...: treat these programs as rejected (to find which newly
     // lowered program changes a game's behaviour without rebuilding).
     if (static const std::string reject_list = [] {
@@ -522,6 +546,7 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
     auto result = std::make_shared<LoweredNativeCode>();
     result->texture_bound = lowered.required_texture_buffer;
     result->source_size = native_header_size + lowered.source_size;
+    result->trap_prefix.assign(native.begin(), native.begin() + trap_count);
     auto& lowered_code = result->code;
     lowered_code.resize(sizeof(sph) / sizeof(u64));
     std::memcpy(lowered_code.data(), &sph, sizeof(sph));
@@ -713,6 +738,26 @@ ComputeEnvironment::ComputeEnvironment(Tegra::Engines::KeplerCompute& kepler_com
         InitializeNativeCode(std::move(lowered_native_), 0);
         start_address = sizeof(sph);
     }
+}
+
+std::optional<u32> ReadNativeGuardConstant(Tegra::Engines::KeplerCompute& compute,
+                                         Tegra::MemoryManager& memory, u32 bank, u32 offset) {
+    const auto& qmd = compute.launch_description;
+    if (bank >= qmd.const_buffer_config.size() ||
+        !(qmd.const_buffer_enable_mask.Value() & (1U << bank)))
+        return std::nullopt;
+    const auto& buffer = qmd.const_buffer_config[bank];
+    const GPUVAddr address = buffer.Address() + offset;
+    if (offset % 4 || offset > buffer.size || buffer.size - offset < sizeof(u32) ||
+        address < buffer.Address() || !memory.IsFullyMappedRange(address, sizeof(u32)))
+        return std::nullopt;
+    u32 value{};
+    memory.ReadBlock(address, &value, sizeof(value));
+    return value;
+}
+
+std::optional<u32> ComputeEnvironment::ReadTrapGuardConstant(u32 bank, u32 offset) {
+    return ReadNativeGuardConstant(*kepler_compute, *gpu_memory, bank, offset);
 }
 
 u32 ComputeEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {

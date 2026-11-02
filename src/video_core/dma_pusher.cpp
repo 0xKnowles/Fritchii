@@ -14,6 +14,7 @@
 #include "core/memory.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/dma_pusher.h"
+#include "video_core/command_fetch_order.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -102,6 +103,8 @@ bool DmaPusher::Step() {
     }
 
     if (header.size > 0) {
+        const bool gpu_written = FlushGpuWrittenCommands(
+            dma_state.dma_get, size_t{header.size} * sizeof(u32));
         if (subchannels[dma_state.subchannel] && dma_state.method_count) {
             const auto engine = subchannel_type[dma_state.subchannel];
             const bool kepler_payload = engine == Engines::EngineTypes::KeplerCompute && dma_state.method == ComputeInline && dma_state.non_incrementing;
@@ -173,8 +176,7 @@ bool DmaPusher::Step() {
         // read: their words at submit time are an older frame's.
         const bool submitted = command_resume_offset == 0 &&
                                dma_pushbuffer_subindex < command_list.submitted_offsets.size() &&
-                               !IsGpuWrittenCommands(dma_state.dma_get,
-                                                     size_t{header.size} * sizeof(u32)) &&
+                               !gpu_written &&
                                !(use_safe && memory_manager.IsMemoryDirty(dma_state.dma_get,
                                                                           header.size * sizeof(u32)));
         if (submitted) {
@@ -191,7 +193,6 @@ bool DmaPusher::Step() {
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         } else {
-            FlushGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::UnsafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
             RecordParsedEntry(header, commands);
@@ -488,19 +489,18 @@ bool DmaPusher::IsGpuWrittenCommands(GPUVAddr address, size_t size) {
     return false;
 }
 
-void DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
-    // Title 1 runs small command lists its culling dispatches fill in each frame. Accurate GPU
-    // mode reads every command list through the caches (safe reads); here only the ones on pages
-    // the GPU has written are, or their draws run with an older frame's words (trees vanish).
-    if (!IsGpuWrittenCommands(address, size)) {
-        return;
+bool DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
+    if (!g_nx2_ampere.load(std::memory_order_relaxed) || size == 0) {
+        return false;
     }
-    // The caches belong to the split's back: it first runs what the front queued (the dispatch
-    // that writes these words among it).
-    VideoCommon::GpuSplit::Get().Drain();
-    if (memory_manager.IsMemoryDirty(address, size, VideoCommon::CacheType::BufferCache)) {
-        memory_manager.FlushRegion(address, size, VideoCommon::CacheType::BufferCache);
-    }
+    return VideoCommon::SynchronizeCommandFetch(
+        [] { VideoCommon::GpuSplit::Get().Drain(); },
+        [&] { return IsGpuWrittenCommands(address, size); },
+        [&] {
+            if (memory_manager.IsMemoryDirty(address, size, VideoCommon::CacheType::BufferCache)) {
+                memory_manager.FlushRegion(address, size, VideoCommon::CacheType::BufferCache);
+            }
+        });
 }
 
 void DmaPusher::ReportUnboundSubchannel() {

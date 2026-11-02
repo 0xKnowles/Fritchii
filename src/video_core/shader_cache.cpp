@@ -17,6 +17,7 @@
 #include "common/cityhash.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/exception.h"
+#include "shader_recompiler/frontend/ampere/trap_guards.h"
 #include "shader_recompiler/object_pool.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dirty_flags.h"
@@ -181,12 +182,22 @@ const ShaderInfo* ShaderCache::ComputeShader() {
         return nullptr;
     }
     if (const ShaderInfo* const shader = TryGet(*cpu_shader_addr)) {
+        if (shader->lowered_native &&
+            !Shader::Ampere::VerifyTrapGuards(shader->lowered_native->trap_prefix,
+                                             [&](u32 bank, u32 offset) {
+                                                 return ReadNativeGuardConstant(
+                                                     *kepler_compute, *gpu_memory, bank, offset);
+                                             }))
+            throw Shader::Ampere::TrapGuardError{};
         return shader;
     }
     try {
         RethrowIfRejected(*cpu_shader_addr);
         ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start};
         return MakeShaderInfo(env, *cpu_shader_addr);
+    } catch (const Shader::Ampere::TrapGuardError&) {
+        // Constants can become valid on the next dispatch; do not cache this rejection.
+        throw;
     } catch (const Shader::Exception&) {
         RememberRejection(*cpu_shader_addr);
         throw;
