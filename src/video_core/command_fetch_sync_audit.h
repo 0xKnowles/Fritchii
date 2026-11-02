@@ -53,7 +53,15 @@ struct CommandFetchSyncAudit {
         first_write_hits += fetch.gpu_written_after;
     }
 
+    /// Opt-in contract mode: a candidate fetched without draining (still counted as a fetch).
+    void RecordContractSkip() {
+        ++fetches;
+        ++candidates;
+        ++contract_skips;
+    }
+
     u64 fetches{};
+    u64 contract_skips{};
     u64 sync_fetches{};
     u64 known_before{};
     u64 candidates{};

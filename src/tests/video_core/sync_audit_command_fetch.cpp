@@ -31,7 +31,7 @@ struct FakeFetch {
     u64 clock = 0;
     std::vector<const char*> order;
 
-    bool Run(Audit& audit, bool sync_wait) {
+    bool Run(Audit& audit, bool sync_wait, bool contract = false) {
         return Tegra::Nx2SynchronizeGpuWrittenCommandsAudited(
             address, guest.size(), sync_wait, audit, [&] { return pending; },
             [&] {
@@ -52,7 +52,7 @@ struct FakeFetch {
                 ++flushes;
                 guest = gpu;
             },
-            [&] { return clock; });
+            [&] { return clock; }, contract);
     }
 };
 
@@ -187,4 +187,71 @@ TEST_CASE("Acquire polling frontier covers queued releases but not trailing stat
     // A state write while a draw may be pending can issue that draw: it stays a writer.
     frontier.Commit(6, VideoCommon::CommandWriteFrontier::StateWriteMayExecute(true, true));
     REQUIRE(frontier.Target() == 6);
+}
+
+TEST_CASE("Opt-in SYNC_WAIT contract skips only unsynchronized candidates",
+          "[video_core][sync_audit]") {
+    Tegra::Nx2ClearGpuWrittenPages();
+    Audit audit;
+    FakeFetch candidate;
+    candidate.address = 90 * Page;
+    candidate.guest.assign(16, 5);
+    candidate.gpu.assign(16, 6);
+    candidate.pending = true;
+    candidate.mark_on_drain = true;
+    // The documented risk: a queued FIRST GPU write to these pages is not waited for.
+    REQUIRE_FALSE(candidate.Run(audit, false, true));
+    REQUIRE(candidate.drains == 0);
+    REQUIRE(candidate.flushes == 0);
+    REQUIRE(candidate.guest != candidate.gpu);
+    REQUIRE(candidate.reads == 0);
+    REQUIRE(audit.fetches == 1);
+    REQUIRE(audit.candidates == 1);
+    REQUIRE(audit.contract_skips == 1);
+    REQUIRE(audit.candidate_waits == 0);
+
+    // SYNC_WAIT fetches keep the full drain-then-test ordering.
+    FakeFetch synced;
+    synced.address = 100 * Page;
+    synced.guest.assign(8, 1);
+    synced.gpu.assign(8, 2);
+    synced.pending = true;
+    synced.mark_on_drain = true;
+    REQUIRE(synced.Run(audit, true, true));
+    REQUIRE(synced.drains == 1);
+    REQUIRE(synced.flushes == 1);
+    REQUIRE(synced.guest == synced.gpu);
+
+    // Pages already known to be GPU-written (culling-filled command lists) keep it too.
+    FakeFetch known;
+    known.address = 110 * Page;
+    known.guest.assign(8, 3);
+    known.gpu.assign(8, 4);
+    known.pending = true;
+    Tegra::Nx2MarkGpuWritten(known.address, 8);
+    REQUIRE(known.Run(audit, false, true));
+    REQUIRE(known.drains == 1);
+    REQUIRE(known.flushes == 1);
+    REQUIRE(known.guest == known.gpu);
+
+    REQUIRE(audit.fetches == 3);
+    REQUIRE(audit.contract_skips == 1);
+    REQUIRE(audit.sync_fetches == 1);
+    REQUIRE(audit.known_before == 1);
+}
+
+TEST_CASE("Contract mode off is the exact default ordering", "[video_core][sync_audit]") {
+    Tegra::Nx2ClearGpuWrittenPages();
+    Audit audit;
+    FakeFetch fetch;
+    fetch.address = 120 * Page;
+    fetch.guest.assign(20, 0x11);
+    fetch.gpu.assign(20, 0x42);
+    fetch.pending = true;
+    fetch.mark_on_drain = true;
+    REQUIRE(fetch.Run(audit, false, false));
+    REQUIRE(fetch.drains == 1);
+    REQUIRE(fetch.guest == fetch.gpu);
+    REQUIRE(audit.contract_skips == 0);
+    REQUIRE(audit.first_write_hits == 1);
 }

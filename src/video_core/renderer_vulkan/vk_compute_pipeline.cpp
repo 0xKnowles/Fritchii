@@ -148,6 +148,10 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         if (pipeline_statistics) {
             pipeline_statistics->Collect(device, *pipeline);
         }
+        // As official c0cb3325: nothing reads the module once the pipeline exists (Vulkan lets
+        // an application destroy a module after pipeline creation); free it now instead of
+        // keeping every compute shader's SPIR-V module alive for the session.
+        spv_module.reset();
         std::scoped_lock lock{build_mutex};
         is_built = true;
         build_condvar.notify_one();

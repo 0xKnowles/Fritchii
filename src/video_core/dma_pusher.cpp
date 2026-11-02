@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
 #include <cstdio>
 #include <deque>
 #include <filesystem>
@@ -846,6 +847,19 @@ void DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size, bool sync
     }
     bool flushed = false;
     auto& split = VideoCommon::GpuSplit::Get();
+    // Default: every fetch drains possible writers first. EDEN_NX2_SYNC_WAIT_FETCH_ORDER=1 is a
+    // risky diagnostic that skips the drain for fetches with neither SYNC_WAIT nor a known
+    // GPU-written page (see Nx2SynchronizeGpuWrittenCommandsAudited). MKW logs measured
+    // 200-460 ms/s of such waits and zero first GPU writes observed during them.
+    static const bool sync_wait_contract = [] {
+        const char* value = std::getenv("EDEN_NX2_SYNC_WAIT_FETCH_ORDER");
+        const bool enabled = value != nullptr && std::strcmp(value, "1") == 0;
+        if (enabled) {
+            LOG_WARNING(HW_GPU, "EDEN_NX2_SYNC_WAIT_FETCH_ORDER=1: command fetches without "
+                                "SYNC_WAIT or known GPU-written pages skip writer drains (unsafe)");
+        }
+        return enabled;
+    }();
     // Unchanged ordering: drain possible writers, then test the historical pages, then flush.
     // The SYNC bit and the pre-drain page test are only recorded (see
     // command_fetch_sync_audit.h); no fetch skips its synchronization because of them.
@@ -864,7 +878,7 @@ void DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size, bool sync
                 flushed = true;
             }
         },
-        [] { return VideoCommon::Nx2Profile::Now(); });
+        [] { return VideoCommon::Nx2Profile::Now(); }, sync_wait_contract);
     split.NoteCommandFetch(size, historical_hit, flushed);
 }
 

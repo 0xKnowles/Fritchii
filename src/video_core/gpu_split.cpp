@@ -136,14 +136,15 @@ void ReportDrainProfile() {
              "GPU split overlap: back idle {:.1f} ms/s ({:.0f} sleeps/s, {:.0f} batches/s) | "
              "command fetch SYNC_WAIT {:.0f}/s of {:.0f}/s, known GPU-written before sync "
              "{:.0f}/s | unsynchronized candidates {:.0f}/s, {:.0f} waited/s for {:.1f} ms/s, "
-             "first GPU writes seen during their sync {} (command contents not sampled)",
+             "first GPU writes seen during their sync {} (command contents not sampled) | "
+             "SYNC_WAIT-contract skips {:.0f}/s (opt-in, unsynchronized)",
              static_cast<double>(back.idle_ns - data.back_start.idle_ns) * 1000.0 / window,
              per_second(back.sleeps - data.back_start.sleeps),
              per_second(back.batches - data.back_start.batches), per_second(audit.sync_fetches),
              per_second(audit.fetches), per_second(audit.known_before),
              per_second(audit.candidates), per_second(audit.candidate_waits),
              static_cast<double>(audit.candidate_wait_ns) * 1000.0 / window,
-             audit.first_write_hits);
+             audit.first_write_hits, per_second(audit.contract_skips));
     // Whether the writer a command fetch waited for was already visible to the back when the
     // wait began (split_publication.h). Wait time itself is the "command fetch" ms/s above.
     const auto& publication = data.publication;

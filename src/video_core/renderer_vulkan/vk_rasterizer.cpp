@@ -244,7 +244,7 @@ RasterizerVulkan::~RasterizerVulkan() {
 }
 
 template <typename Func>
-void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+void RasterizerVulkan::PrepareDraw(bool is_indexed, u32 native_draw_count, Func&& draw_func) {
 
     SCOPE_EXIT {
         gpu.TickWork();
@@ -276,9 +276,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     };
     GraphicsPipeline* const pipeline{[&] {
         Profile::Scope scope{Profile::Zone::PipelineLookup};
-        const auto& draw = maxwell3d->draw_manager.draw_state;
-        return pipeline_cache.CurrentGraphicsPipeline(
-            is_indexed ? draw.index_buffer.count : draw.vertex_buffer.count);
+        return pipeline_cache.CurrentGraphicsPipeline(native_draw_count);
     }()};
     if (!pipeline) {
         if (pipeline_cache.WasAsyncDrawSkipped()) {
@@ -628,7 +626,10 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                      regs.blend.enable[0], seen.size());
         }
     }
-    PrepareDraw(is_indexed, [this, is_indexed, instance_count] {
+    const auto& direct_draw = maxwell3d->draw_manager.draw_state;
+    const u32 native_draw_count =
+        is_indexed ? direct_draw.index_buffer.count : direct_draw.vertex_buffer.count;
+    PrepareDraw(is_indexed, native_draw_count, [this, is_indexed, instance_count] {
         const auto& draw_state = maxwell3d->draw_manager.draw_state;
         const u32 num_instances{instance_count};
         const DrawParams draw_params{MakeDrawParams(draw_state, num_instances, is_indexed)};
@@ -664,7 +665,9 @@ void RasterizerVulkan::DrawIndirect() {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     const auto& params = maxwell3d->draw_manager.indirect_state;
     buffer_cache.SetDrawIndirect(&params);
-    PrepareDraw(params.is_indexed, [this, &params] {
+    // The direct draw_state counts are stale for indirect draws (often GPU-written culling
+    // output); 0 keeps them out of the async omission experiment.
+    PrepareDraw(params.is_indexed, 0, [this, &params] {
         const auto indirect_buffer = buffer_cache.GetDrawIndirectBuffer();
         const auto& buffer = indirect_buffer.first;
         const auto& offset = indirect_buffer.second;

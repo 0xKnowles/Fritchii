@@ -37,6 +37,8 @@ add_executable(tests
     video_core/memory_tracker.cpp
     video_core/descriptor_table.cpp
     video_core/native_async_draw.cpp
+    video_core/pipeline_cache_files.cpp
+    video_core/block_aware_eviction.cpp
     video_core/memory_budget.cpp
     video_core/astc_recompression_override.cpp
     video_core/nx2_video_configuration.cpp

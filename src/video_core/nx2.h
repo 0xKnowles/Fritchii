@@ -119,13 +119,23 @@ bool Nx2SynchronizeGpuWrittenCommandsAudited(GPUVAddr address, size_t size, bool
                                              VideoCommon::CommandFetchSyncAudit& audit,
                                              WritersPending&& writers_pending, Drain&& drain,
                                              Translate&& translate, Flush&& flush,
-                                             Now&& now) {
+                                             Now&& now, bool sync_wait_contract = false) {
     if (size == 0) return false;
     using Audit = VideoCommon::CommandFetchSyncAudit;
     Audit::Fetch fetch{};
     fetch.sync_wait = sync_wait;
     fetch.known_gpu_written_before = Nx2HasGpuWrittenPage(address, size, translate);
     const bool candidate = Audit::IsCandidate(sync_wait, fetch.known_gpu_written_before);
+    if (sync_wait_contract && candidate) {
+        // RISKY opt-in (EDEN_NX2_SYNC_WAIT_FETCH_ORDER=1), closer to official c0cb3325, which
+        // drains only for already-known GPU-written pages: the PBDMA contract
+        // (command_fetch_sync_audit.h) lets hardware fetch a segment without SYNC_WAIT before
+        // earlier engine work, so a guest relying on that ordering races on hardware too.
+        // Still unsafe if a queued writer makes the FIRST GPU write to these pages. No drain
+        // and no flush: the caches belong to the split's back thread.
+        audit.RecordContractSkip();
+        return false;
+    }
     fetch.writers_pending = candidate && writers_pending();
     const u64 start = fetch.writers_pending ? now() : 0;
     drain();

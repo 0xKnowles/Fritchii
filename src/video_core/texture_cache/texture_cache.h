@@ -243,12 +243,50 @@ void TextureCache<P>::RunGarbageCollector() {
         download_victims.clear();
         deferred_bytes = 0;
     };
+    // Native-tiling (Switch 2) titles on Vulkan offer the emptiest VMA blocks' images first
+    // among up to 8x this pass's budget of age-eligible candidates (block_aware_eviction.h,
+    // as official c0cb3325). Other titles/backends keep the plain oldest-first walk.
+    const auto Collect = [&] {
+        if constexpr (requires(const Image& image) { image.MemoryBlock(); }) {
+            if (gpu_memory != nullptr && gpu_memory->UsesNativeTiling()) {
+                std::vector<ImageId> candidates;
+                const size_t limit = num_iterations * 8;
+                lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, [&](ImageId image_id) {
+                    candidates.push_back(image_id);
+                    return candidates.size() >= limit;
+                });
+                if (candidates.empty()) {
+                    return;
+                }
+                if (block_image_bytes_frame == ~0ULL || frame_tick - block_image_bytes_frame >= 60) {
+                    block_image_bytes_frame = frame_tick;
+                    block_image_bytes.clear();
+                    for (const auto [image_id, image] : slot_images) {
+                        const auto block = image->MemoryBlock();
+                        if (block.block != 0) {
+                            block_image_bytes[block.block] += block.size;
+                        }
+                    }
+                }
+                const auto ordered = OrderByBlockFill<ImageId>(
+                    candidates, block_image_bytes,
+                    [&](ImageId image_id) { return slot_images[image_id].MemoryBlock(); });
+                for (const ImageId image_id : ordered) {
+                    if (Cleanup(image_id)) {
+                        break;
+                    }
+                }
+                return;
+            }
+        }
+        lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, Cleanup);
+    };
     Configure(false);
-    lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, Cleanup);
+    Collect();
     FlushDownloadVictims();
     if (total_used_memory >= critical_memory) {
         Configure(true);
-        lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, Cleanup);
+        Collect();
         FlushDownloadVictims();
     }
 }

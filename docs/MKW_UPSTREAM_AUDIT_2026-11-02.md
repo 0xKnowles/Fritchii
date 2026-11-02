@@ -185,3 +185,9 @@ Compare the same course, save, camera, accuracy, resolution, texture settings an
 warm-cache state. Inspect rendering completeness alongside exact command-drain,
 readback, pending-fence reuse, front-idle and presentation timings. Do not infer
 speed gains by combining sampled estimates or nested inclusive timing totals.
+
+## Third pass
+
+See `MKW_OPUS_AUDIT_2026-11-02.md`: shared pipeline-cache deletion between official and fork
+builds (fixed), ordered CPU reads and command-fetch drains as the main measured costs, and
+candidates A/B with opt-in experiments.

@@ -410,6 +410,12 @@ public:
         return sparse_layers.bound_bytes;
     }
 
+    /// The original image's VMA block, for block-aware collection (block_aware_eviction.h).
+    VideoCommon::ImageMemoryBlock MemoryBlock() const noexcept {
+        const auto block = original_image.GetMemoryBlock();
+        return {.block = block.block, .block_size = block.block_size, .size = block.size};
+    }
+
     // Exact allocation sizes for resources this image alone owns. Sparse allocations
     // require DEVICE_LOCAL; fallback host-only allocations are not credited as VRAM.
     u64 DeviceLocalAllocationBytes() const noexcept {

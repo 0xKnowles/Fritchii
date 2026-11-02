@@ -157,8 +157,10 @@ private:
 
     static constexpr VkDeviceSize DEFAULT_BUFFER_SIZE = 4 * sizeof(float);
 
+    /// native_draw_count: the direct draw's vertex/index count, used only by the opt-in native
+    /// async omission experiment. Indirect draws pass 0 (their count lives in GPU memory).
     template <typename Func>
-    void PrepareDraw(bool is_indexed, Func&&);
+    void PrepareDraw(bool is_indexed, u32 native_draw_count, Func&&);
 
     void FlushWork();
 

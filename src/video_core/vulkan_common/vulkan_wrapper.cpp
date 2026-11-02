@@ -530,6 +530,19 @@ VkDeviceSize Image::DeviceLocalAllocationBytes() const noexcept {
     return info.size;
 }
 
+Image::MemoryBlock Image::GetMemoryBlock() const noexcept {
+    if (!handle || !allocation) {
+        return {0, 0, 0};
+    }
+    VmaAllocationInfo2 info{};
+    vmaGetAllocationInfo2(allocator, allocation, &info);
+    if (info.dedicatedMemory) {
+        return {0, info.blockSize, info.allocationInfo.size};
+    }
+    return {reinterpret_cast<u64>(info.allocationInfo.deviceMemory), info.blockSize,
+            info.allocationInfo.size};
+}
+
 void Image::Release() const noexcept {
     if (handle) {
         vmaDestroyImage(allocator, handle, allocation);

@@ -739,6 +739,15 @@ public:
 
     [[nodiscard]] VkDeviceSize DeviceLocalAllocationBytes() const noexcept;
 
+    /// Where the image's memory lies: the VMA block (0 without memory or with a dedicated
+    /// allocation), the block's size and this image's part of it.
+    struct MemoryBlock {
+        u64 block;
+        u64 block_size;
+        u64 size;
+    };
+    [[nodiscard]] MemoryBlock GetMemoryBlock() const noexcept;
+
 private:
     void Release() const noexcept;
 

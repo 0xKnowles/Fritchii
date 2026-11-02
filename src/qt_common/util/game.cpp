@@ -12,6 +12,12 @@
 #include "qt_common/config/uisettings.h"
 #include "qt_common/qt_common.h"
 
+#include <algorithm>
+#include <filesystem>
+#include <string>
+#include <string_view>
+#include <vector>
+
 #include <QDesktopServices>
 #include <QStandardPaths>
 #include <QUrl>
@@ -239,6 +245,36 @@ void RemoveAddOnContent(u64 program_id, InstalledEntryType type) {
 
 // Global Content //
 
+namespace {
+// The legacy file plus its version-suffixed variants ("vulkan.bin" -> "vulkan.fork-v39.bin").
+std::vector<std::filesystem::path> ShaderCacheFiles(const std::filesystem::path& folder,
+                                                    std::string_view legacy_name) {
+    std::vector<std::filesystem::path> files;
+    if (legacy_name.empty()) {
+        return files;
+    }
+    const std::string_view stem = legacy_name.substr(0, legacy_name.rfind('.'));
+    const std::string prefix = fmt::format("{}.fork-v", stem);
+    std::error_code error;
+    for (const auto& entry : std::filesystem::directory_iterator(folder, error)) {
+        const std::string name = Common::FS::PathToUTF8String(entry.path().filename());
+        if (name == legacy_name ||
+            (name.starts_with(prefix) && name.ends_with(".bin"))) {
+            files.push_back(entry.path());
+        }
+    }
+    return files;
+}
+/// Attempts every file (no short-circuit); true only if all were removed.
+bool RemoveShaderCacheFiles(const std::vector<std::filesystem::path>& files) {
+    bool removed = true;
+    for (const auto& file : files) {
+        removed &= Common::FS::RemoveFile(file);
+    }
+    return removed;
+}
+} // Anonymous namespace
+
 void RemoveTransferableShaderCache(u64 program_id, GameListRemoveTarget target) {
     const auto target_file_name = [target] {
         switch (target) {
@@ -252,14 +288,15 @@ void RemoveTransferableShaderCache(u64 program_id, GameListRemoveTarget target) 
     }();
     const auto shader_cache_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir);
     const auto shader_cache_folder_path = shader_cache_dir / fmt::format("{:016x}", program_id);
-    const auto target_file = shader_cache_folder_path / target_file_name;
+    // Vulkan caches are also stored version-suffixed (video_core/pipeline_cache_files.h).
+    const auto targets = ShaderCacheFiles(shader_cache_folder_path, target_file_name);
 
-    if (!Common::FS::Exists(target_file)) {
+    if (targets.empty()) {
         QtCommon::Frontend::Warning(tr("Error Removing Transferable Shader Cache"),
                                     tr("A shader cache for this title does not exist."));
         return;
     }
-    if (Common::FS::RemoveFile(target_file)) {
+    if (RemoveShaderCacheFiles(targets)) {
         QtCommon::Frontend::Information(tr("Successfully Removed"),
                                         tr("Successfully removed the transferable shader cache."));
     } else {
@@ -273,12 +310,9 @@ void RemoveVulkanDriverPipelineCache(u64 program_id) {
 
     const auto shader_cache_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir);
     const auto shader_cache_folder_path = shader_cache_dir / fmt::format("{:016x}", program_id);
-    const auto target_file = shader_cache_folder_path / target_file_name;
+    const auto targets = ShaderCacheFiles(shader_cache_folder_path, target_file_name);
 
-    if (!Common::FS::Exists(target_file)) {
-        return;
-    }
-    if (!Common::FS::RemoveFile(target_file)) {
+    if (!RemoveShaderCacheFiles(targets)) {
         QtCommon::Frontend::Warning(tr("Error Removing Vulkan Driver Pipeline Cache"),
                                     tr("Failed to remove the driver pipeline cache."));
     }

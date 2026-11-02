@@ -30,6 +30,7 @@
 #include <ranges>
 #include "common/scratch_buffer.h"
 #include "common/slot_vector.h"
+#include "video_core/texture_cache/block_aware_eviction.h"
 #include "video_core/texture_cache/pending_download.h"
 #include "video_core/texture_cache/retired_resource.h"
 #include "common/thread_worker.h"
@@ -134,6 +135,8 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 native_critical_memory{};
     u64 native_expected_memory{};
     u64 budget_check_frames{};
+    std::unordered_map<u64, u64> block_image_bytes; ///< VMA block -> image bytes in it
+    u64 block_image_bytes_frame{~0ULL};             ///< Frame block_image_bytes was counted
     u64 astc_opaque_images{};
     u64 astc_alpha_images{};
     std::vector<u8> astc_scan_buffer;

@@ -36,6 +36,7 @@
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 #include "video_core/renderer_vulkan/native_async_draw.h"
+#include "video_core/pipeline_cache_files.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
@@ -73,6 +74,8 @@ constexpr u32 CACHE_VERSION = 39;
 constexpr size_t VULKAN_CACHE_FLUSH_PIPELINES = 128;
 constexpr size_t VULKAN_CACHE_FLUSH_MIN_SECONDS = 30;
 constexpr std::array<char, 8> VULKAN_CACHE_MAGIC_NUMBER{'y', 'u', 'z', 'u', 'v', 'k', 'c', 'h'};
+// Must match MAGIC_NUMBER in shader_environment.cpp (header of the shader pipeline cache).
+constexpr std::array<char, 8> PIPELINE_CACHE_MAGIC_NUMBER{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h'};
 
 template <typename Container>
 auto MakeSpan(Container& container) {
@@ -730,10 +733,21 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         LOG_ERROR(Common_Filesystem, "Failed to create pipeline cache directories");
         return;
     }
-    pipeline_cache_filename = base_dir / "vulkan.bin";
+    // Version-suffixed so another Eglantine build's cache in this directory is neither deleted
+    // nor deletes ours (pipeline_cache_files.h). A legacy file of this exact version is adopted.
+    pipeline_cache_filename =
+        VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan", CACHE_VERSION);
+    if (VideoCommon::AdoptLegacyPipelineCache(base_dir / "vulkan.bin", pipeline_cache_filename,
+                                              PIPELINE_CACHE_MAGIC_NUMBER, CACHE_VERSION)) {
+        LOG_INFO(Render_Vulkan, "Adopted the existing version {} pipeline cache", CACHE_VERSION);
+    }
 
     if (use_vulkan_pipeline_cache) {
-        vulkan_pipeline_cache_filename = base_dir / "vulkan_pipelines.bin";
+        vulkan_pipeline_cache_filename =
+            VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_pipelines", CACHE_VERSION);
+        VideoCommon::AdoptLegacyPipelineCache(base_dir / "vulkan_pipelines.bin",
+                                              vulkan_pipeline_cache_filename,
+                                              VULKAN_CACHE_MAGIC_NUMBER, CACHE_VERSION);
         vulkan_pipeline_cache =
             LoadVulkanPipelineCache(vulkan_pipeline_cache_filename, CACHE_VERSION);
     }
