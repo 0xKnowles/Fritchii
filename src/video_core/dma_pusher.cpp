@@ -103,7 +103,7 @@ bool DmaPusher::Step() {
     }
 
     if (header.size > 0) {
-        const bool gpu_written = FlushGpuWrittenCommands(
+        bool gpu_written = FlushGpuWrittenCommands(
             dma_state.dma_get, size_t{header.size} * sizeof(u32));
         if (subchannels[dma_state.subchannel] && dma_state.method_count) {
             const auto engine = subchannel_type[dma_state.subchannel];
@@ -113,15 +113,14 @@ bool DmaPusher::Step() {
                 const size_t words = std::min<size_t>(dma_state.method_count, header.size);
                 auto* const engine_state = subchannels[dma_state.subchannel];
                 if (g_nx2_ampere.load(std::memory_order_relaxed) && words != 0) {
-                    // Continued native macro arguments can be GPU-generated indirect records.
-                    // Drain before checking dirty state, including a page's first GPU write,
-                    // and flush before selecting a submitted-word snapshot below.
-                    VideoCommon::GpuSplit::Get().Drain();
+                    // Fetch synchronization above already drained the back thread. A parameter
+                    // flush must also disqualify the older submission-time snapshot.
                     const size_t bytes = words * sizeof(u32);
                     if (memory_manager.IsMemoryDirty(dma_state.dma_get, bytes,
                                                      VideoCommon::CacheType::BufferCache)) {
                         memory_manager.FlushRegion(dma_state.dma_get, bytes,
                                                    VideoCommon::CacheType::BufferCache);
+                        gpu_written = true;
                     }
                 }
                 if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
@@ -170,15 +169,12 @@ bool DmaPusher::Step() {
         // (the split only starts with unsafe reads; the settings can change mid-game).
         const bool use_safe = !VideoCommon::GpuSplit::Get().Active() &&
                               (Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe());
-        // The words as submitted, unless this is a resumed entry or the GPU has newer ones the
-        // safe read below would flush (with the split, the front can't tell: it reads memory
-        // unflushed anyway). Entries on pages the GPU writes (culling) always take the flushing
-        // read: their words at submit time are an older frame's.
-        const bool submitted = command_resume_offset == 0 &&
-                               dma_pushbuffer_subindex < command_list.submitted_offsets.size() &&
-                               !gpu_written &&
-                               !(use_safe && memory_manager.IsMemoryDirty(dma_state.dma_get,
-                                                                          header.size * sizeof(u32)));
+        // Resume and GPU-written entries need live words, even after a flush cleared dirty state.
+        const bool submitted = VideoCommon::CanUseSubmittedCommands(
+            command_resume_offset != 0,
+            dma_pushbuffer_subindex < command_list.submitted_offsets.size(), gpu_written,
+            use_safe && memory_manager.IsMemoryDirty(dma_state.dma_get,
+                                                     header.size * sizeof(u32)));
         if (submitted) {
             const std::span<const CommandHeader> commands{
                 command_list.submitted_words.data() +
