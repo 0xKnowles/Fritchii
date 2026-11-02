@@ -24,6 +24,8 @@ u32 TranslationReads::Ask(Shader::Environment& env, Query query, u32 arg0, u32 a
     switch (query) {
     case Query::CbufValue:
         return env.ReadCbufValue(arg0, arg1);
+    case Query::CbufStorageBufferPointer:
+        return env.IsCbufStorageBufferPointer(arg0, arg1) ? 1 : 0;
     case Query::TextureType:
         return static_cast<u32>(env.ReadTextureType(arg0));
     case Query::TexturePixelFormat:
@@ -54,9 +56,11 @@ TranslationReads::Properties TranslationReads::PropertiesOf(const Shader::Enviro
     result.stage = env.ShaderStage();
     result.start_address = env.StartAddress();
     result.texture_bound_buffer = env.TextureBoundBuffer();
+    result.surface_bound_buffer = env.SurfaceBoundBuffer();
     result.local_memory_size = env.LocalMemorySize();
     result.shared_memory_size = env.SharedMemorySize();
     result.is_proprietary_driver = env.IsProprietaryDriver();
+    result.has_native_instructions = env.HasNativeInstructions();
     return result;
 }
 
@@ -111,6 +115,11 @@ u32 RecordingEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
     return AskAndRecord(TranslationReads::Query::CbufValue, cbuf_index, cbuf_offset);
 }
 
+bool RecordingEnvironment::IsCbufStorageBufferPointer(u32 cbuf_index, u32 cbuf_offset) {
+    return AskAndRecord(TranslationReads::Query::CbufStorageBufferPointer, cbuf_index,
+                        cbuf_offset) != 0;
+}
+
 Shader::TextureType RecordingEnvironment::ReadTextureType(u32 raw_handle) {
     return static_cast<Shader::TextureType>(
         AskAndRecord(TranslationReads::Query::TextureType, raw_handle));
@@ -146,6 +155,14 @@ bool RecordingEnvironment::HasHLEMacroState() const {
 // Fixed properties, compared as a whole by TranslationReads::Matches.
 u32 RecordingEnvironment::TextureBoundBuffer() const {
     return inner->TextureBoundBuffer();
+}
+
+u32 RecordingEnvironment::SurfaceBoundBuffer() const {
+    return inner->SurfaceBoundBuffer();
+}
+
+bool RecordingEnvironment::HasNativeInstructions() const {
+    return inner->HasNativeInstructions();
 }
 
 u32 RecordingEnvironment::LocalMemorySize() const {

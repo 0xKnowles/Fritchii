@@ -44,6 +44,72 @@ void Pause() {
 [[maybe_unused]] std::atomic<u32> g_back_thread_id{};
 std::atomic<bool> g_back_busy{};
 
+struct DrainProfileData {
+    SplitDrainMetrics metrics;
+    u64 window_start{};
+    u32 events{};
+};
+thread_local DrainProfileData drain_profile;
+
+void ReportDrainProfile() {
+    auto& data = drain_profile;
+    if ((++data.events & 255) != 0) {
+        return;
+    }
+    const u64 now = Nx2Profile::Now();
+    if (data.window_start == 0) {
+        data.window_start = now;
+        data.metrics = {};
+        return;
+    }
+    const u64 window = now - data.window_start;
+    if (window < 10'000'000'000ULL) {
+        return;
+    }
+    static constexpr std::array names{
+        "other", "command fetch", "parameter flush", "parameter dirty", "submission fence", "ring space"};
+    std::string line;
+    for (size_t i = 0; i < names.size(); ++i) {
+        const auto& entry = data.metrics.drains[i];
+        if (entry.calls == 0) continue;
+        line += fmt::format(" | {} {:.1f} ms/s ({:.0f}/s, {:.0f} pending/s, {:.0f} queued words/s)",
+                            names[i], static_cast<double>(entry.elapsed_ns) * 1000.0 / window,
+                            static_cast<double>(entry.calls) * 1e9 / window,
+                            static_cast<double>(entry.pending_calls) * 1e9 / window,
+                            static_cast<double>(entry.queued_words) * 1e9 / window);
+    }
+    const auto& metrics = data.metrics;
+    LOG_INFO(HW_GPU,
+             "GPU split drain attribution:{} | command fetches {:.0f}/s, {:.0f} KiB/s, "
+             "historical GPU-page hits {:.0f}/s, dirty flushes {:.0f}/s ({:.0f} KiB requested/s)",
+             line, static_cast<double>(metrics.command_fetches) * 1e9 / window,
+             static_cast<double>(metrics.command_bytes) * 1e9 / 1024.0 / window,
+             static_cast<double>(metrics.historical_hits) * 1e9 / window,
+             static_cast<double>(metrics.dirty_flushes) * 1e9 / window,
+             static_cast<double>(metrics.flushed_bytes) * 1e9 / 1024.0 / window);
+    data = {};
+    data.window_start = now;
+}
+
+class DrainProfileScope {
+public:
+    DrainProfileScope(SplitDrainReason reason_, u64 queued_words_)
+        : reason{reason_}, queued_words{queued_words_}, enabled{Nx2Profile::Enabled()} {
+        if (enabled && queued_words != 0) start = Nx2Profile::Now();
+    }
+    ~DrainProfileScope() {
+        if (!enabled) return;
+        const u64 elapsed = queued_words != 0 ? Nx2Profile::Now() - start : 0;
+        drain_profile.metrics.RecordDrain(reason, queued_words, elapsed);
+        ReportDrainProfile();
+    }
+private:
+    SplitDrainReason reason;
+    u64 queued_words;
+    bool enabled;
+    u64 start{};
+};
+
 } // Anonymous namespace
 
 void GpuSplit::CheckOwner(const char* where) {
@@ -110,6 +176,7 @@ void GpuSplit::MaybeStart(Core::System& system_) {
         return;
     }
     system = &system_;
+    drain_profile = {};
     check_owner = std::getenv("EDEN_NX2_SPLIT_CHECK") != nullptr;
     ring = std::make_unique<u64[]>(RingWords);
     back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
@@ -140,6 +207,7 @@ void GpuSplit::Stop() {
     write_position = 0;
     published_local = 0;
     consumed_cache = 0;
+    command_writes.Reset();
     publish_every = PublishEvery;
     front_engine = nullptr;
     back_engine = nullptr;
@@ -168,6 +236,7 @@ void GpuSplit::WaitForSpace(size_t words) {
         return;
     }
     Publish();
+    DrainProfileScope attribution{SplitDrainReason::RingSpace, write_position - consumed_cache};
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
@@ -195,16 +264,30 @@ void GpuSplit::Publish() {
     }
 }
 
-void GpuSplit::Drain() {
+void GpuSplit::Drain(SplitDrainReason reason) {
+    DrainTo(write_position, reason);
+}
+
+void GpuSplit::DrainCommandReads() {
+    if (command_writes.Target() < write_position) {
+        Nx2Profile::Add(Nx2Profile::Counter::CommandStateTails, 1);
+    }
+    DrainTo(command_writes.Target(), SplitDrainReason::CommandFetch);
+    // Do not starve state-only runs when the reader never needs a full drain.
+    Publish();
+}
+
+void GpuSplit::DrainTo(u64 target, SplitDrainReason reason) {
     consumed_cache = consumed.load(std::memory_order_acquire);
-    if (consumed_cache == write_position) {
+    DrainProfileScope attribution{reason, target > consumed_cache ? target - consumed_cache : 0};
+    if (consumed_cache >= target) {
         return;
     }
     Publish();
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
-        if (consumed_cache == write_position) {
+        if (consumed_cache >= target) {
             publish_every = 8;
             return;
         }
@@ -216,12 +299,18 @@ void GpuSplit::Drain() {
     }
 }
 
+void GpuSplit::NoteCommandFetch(u64 bytes, bool historical_hit, bool flushed) {
+    if (!Nx2Profile::Enabled()) return;
+    drain_profile.metrics.RecordCommandFetch(bytes, historical_hit, flushed);
+    ReportDrainProfile();
+}
+
 void GpuSplit::SwitchEngine(Tegra::Engines::EngineInterface* engine) {
     front_engine = engine;
     u64* const entry = Reserve(2);
     entry[0] = static_cast<u64>(Kind::Engine);
     entry[1] = reinterpret_cast<u64>(engine);
-    Commit(2);
+    Commit(2, false);
 }
 
 void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,

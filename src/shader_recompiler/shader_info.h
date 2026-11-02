@@ -205,6 +205,26 @@ struct ImageBufferDescriptor {
 };
 using ImageBufferDescriptors = boost::container::small_vector<ImageBufferDescriptor, 2>;
 
+// Buffer-backed native texture tables; adapted from Duck912/eden-fefw 8c6f0522.
+struct BufferTextureExclusion {
+    u32 offset{};
+    u32 mask{};
+    u32 value{};
+    bool not_equal{};
+    bool Matches(u32 word) const { return mask && (((word & mask) != value) == not_equal); }
+    auto operator<=>(const BufferTextureExclusion&) const = default;
+};
+
+struct BufferTextureSource {
+    u32 offset{};
+    u32 stride{};
+    u32 size{};
+    bool enabled{};
+    bool width_query{};
+    std::array<BufferTextureExclusion, 4> exclusions{};
+    auto operator<=>(const BufferTextureSource&) const = default;
+};
+
 struct TextureDescriptor {
     TextureType type;
     bool is_depth;
@@ -220,6 +240,7 @@ struct TextureDescriptor {
     u32 count;
     u32 size_shift;
 
+    BufferTextureSource buffer_source{};
     auto operator<=>(const TextureDescriptor&) const = default;
 };
 using TextureDescriptors = boost::container::small_vector<TextureDescriptor, 12>;
@@ -241,7 +262,7 @@ using ImageDescriptors = boost::container::small_vector<ImageDescriptor, 4>;
 
 struct Info {
     static constexpr size_t MAX_INDIRECT_CBUFS{14};
-    static constexpr size_t MAX_CBUFS{18};
+    static constexpr size_t MAX_CBUFS{32};
     static constexpr size_t MAX_SSBOS{32};
 
     bool uses_workgroup_id{};
@@ -312,6 +333,9 @@ struct Info {
     bool uses_atomic_s32_max{};
     bool uses_int64_bit_atomics{};
     bool uses_global_memory{};
+    bool native_global_bounds{};
+    bool uses_global_subword_write{};
+    bool uses_global_atomics{};
     bool uses_atomic_image_u32{};
     bool uses_shadow_lod{};
     bool uses_rescaling_uniform{};

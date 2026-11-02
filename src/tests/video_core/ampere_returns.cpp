@@ -48,4 +48,22 @@ TEST_CASE("Ampere callees still reject writes to the link", "[video_core][ampere
     REQUIRE(lowered.error == "native callee overwrites link register");
     REQUIRE(lowered.error_offset == 0x30);
 }
+TEST_CASE("Ampere predicated NOINC exits a loop in a program containing returns", "[video_core][ampere]") {
+    for (u32 guard : {0U, 6U, 8U, 14U}) {
+        std::array<Instruction, 4> code{{
+            {{0x944U | (guard << 12), 16, 0x03c00000, 0}},
+            {{0x7947, 0xffffffe0U, 0x0383ffff, 0}},
+            {{0x794d, 0, 0x03800000, 0}},
+            {{0x7950, 0xffffffc0U, 0x03c3ffff, 0}},
+        }};
+        const auto lowered = LowerToMaxwell(code);
+        REQUIRE(lowered);
+        REQUIRE(lowered.source_size == 48);
+        REQUIRE(((lowered.instructions[0] >> 16) & 15) == guard);
+        REQUIRE((lowered.instructions[0] >> 52) == 0xe24);
+        code[1].words[1] = 16; // Not a loop back edge; do not pretend the CALL is a branch.
+        code[1].words[2] = 0x03800000;
+        REQUIRE_FALSE(LowerToMaxwell(code));
+    }
+}
 } // namespace

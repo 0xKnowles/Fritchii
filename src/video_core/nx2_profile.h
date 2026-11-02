@@ -51,6 +51,15 @@ enum class Zone : u32 {
     Method,       ///< Engine method calls (what a split GPU thread's back half would run)
     SplitDrain,   ///< Split GPU thread: the front waits for the back (gpu_split.h)
     SplitWait,    ///< Split GPU thread: the back waits for work
+    ComputeFlush,
+    ComputePipeline,
+    ComputeLocks,
+    ComputeStorage,
+    ComputeTextures,
+    ComputeUpdateBuffers,
+    ComputeBindBuffers,
+    ComputeDescriptors,
+    ComputeRecord,
     Count,
 };
 
@@ -62,6 +71,9 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "descriptor acquire", "bind stage buffers", "push descriptors", "render targets",
     "configure draw", "dynamic state", "draw record", "texture upload", "fence",
     "fence skipped", "method", "split drain", "split wait",
+    "compute flush", "compute pipeline", "compute locks", "compute storage",
+    "compute textures", "compute update buffers", "compute bind buffers",
+    "compute descriptors", "compute record",
 };
 
 inline bool Enabled() {
@@ -78,7 +90,7 @@ inline u64 Now() {
 struct ThreadData {
     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
-    std::array<u64, 8> counters{}; ///< See Counter
+    std::array<u64, 20> counters{}; ///< See Counter
     u64 child_ns{};    ///< Time of the zones nested in the current one
     u64 window_start{};
 };
@@ -128,6 +140,18 @@ enum class Counter : u32 {
     SameValueWrites, ///< Of MethodWrites: the register already held the value
     AcquireChecks,  ///< Semaphore acquires evaluated
     AcquireWaits,   ///< Of AcquireChecks: not met yet (the channel waits)
+    QmdDataWrites, ///< Inline-QMD data writes considered on the compute front
+    QmdSameValueSkipped, ///< Of QmdDataWrites: unchanged, side-effect-free writes omitted
+    EmptyComputeSkipped, ///< Direct dispatch with at least one zero group count
+    StorageRangeCacheHits,
+    StorageRangeCacheMisses,
+    HandleTableSnapshotLoads,
+    HandleTableSnapshotReuseHits,
+    HandleTableSnapshotBytesAvoided,
+    UniformUploadHits,
+    UniformUploadMisses,
+    StorageBindingReuse,
+    CommandStateTails,
 };
 
 /// Device pages (4 KiB) the native MME has DMA-read since start (GPU thread only; filled only
@@ -188,6 +212,24 @@ inline void Report(const char* thread_name = "GPU thread") {
     line += fmt::format(" | acquires {:.0f} ({:.0f} waited)",
                         static_cast<double>(data.counters[6]) * 1e9 / window,
                         static_cast<double>(data.counters[7]) * 1e9 / window);
+    line += fmt::format(" | inline QMD data writes {:.0f} ({:.0f} same value skipped)",
+                        static_cast<double>(data.counters[8]) * 1e9 / window,
+                        static_cast<double>(data.counters[9]) * 1e9 / window);
+    line += fmt::format(" | empty compute skipped {:.0f}",
+                        static_cast<double>(data.counters[10]) * 1e9 / window);
+    line += fmt::format(" | storage range cache {:.0f} hits/{:.0f} misses",
+                        static_cast<double>(data.counters[11]) * 1e9 / window,
+                        static_cast<double>(data.counters[12]) * 1e9 / window);
+    line += fmt::format(" | handle snapshots {:.0f} loads/{:.0f} reused ({:.0f} KiB avoided)",
+                        static_cast<double>(data.counters[13]) * 1e9 / window,
+                        static_cast<double>(data.counters[14]) * 1e9 / window,
+                        static_cast<double>(data.counters[15]) * 1e9 / 1024.0 / window);
+    line += fmt::format(" | uniform uploads {:.0f} reused/{:.0f} new | storage setup reused {:.0f}"
+                        " | command state-only tails {:.0f}",
+                        static_cast<double>(data.counters[16]) * 1e9 / window,
+                        static_cast<double>(data.counters[17]) * 1e9 / window,
+                        static_cast<double>(data.counters[18]) * 1e9 / window,
+                        static_cast<double>(data.counters[19]) * 1e9 / window);
     LOG_INFO(HW_GPU, "{} per second:{}", thread_name, line);
     data = {};
     data.window_start = now;

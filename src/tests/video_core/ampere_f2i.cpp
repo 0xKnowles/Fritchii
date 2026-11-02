@@ -82,7 +82,7 @@ TEST_CASE("Ampere byte F2I rejects other widths, rounding, modifiers and registe
         invalid[0].words[2] = mode;
         REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(invalid)));
     }
-    for (const u32 source : {246U, 254U, 0x10003U}) {
+    for (const u32 source : {0x10003U}) {
         auto invalid = code;
         invalid[0].words[1] = source;
         REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(invalid)));
@@ -108,7 +108,7 @@ TEST_CASE("Ampere byte F2I rejects other widths, rounding, modifiers and registe
     REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(invalid)));
     invalid = code;
     invalid[0].words[0] = 0x00f67305;
-    REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(invalid)));
+    REQUIRE(static_cast<bool>(LowerToMaxwell(invalid)));
 }
 TEST_CASE("Ampere ceiling F2I preserves rounding, signedness and unsigned saturation",
           "[video_core][ampere]") {
@@ -174,7 +174,7 @@ TEST_CASE("Ampere byte and ceiling F2I bound registers and extended instruction 
             {{0x00027305, 2, mode, 0x000e3000}},
             {{0x0000794d, 0, 0x03800000, 0}},
         }};
-        for (const u32 source : {0U, 245U, 255U}) {
+        for (const u32 source : {0U, 245U, 246U, 254U, 255U}) {
             auto valid = code;
             valid[0].words[1] = source;
             REQUIRE(static_cast<bool>(LowerToMaxwell(valid)));

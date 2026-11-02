@@ -689,7 +689,8 @@ struct Memory::Impl {
     [[nodiscard]] u8* GetPointerImpl(u64 vaddr, F&& on_unmapped, G&& on_rasterizer) const {
         // AARCH64 masks the upper 16 bit of all memory accesses
         vaddr &= 0xffffffffffffULL;
-        if (AddressSpaceContains(*current_page_table, vaddr, 1)) [[likely]] {
+        // The 48-bit mask makes a one-byte access overflow impossible.
+        if (vaddr < (1ULL << current_page_table->GetAddressSpaceBits())) [[likely]] {
             // Avoid adding any extra logic to this fast-path block
             const auto raw = current_page_table->entries[vaddr >> YUZU_PAGEBITS].Raw();
             if (auto pointer = Common::PageTable::PageEntryData::ExtractPointer(raw); pointer) [[likely]] {

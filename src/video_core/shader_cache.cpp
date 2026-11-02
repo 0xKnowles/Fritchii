@@ -14,6 +14,7 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/assert.h"
+#include "shader_recompiler/frontend/ampere/trap_guards.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/object_pool.h"
@@ -155,6 +156,14 @@ const ShaderInfo* ShaderCache::ComputeShader() {
         return nullptr;
     }
     if (const ShaderInfo* const shader = TryGet(*cpu_shader_addr)) {
+        if (shader->lowered_native &&
+            !Shader::Ampere::VerifyTrapGuards(shader->lowered_native->trap_prefix,
+                                             [&](u32 bank, u32 offset) {
+                                                 return ReadNativeGuardConstant(
+                                                     *kepler_compute, *gpu_memory, bank, offset);
+                                             })) {
+            throw Shader::NativeTrapGuardError{};
+        }
         return shader;
     }
     try {
@@ -162,6 +171,8 @@ const ShaderInfo* ShaderCache::ComputeShader() {
         ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start,
                                {}, support_cooperative_matrix};
         return MakeShaderInfo(env, *cpu_shader_addr);
+    } catch (const Shader::NativeTrapGuardError&) {
+        throw;
     } catch (const Shader::Exception&) {
         RememberRejection(*cpu_shader_addr);
         throw;

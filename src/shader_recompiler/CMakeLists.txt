@@ -60,6 +60,9 @@ add_library(shader_recompiler STATIC
     frontend/ir/value.cpp
     frontend/ir/value.h
     frontend/ampere/lower_to_maxwell.h
+    frontend/ampere/instruction.h
+    frontend/ampere/trap_guards.h
+    frontend/ampere/register_pressure.h
     frontend/ampere/program_override.h
     frontend/ampere/program_address_map.h
     frontend/maxwell/control_flow.cpp
@@ -186,6 +189,9 @@ add_library(shader_recompiler STATIC
     ir_opt/lower_fp64_to_fp32.cpp
     ir_opt/lower_int64_to_int32.cpp
     ir_opt/passes.h
+    ir_opt/buffer_texture.h
+    ir_opt/conditional_phi.h
+    ir_opt/control_flow_reachability.h
     ir_opt/predicate_mask.h
     ir_opt/position_pass.cpp
     ir_opt/rescaling_pass.cpp

@@ -22,6 +22,7 @@
 #include "video_core/nx2.h"
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/engines/kepler_compute.h"
+#include "video_core/engines/native_qmd_write.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
 #include "video_core/native_query_trace.h"
@@ -838,6 +839,20 @@ std::span<u32> KeplerCompute::FrontMacroPositions(FrontState& fs) {
     return native_macro_positions;
 }
 
+bool KeplerCompute::SkipFrontQmdWrite(const FrontState& fs, u32 method, u32 argument) const {
+    if (!IsInlineQmdDataMethod(method)) {
+        return false;
+    }
+    namespace Profile = VideoCommon::Nx2Profile;
+    Profile::Add(Profile::Counter::QmdDataWrites, 1);
+    const bool skip = CanSkipInlineQmdWrite(method, fs.registers[method], argument,
+                                          native_plain_methods[method]);
+    if (skip) {
+        Profile::Add(Profile::Counter::QmdSameValueSkipped, 1);
+    }
+    return skip;
+}
+
 void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split,
                                     u32 method, u32 argument, bool is_last_call,
                                     const GPUVAddr* segment) {
@@ -858,6 +873,9 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
         if (is_last_call) {
             FrontRunMacro(system, split, fs);
         }
+        return;
+    }
+    if (SkipFrontQmdWrite(fs, method, argument)) {
         return;
     }
     FrontApply(fs, method, argument);
@@ -905,6 +923,9 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         [&](u32 address, u32 value) {
             if (address >= 0xe00) {
                 return false;
+            }
+            if (SkipFrontQmdWrite(fs, address, value)) {
+                return true;
             }
             FrontApply(fs, address, value);
             split.MacroWrite(this, address, value);

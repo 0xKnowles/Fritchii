@@ -27,14 +27,15 @@ struct TensorProgram {
     IR::Program program;
     Profile profile;
 
-    explicit TensorProgram(u32 count = 1) {
+    explicit TensorProgram(u32 count = 1, u32 software_depth = 0) {
         program.stage = Stage::Compute;
         program.workgroup_size = {64, 1, 1};
         program.blocks = {&block};
         program.post_order_blocks = {&block};
         program.syntax_list = {{{.block = &block}, IR::AbstractSyntaxNode::Type::Block},
                                {{}, IR::AbstractSyntaxNode::Type::Return}};
-        program.info.uses_tensor_mul_add = count != 0;
+        program.info.uses_tensor_mul_add = count != 0 && software_depth == 0;
+        program.info.uses_subgroup_shuffles = count != 0 && software_depth != 0;
         program.info.uses_subgroup_invocation_id = count != 0;
         profile.support_cooperative_matrix = true;
         profile.supported_spirv = 0x00010500;
@@ -49,14 +50,25 @@ struct TensorProgram {
         const auto lane = ir.LaneId();
         std::array<IR::U32, 8> inputs;
         for (u32 i = 0; i < inputs.size(); ++i) {
-            inputs[i] = ir.IAdd(ir.Imm32((i + 1) * 0x01000100U), lane);
+            inputs[i] = software_depth ? ir.IAdd(ir.Imm32(0x3c003c00U + i * 0x01000100U),
+                ir.ShiftLeftLogical(lane, ir.Imm32(3))) : ir.IAdd(ir.Imm32((i + 1) * 0x01000100U), lane);
         }
         for (u32 i = 0; i < count; ++i) {
             const auto result = ir.Inst(IR::Opcode::TensorMulAdd, inputs[0], inputs[1],
                                        inputs[2], inputs[3], inputs[4], inputs[5],
                                        inputs[6], inputs[7]);
+            result.Inst()->SetFlags<u32>(software_depth);
             inputs[6] = IR::U32{ir.CompositeExtract(result, 0)};
             inputs[7] = IR::U32{ir.CompositeExtract(result, 1)};
+        }
+        if (software_depth) {
+            program.info.used_storage_buffer_types = IR::Type::U32;
+            program.info.storage_buffers_descriptors = {{0, 0, 1, true}};
+            program.info.uses_local_invocation_id = true;
+            const auto offset = ir.ShiftLeftLogical(ir.LocalInvocationIdX(), ir.Imm32(3));
+            block.AppendNewInst(IR::Opcode::WriteStorage32, {ir.Imm32(0), offset, inputs[6]});
+            block.AppendNewInst(IR::Opcode::WriteStorage32,
+                {ir.Imm32(0), ir.IAdd(offset, ir.Imm32(4)), inputs[7]});
         }
     }
 
@@ -250,19 +262,168 @@ TEST_CASE("NV tensor shape requires the exact scope and all four half types", "[
     REQUIRE_FALSE(Vulkan::IsTensorMatrixShape(wrong));
 }
 
-TEST_CASE("Native tensor lowering remains opt-in and preserves fallback errors", "[video_core][tensor]") {
+TEST_CASE("Software HMMA shares a bounded loop without tensor extensions", "[video_core][tensor][ampere]") {
+    for (const u32 depth : {8U, 16U}) {
+        TensorProgram single{1, depth};
+        single.profile.support_cooperative_matrix = false;
+        const auto first = single.Emit(depth == 8 ? "software-k8" : "software-k16");
+        REQUIRE_FALSE(HasCapability(first, 5357));
+        REQUIRE(Instructions(first, 246).size() == 1); // OpLoopMerge
+        REQUIRE(Instructions(first, 57).size() == 1); // OpFunctionCall
+        TensorProgram repeated{64, depth};
+        repeated.profile.support_cooperative_matrix = false;
+        const auto many = repeated.Emit(depth == 8 ? "software-k8-many" : "software-k16-many");
+        REQUIRE(Instructions(many, 246).size() == 1);
+        REQUIRE(Instructions(many, 57).size() == 64);
+        REQUIRE(many.size() < first.size() + 64 * 32);
+    }
+}
+
+TEST_CASE("Software HMMA rounds only on uniform K8 boundaries", "[video_core][tensor][ampere]") {
+    for (const u32 depth : {8U, 16U}) {
+        TensorProgram fixture{1, depth};
+        fixture.profile.support_cooperative_matrix = false;
+        const auto code = fixture.Emit();
+        std::map<u32, u32> constants;
+        for (const auto& words : Instructions(code, 43)) { // OpConstant
+            constants.emplace(words[1], words[2]);
+        }
+
+        const auto selections = Instructions(code, 247); // OpSelectionMerge
+        REQUIRE(selections.size() == 1);
+        REQUIRE(selections.front()[1] == 2); // DontFlatten
+        const u32 merge = selections.front()[0];
+        const auto branches = Instructions(code, 250); // OpBranchConditional
+        const auto branch = std::ranges::find_if(branches, [=](const auto& words) {
+            return words[2] == merge;
+        });
+        REQUIRE(branch != branches.end());
+        const u32 condition = (*branch)[0];
+        const u32 round_block = (*branch)[1];
+        REQUIRE(round_block != merge);
+
+        const auto comparisons = Instructions(code, 170); // OpIEqual
+        const auto comparison = std::ranges::find_if(comparisons, [=](const auto& words) {
+            return words[1] == condition;
+        });
+        REQUIRE(comparison != comparisons.end());
+        const u32 component = (*comparison)[2];
+        const u32 boundary = constants.at((*comparison)[3]);
+        const auto masks = Instructions(code, 199); // OpBitwiseAnd
+        const auto mask = std::ranges::find_if(masks, [=](const auto& words) {
+            return words[1] == component;
+        });
+        REQUIRE(mask != masks.end());
+        const u32 pair = (*mask)[2];
+        const u32 pair_mask = constants.at((*mask)[3]);
+        REQUIRE(pair_mask == 3);
+        REQUIRE(boundary == 3);
+        const auto loads = Instructions(code, 61); // OpLoad
+        const auto pair_load = std::ranges::find_if(loads, [=](const auto& words) {
+            return words[1] == pair;
+        });
+        REQUIRE(pair_load != loads.end());
+        const u32 counter = (*pair_load)[2];
+        const auto stores = Instructions(code, 62); // OpStore
+        const auto additions = Instructions(code, 128); // OpIAdd
+        u32 initializations = 0;
+        u32 increments = 0;
+        for (const auto& store : stores) {
+            if (store[0] != counter) {
+                continue;
+            }
+            if (constants.contains(store[1])) {
+                REQUIRE(constants.at(store[1]) == 0);
+                ++initializations;
+            } else {
+                const auto increment = std::ranges::find_if(additions, [&](const auto& words) {
+                    return words[1] == store[1];
+                });
+                REQUIRE(increment != additions.end());
+                REQUIRE((*increment)[2] == pair);
+                REQUIRE(constants.at((*increment)[3]) == 1);
+                ++increments;
+            }
+        }
+        REQUIRE(initializations == 1);
+        REQUIRE(increments == 1); // No lane-dependent input controls rounding.
+        const auto limits = Instructions(code, 176); // OpULessThan
+        const auto limit = std::ranges::find_if(limits, [=](const auto& words) {
+            return words[2] == pair;
+        });
+        REQUIRE(limit != limits.end());
+        const u32 pairs = constants.at((*limit)[3]);
+        REQUIRE(pairs == depth / 2);
+        std::vector<u32> rounded_pairs;
+        for (u32 value = 0; value < pairs; ++value) {
+            if ((value & pair_mask) == boundary) {
+                rounded_pairs.push_back(value);
+            }
+        }
+        REQUIRE(rounded_pairs == (depth == 8 ? std::vector<u32>{3} : std::vector<u32>{3, 7}));
+
+        // Inspect the generated function, not a second implementation of its branch.
+        // Every expensive conversion is inside the true block; no collective is.
+        u32 block = 0;
+        u32 rounding_operations = 0;
+        u32 fma_operations = 0;
+        u32 shuffles = 0;
+        std::vector<u32> rounded_accumulators;
+        bool round_rejoins = false;
+        for (size_t offset = 5; offset < code.size();) {
+            const u32 length = code[offset] >> 16;
+            const u32 opcode = code[offset] & 0xffffU;
+            REQUIRE(length != 0);
+            REQUIRE(offset + length <= code.size());
+            const auto words = std::span{code}.subspan(offset + 1, length - 1);
+            if (opcode == 248) { // OpLabel
+                block = words[0];
+            } else if (opcode == 12 && words[3] == 2) { // GLSL.std.450 RoundEven
+                REQUIRE(block == round_block);
+                ++rounding_operations;
+            } else if (opcode == 12 && words[3] == 50) { // GLSL.std.450 Fma
+                REQUIRE(block != round_block);
+                ++fma_operations;
+            } else if (opcode == 345) { // OpGroupNonUniformShuffle
+                REQUIRE(block != round_block);
+                ++shuffles;
+            } else if (opcode == 62 && block == round_block) { // OpStore
+                rounded_accumulators.push_back(words[0]);
+            } else if (opcode == 249 && block == round_block) { // OpBranch
+                REQUIRE(words[0] == merge);
+                round_rejoins = true;
+            } else if (opcode == 169) { // OpSelect must not evaluate a discarded conversion.
+                REQUIRE(words[2] != condition);
+            }
+            offset += length;
+        }
+        REQUIRE(rounding_operations == 4);
+        REQUIRE(fma_operations == 8);
+        REQUIRE(shuffles == 4);
+        REQUIRE(round_rejoins);
+        REQUIRE(rounded_accumulators.size() == 4);
+        std::ranges::sort(rounded_accumulators);
+        REQUIRE(std::ranges::adjacent_find(rounded_accumulators) == rounded_accumulators.end());
+    }
+}
+
+TEST_CASE("Native matrix lowering selects compact software helpers without legacy toggles", "[video_core][tensor][ampere]") {
     TensorMode mode{nullptr};
     std::array<Ampere::Instruction, 2> code{{
         {{0x0810723c, 12, 0x8ff, 0}}, {{0x0000794d, 0, 0x03800000, 0}}}};
-    REQUIRE_FALSE(static_cast<bool>(Ampere::LowerToMaxwell(code, false, true)));
-    TensorMode::Set("fast");
-    const auto unsupported = Ampere::LowerToMaxwell(code, false, false);
-    REQUIRE_FALSE(static_cast<bool>(unsupported));
-    REQUIRE(unsupported.error.find("matrix multiply") != std::string_view::npos);
-    const auto supported = Ampere::LowerToMaxwell(code, false, true);
+    const auto supported = Ampere::LowerToMaxwell(code, false, false);
     REQUIRE(static_cast<bool>(supported));
-    REQUIRE(supported.instructions[0] >> 52 == 0x5d3);
-    REQUIRE(Maxwell::Decode(supported.instructions[0]) == Maxwell::Opcode::TENSOR_MUL_ADD);
+    REQUIRE(supported.instructions.size() > 100);
+    const auto compact = Ampere::LowerToMaxwell(code, false, true);
+    REQUIRE(compact);
+    REQUIRE(compact.instructions.size() == 2);
+    REQUIRE(Maxwell::Decode(compact.instructions.front()) == Maxwell::Opcode::TENSOR_MUL_ADD);
+    REQUIRE((compact.instructions.front() & (1ULL << 48)) != 0);
+    for (const char* legacy : {"fast", "stub", "off"}) {
+        TensorMode::Set(legacy);
+        REQUIRE(Ampere::LowerToMaxwell(code, false, true).instructions == compact.instructions);
+        REQUIRE(Ampere::LowerToMaxwell(code).instructions == supported.instructions);
+    }
     code[0].words[0] &= ~0x7000U;
     REQUIRE_FALSE(static_cast<bool>(Ampere::LowerToMaxwell(code, false, true)));
     code[0].words[0] |= 0x7000;

@@ -206,7 +206,10 @@ public:
                 case 30:
                     if (x >= active_dram->size()) { fail("data RAM read out of bounds"); break; }
                     value = (*active_dram)[x];
-                    if (std::ranges::find(data_ram_writes, x, &DataRamAccess::first) != data_ram_writes.end()) {
+                    // Once a read depends on an earlier write, this call cannot be memoized.
+                    // Keep recording accesses, but no further dependency searches are needed.
+                    if (!reread_data_ram &&
+                        std::ranges::find(data_ram_writes, x, &DataRamAccess::first) != data_ram_writes.end()) {
                         reread_data_ram = true;
                     }
                     data_ram_reads.emplace_back(x, value);

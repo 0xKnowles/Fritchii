@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <array>
 #include <memory>
 #include <stdexcept>
 #include "common/container/unordered_map.h"
@@ -12,6 +13,7 @@
 
 #include "common/common_types.h"
 #include "video_core/buffer_cache/memory_tracker_base.h"
+#include "video_core/buffer_cache/fence_download_ranges.h"
 #include "video_core/nx2.h"
 #include "core/device_memory.h"
 #include "core/memory.h"
@@ -634,4 +636,236 @@ TEST_CASE("MemoryTracker: repeated indirect rewrites keep historical command-pag
     }
     tracker->MarkRegionAsCpuModified(c, PAGE);
     REQUIRE(rasterizer.Count() == 0);
+}
+
+TEST_CASE("MemoryTracker: preflushable enumeration clips pages and preserves sparse state",
+          "[video_core][buffer_readback]") {
+    RasterizerInterface rasterizer;
+    auto tracker = std::make_unique<MemoryTracker>(rasterizer);
+    const u64 boundary = c + HIGH_PAGE_SIZE;
+    tracker->MarkRegionAsPreflushable(c + PAGE, PAGE);
+    tracker->MarkRegionAsPreflushable(boundary - PAGE, 2 * PAGE);
+    const auto enumerate = [&](u64 address, u64 size) {
+        std::vector<Range> ranges;
+        tracker->ForEachPreflushableRange(address, size, [&](u64 begin, u64 length) {
+            ranges.emplace_back(begin, length);
+        });
+        return ranges;
+    };
+    for (int repeat = 0; repeat < 3; ++repeat) {
+        REQUIRE(enumerate(c + PAGE + 7, HIGH_PAGE_SIZE) ==
+                std::vector<Range>{{c + PAGE + 7, PAGE - 7},
+                                   {boundary - PAGE, PAGE}, {boundary, PAGE}});
+        REQUIRE(enumerate(boundary - 7, 14) ==
+                std::vector<Range>{{boundary - 7, 7}, {boundary, 7}});
+        REQUIRE(enumerate(c + 2 * PAGE, PAGE).empty());
+        REQUIRE(enumerate(c + 4 * HIGH_PAGE_SIZE, PAGE).empty());
+        REQUIRE(enumerate(c, 0).empty());
+        REQUIRE(tracker->IsRegionPreflushable(c, 8 * 1024 * 1024));
+        REQUIRE_FALSE(tracker->IsRegionFullyPreflushable(c, 8 * 1024 * 1024));
+        REQUIRE(tracker->IsRegionFullyPreflushable(boundary - 7, 14));
+        REQUIRE_FALSE(tracker->IsRegionFullyPreflushable(boundary - PAGE - 1, 2));
+    }
+    tracker->UnmarkRegionAsPreflushable(boundary, PAGE);
+    REQUIRE_FALSE(tracker->IsRegionFullyPreflushable(boundary - 7, 14));
+    REQUIRE(rasterizer.UpdateCalls() == 0);
+}
+
+TEST_CASE("Buffer readback: one CPU-visible page does not download an entire native window",
+          "[video_core][buffer_readback]") {
+    RasterizerInterface rasterizer;
+    auto tracker = std::make_unique<MemoryTracker>(rasterizer);
+    constexpr u64 window = 8 * 1024 * 1024;
+    tracker->UnmarkRegionAsCpuModified(c, window);
+    tracker->MarkRegionAsPreflushable(c + PAGE, PAGE);
+    Common::RangeSet<DAddr> cpu_reads;
+    Common::RangeSet<DAddr> downloads;
+    cpu_reads.Add(c + PAGE + 10, 20); // Already included by the preflushable page.
+    cpu_reads.Add(c + 7 * PAGE + 3, 13);
+    cpu_reads.Add(c + window + PAGE, PAGE); // Outside this write.
+    for (int frame = 0; frame < 3; ++frame) {
+        downloads.Clear();
+        tracker->MarkRegionAsGpuModified(c, window);
+        REQUIRE(VideoCommon::QueueFenceDownloadRanges(false, c, window, *tracker,
+                                                       cpu_reads, downloads));
+        std::vector<Range> ranges;
+        downloads.ForEach([&](DAddr begin, DAddr end) { ranges.emplace_back(begin, end - begin); });
+        REQUIRE(ranges == std::vector<Range>{{c + PAGE, PAGE}, {c + 7 * PAGE + 3, 13}});
+        REQUIRE(tracker->IsRegionGpuModified(c + 2 * PAGE, PAGE));
+        REQUIRE(tracker->IsRegionFullyPreflushable(c + PAGE, PAGE));
+        REQUIRE_FALSE(tracker->IsRegionFullyPreflushable(c + PAGE, 2 * PAGE));
+        tracker->UnmarkRegionAsGpuModified(c + PAGE, PAGE);
+        // Enumerating fence ranges must not clear dirty or preflushable state elsewhere.
+        REQUIRE(tracker->IsRegionGpuModified(c + 2 * PAGE, PAGE));
+    }
+}
+
+TEST_CASE("Buffer readback: full-download policy and fully covered writes retain eager visibility",
+          "[video_core][buffer_readback]") {
+    RasterizerInterface rasterizer;
+    auto tracker = std::make_unique<MemoryTracker>(rasterizer);
+    Common::RangeSet<DAddr> cpu_reads;
+    Common::RangeSet<DAddr> downloads;
+    REQUIRE_FALSE(VideoCommon::QueueFenceDownloadRanges(true, c + 7, 3 * PAGE, *tracker,
+                                                         cpu_reads, downloads));
+    std::vector<Range> ranges;
+    downloads.ForEach([&](DAddr begin, DAddr end) { ranges.emplace_back(begin, end - begin); });
+    REQUIRE(ranges == std::vector<Range>{{c + 7, 3 * PAGE}});
+    downloads.Clear();
+    tracker->MarkRegionAsPreflushable(c, 2 * PAGE);
+    REQUIRE_FALSE(VideoCommon::QueueFenceDownloadRanges(false, c + 7, PAGE, *tracker,
+                                                         cpu_reads, downloads));
+    ranges.clear();
+    downloads.ForEach([&](DAddr begin, DAddr end) { ranges.emplace_back(begin, end - begin); });
+    REQUIRE(ranges == std::vector<Range>{{c + 7, PAGE}});
+    downloads.Clear();
+    REQUIRE_FALSE(VideoCommon::QueueFenceDownloadRanges(false, c, 0, *tracker, cpu_reads, downloads));
+    REQUIRE(downloads.Empty());
+    REQUIRE(VideoCommon::QueueFenceDownloadRanges(false, c + 4 * PAGE, PAGE, *tracker,
+                                                  cpu_reads, downloads));
+    REQUIRE(downloads.Empty());
+}
+
+TEST_CASE("Buffer readback: final copies preserve disjoint selections on a dirty page",
+          "[video_core][buffer_readback]") {
+    RasterizerInterface rasterizer;
+    auto tracker = std::make_unique<MemoryTracker>(rasterizer);
+    tracker->UnmarkRegionAsCpuModified(c, PAGE);
+    tracker->MarkRegionAsGpuModified(c, PAGE);
+    Common::RangeSet<DAddr> gpu_modified;
+    gpu_modified.Add(c, PAGE);
+    Common::RangeSet<DAddr> cpu_reads;
+    cpu_reads.Add(c + 3, 13);
+    cpu_reads.Add(c + 101, 7);
+    Common::RangeSet<DAddr> selected;
+    REQUIRE(VideoCommon::QueueFenceDownloadRanges(false, c, PAGE, *tracker, cpu_reads, selected));
+
+    // Exercise selection through the same final-copy enumerator the fence builder uses.
+    for (int repeat = 0; repeat < 3; ++repeat) {
+        std::vector<Range> copies;
+        selected.ForEach([&](DAddr begin, DAddr end) {
+            VideoCommon::ForEachFenceDownloadRange(begin, end - begin, *tracker, gpu_modified,
+                [&](DAddr first, DAddr last) { copies.emplace_back(first, last - first); });
+        });
+        REQUIRE(copies == std::vector<Range>{{c + 3, 13}, {c + 101, 7}});
+        REQUIRE(tracker->IsRegionGpuModified(c, PAGE));
+        REQUIRE(gpu_modified.Intersects(c + 1000, 1));
+    }
+}
+
+TEST_CASE("Buffer readback: final copies intersect buffer bounds and byte-level dirtiness",
+          "[video_core][buffer_readback]") {
+    RasterizerInterface rasterizer;
+    auto tracker = std::make_unique<MemoryTracker>(rasterizer);
+    const DAddr boundary = c + HIGH_PAGE_SIZE;
+    tracker->UnmarkRegionAsCpuModified(boundary - PAGE, 3 * PAGE);
+    tracker->MarkRegionAsGpuModified(boundary - PAGE, 2 * PAGE);
+    Common::RangeSet<DAddr> gpu_modified;
+    gpu_modified.Add(boundary - PAGE, PAGE - 2);
+    gpu_modified.Add(boundary + 2, 2 * PAGE - 2);
+    std::vector<Range> copies;
+    const auto append = [&](DAddr first, DAddr last) { copies.emplace_back(first, last - first); };
+    // This interval represents a selected range clipped to a host buffer at both ends.
+    VideoCommon::ForEachFenceDownloadRange(boundary - 7, 14, *tracker, gpu_modified, append);
+    REQUIRE(copies == std::vector<Range>{{boundary - 7, 5}, {boundary + 2, 5}});
+    copies.clear();
+    VideoCommon::ForEachFenceDownloadRange(boundary + PAGE, PAGE, *tracker, gpu_modified, append);
+    REQUIRE(copies.empty()); // Byte-level dirtiness alone does not bypass page tracking.
+    VideoCommon::ForEachFenceDownloadRange(boundary, 0, *tracker, gpu_modified, append);
+    REQUIRE(copies.empty());
+    REQUIRE(tracker->IsRegionGpuModified(boundary - PAGE, PAGE));
+    REQUIRE(gpu_modified.Intersects(boundary + 8, 1));
+}
+
+TEST_CASE("Buffer readback: full and selective final copies match a byte reference",
+          "[video_core][buffer_readback]") {
+    constexpr u64 size = 3 * PAGE;
+    constexpr DAddr address = c + WORD - PAGE;
+    RasterizerInterface rasterizer;
+    auto tracker = std::make_unique<MemoryTracker>(rasterizer);
+    tracker->UnmarkRegionAsCpuModified(address, size);
+    tracker->MarkRegionAsGpuModified(address, size);
+    tracker->MarkRegionAsPreflushable(address + PAGE, PAGE);
+    Common::RangeSet<DAddr> cpu_reads;
+    Common::RangeSet<DAddr> gpu_modified;
+    std::array<bool, size> requested{};
+    std::array<bool, size> dirty{};
+    for (u64 offset = 0; offset < size; ++offset) {
+        requested[offset] = (offset >= PAGE && offset < 2 * PAGE) || offset % 101 < 17;
+        dirty[offset] = offset % 79 < 53;
+        if (offset % 101 < 17) {
+            cpu_reads.Add(address + offset, 1);
+        }
+        if (dirty[offset]) {
+            gpu_modified.Add(address + offset, 1);
+        }
+    }
+    for (const bool full : {false, true}) {
+        Common::RangeSet<DAddr> selected;
+        VideoCommon::QueueFenceDownloadRanges(full, address + 3, size - 10, *tracker,
+                                             cpu_reads, selected);
+        std::array<unsigned, size> visits{};
+        selected.ForEach([&](DAddr begin, DAddr end) {
+            VideoCommon::ForEachFenceDownloadRange(begin, end - begin, *tracker, gpu_modified,
+                [&](DAddr first, DAddr last) {
+                    REQUIRE(first >= begin);
+                    REQUIRE(last <= end);
+                    for (DAddr byte = first; byte < last; ++byte) {
+                        ++visits[byte - address];
+                    }
+                });
+        });
+        for (u64 offset = 0; offset < size; ++offset) {
+            const bool expected = offset >= 3 && offset < size - 7 && dirty[offset] &&
+                                  (full || requested[offset]);
+            REQUIRE(visits[offset] == (expected ? 1U : 0U));
+        }
+    }
+}
+
+TEST_CASE("Buffer readback: selected pages match a reference across word and manager boundaries",
+          "[video_core][buffer_readback]") {
+    RasterizerInterface rasterizer;
+    auto tracker = std::make_unique<MemoryTracker>(rasterizer);
+    constexpr u64 pages = 2048;
+    constexpr u64 start = c - 13 * PAGE;
+    std::array<bool, pages> preflushable{};
+    std::array<bool, pages> cpu_visible{};
+    u32 random = 0x19fef00d;
+    Common::RangeSet<DAddr> cpu_reads;
+    for (u64 page = 0; page < pages; ++page) {
+        random = random * 1664525U + 1013904223U;
+        preflushable[page] = (random & 31) == 0;
+        cpu_visible[page] = (random & 15) == 1;
+        if (preflushable[page]) tracker->MarkRegionAsPreflushable(start + page * PAGE, PAGE);
+        if (cpu_visible[page]) cpu_reads.Add(start + page * PAGE, PAGE);
+    }
+    for (u64 query = 0; query < 40; ++query) {
+        const u64 first = query * 41;
+        const u64 count = (std::min<u64>)(pages - first, 97 + query);
+        const u64 address = start + first * PAGE + 17;
+        const u64 size = count * PAGE - 31;
+        Common::RangeSet<DAddr> downloads;
+        const bool needs_traps = VideoCommon::QueueFenceDownloadRanges(
+            false, address, size, *tracker, cpu_reads, downloads);
+        u64 expected_bytes = 0;
+        bool all_preflushable = true;
+        for (u64 page = first; page < first + count; ++page) {
+            const u64 begin = (std::max)(address, start + page * PAGE);
+            const u64 end = (std::min)(address + size, start + (page + 1) * PAGE);
+            const bool expected = preflushable[page] || cpu_visible[page];
+            REQUIRE(downloads.Intersects(begin, end - begin) == expected);
+            if (expected) expected_bytes += end - begin;
+            all_preflushable &= preflushable[page];
+        }
+        u64 actual_bytes = 0;
+        downloads.ForEach([&](DAddr begin, DAddr end) {
+            REQUIRE(begin >= address);
+            REQUIRE(end <= address + size);
+            actual_bytes += end - begin;
+        });
+        REQUIRE(actual_bytes == expected_bytes);
+        REQUIRE(needs_traps == !all_preflushable);
+        REQUIRE(tracker->IsRegionFullyPreflushable(address, size) == all_preflushable);
+    }
 }

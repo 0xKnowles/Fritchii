@@ -203,6 +203,8 @@ void DefineVariables(const EmitContext& ctx, std::string& header) {
 
 std::string EmitGLSL(const Profile& profile, const RuntimeInfo& runtime_info, IR::Program& program,
                      Bindings& bindings) {
+    if (program.info.native_global_bounds)
+        throw NotImplementedException("Native multi-pointer storage selection in GLSL");
     EmitContext ctx{program, bindings, profile, runtime_info};
     Precolor(program);
     EmitCode(ctx, program);

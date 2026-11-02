@@ -66,6 +66,7 @@ struct ConstBufferAddr {
     IR::U32 dynamic_offset;
     u32 count;
     bool has_secondary;
+    BufferTextureSource buffer_source{};
 };
 
 class Environment {
@@ -77,6 +78,9 @@ public:
     [[nodiscard]] virtual u32 TranslateProgramAddress(u32 address) const { return address; }
 
     [[nodiscard]] virtual u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) = 0;
+
+    // Native environments classify pointer slots; non-native translation does not use this.
+    [[nodiscard]] virtual bool IsCbufStorageBufferPointer(u32, u32) { return false; }
 
     [[nodiscard]] virtual TextureType ReadTextureType(u32 raw_handle) = 0;
 
@@ -99,6 +103,9 @@ public:
     [[nodiscard]] virtual std::array<u32, 3> WorkgroupSize() const = 0;
 
     [[nodiscard]] virtual bool HasHLEMacroState() const = 0;
+
+    // Only emulator-generated native lowering may use extended SSA-register copies/MUFU modes.
+    [[nodiscard]] virtual bool HasNativeInstructions() const { return false; }
 
     [[nodiscard]] virtual std::optional<ReplaceConstant> GetReplaceConstBuffer(u32 bank,
                                                                                u32 offset) = 0;

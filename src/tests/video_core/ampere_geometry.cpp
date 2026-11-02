@@ -216,7 +216,9 @@ constexpr std::array<Instruction, 8> TerminalFloatTailProgram{{
     {{0x00027802, 0x20, 0x00000f00, 0}},
     {{0x00007944, 0x50, 0x03c00000, 0}},
     {{0x00000944, 0x10, 0x03c00000, 0}},
-    {{0x00007947, 0xffffffe0, 0x0383ffff, 0}},
+    // Forward branch deliberately excludes the independent loop-backedge proof. These tests
+    // exercise the stricter terminal-tail fallback, not the newly supported loop transfer.
+    {{0x00007947, 0, 0x03800000, 0}},
     {{0xff007209, 0x21, 0x07810000, 0x000fe400}},
     {{0x01017809, 0x447a0000, 0x03810000, 0x000fe400}},
     {{0x0000794d, 0, 0x03800000, 0x000fec00}},

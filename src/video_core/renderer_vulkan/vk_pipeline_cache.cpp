@@ -68,7 +68,7 @@ using VideoCommon::FileEnvironment;
 using VideoCommon::GenericEnvironment;
 using VideoCommon::GraphicsEnvironment;
 
-constexpr u32 CACHE_VERSION = 25;
+constexpr u32 CACHE_VERSION = 39;
 constexpr size_t VULKAN_CACHE_FLUSH_PIPELINES = 128;
 constexpr size_t VULKAN_CACHE_FLUSH_MIN_SECONDS = 30;
 constexpr std::array<char, 8> VULKAN_CACHE_MAGIC_NUMBER{'y', 'u', 'z', 'u', 'v', 'k', 'c', 'h'};
@@ -437,10 +437,12 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
                            Common::ThreadPlacement::Background),
     translation_workers(num_translation_threads, "VkPipelineTranslator", {},
                         Common::ThreadPlacement::Background) {
-    const char* tensor_mode = std::getenv("EDEN_NX2_TENSOR");
-    const bool tensor_enabled = tensor_mode && std::string_view{tensor_mode} == "fast" &&
-                                device.IsExtCooperativeMatrixSupported();
-    SetCooperativeMatrixSupported(tensor_enabled);
+    const bool tensor_enabled = device.IsExtCooperativeMatrixSupported();
+    // Compact software HMMA uses ordinary subgroup shuffles, not tensor extensions.
+    SetCooperativeMatrixSupported(
+        device.GetDriverID() == VK_DRIVER_ID_NVIDIA_PROPRIETARY &&
+        (device.GetSubgroupSupportedStages() & VK_SHADER_STAGE_COMPUTE_BIT) &&
+        device.IsSubgroupFeatureSupported(VK_SUBGROUP_FEATURE_SHUFFLE_BIT));
     if (use_async_translation) {
         LOG_INFO(Render_Vulkan, "Native graphics pipelines are translated on {} worker threads",
                  num_translation_threads);
@@ -586,6 +588,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .support_geometry_shader_passthrough = device.IsNvGeometryShaderPassthroughSupported(),
         .support_conditional_barrier = device.SupportsConditionalBarriers(),
         .single_lane_geometry_subgroups = !profile.SupportsSubgroupStage(Shader::Stage::Geometry),
+        .support_buffer_texture_handles = profile.support_sampled_image_array_nonuniform_indexing,
     };
     host_info.ApplyDescriptorLimitPolicy();
 
@@ -1427,7 +1430,7 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
     const GPUVAddr program_base{kepler_compute->regs.code_loc.Address()};
     const auto& qmd{kepler_compute->launch_description};
     ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start,
-                           shader->lowered_native, profile.support_cooperative_matrix};
+                           shader->lowered_native, support_cooperative_matrix};
     env.SetCachedSize(shader->size_bytes);
 
     main_pools.ReleaseContents();

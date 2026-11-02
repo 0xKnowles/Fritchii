@@ -121,14 +121,14 @@ IR::F64 TranslatorVisitor::GetDoubleReg39(u64 insn) {
     return D(reg.index);
 }
 
-static std::pair<IR::U32, IR::U32> CbufAddr(u64 insn) {
+static std::pair<IR::U32, IR::U32> CbufAddr(u64 insn, bool native) {
     union {
         u64 raw;
         BitField<20, 14, u64> offset;
         BitField<34, 5, u64> binding;
     } const cbuf{insn};
 
-    if (cbuf.binding >= 18) {
+    if (cbuf.binding >= 18 && !(native && cbuf.binding >= 24)) {
         throw NotImplementedException("Out of bounds constant buffer binding {}", cbuf.binding);
     }
     if (cbuf.offset >= 0x10'000) {
@@ -140,12 +140,12 @@ static std::pair<IR::U32, IR::U32> CbufAddr(u64 insn) {
 }
 
 IR::U32 TranslatorVisitor::GetCbuf(u64 insn) {
-    const auto [binding, byte_offset]{CbufAddr(insn)};
+    const auto [binding, byte_offset]{CbufAddr(insn, env.HasNativeInstructions())};
     return ir.GetCbuf(binding, byte_offset);
 }
 
 IR::F32 TranslatorVisitor::GetFloatCbuf(u64 insn) {
-    const auto [binding, byte_offset]{CbufAddr(insn)};
+    const auto [binding, byte_offset]{CbufAddr(insn, env.HasNativeInstructions())};
     return ir.GetFloatCbuf(binding, byte_offset);
 }
 
@@ -155,7 +155,7 @@ IR::F64 TranslatorVisitor::GetDoubleCbuf(u64 insn) {
         BitField<20, 1, u64> unaligned;
     } const cbuf{insn};
 
-    const auto [binding, offset_value]{CbufAddr(insn)};
+    const auto [binding, offset_value]{CbufAddr(insn, env.HasNativeInstructions())};
     const bool unaligned{cbuf.unaligned != 0};
     const u32 offset{offset_value.U32()};
     const IR::Value addr{unaligned ? offset | 4u : (offset & ~7u) | 4u};
@@ -174,7 +174,7 @@ IR::U64 TranslatorVisitor::GetPackedCbuf(u64 insn) {
     if (cbuf.unaligned != 0) {
         throw NotImplementedException("Unaligned packed constant buffer read");
     }
-    const auto [binding, lower_offset]{CbufAddr(insn)};
+    const auto [binding, lower_offset]{CbufAddr(insn, env.HasNativeInstructions())};
     const IR::U32 upper_offset{ir.Imm32(lower_offset.U32() + 4)};
     const IR::U32 lower_value{ir.GetCbuf(binding, lower_offset)};
     const IR::U32 upper_value{ir.GetCbuf(binding, upper_offset)};

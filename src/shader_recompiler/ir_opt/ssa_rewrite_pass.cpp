@@ -188,6 +188,11 @@ public:
 
     template <typename Type>
     IR::Value ReadVariable(Type variable, IR::Block* root_block) {
+        // A local definition needs neither a predecessor walk nor another write of the same
+        // value. ReadVariable never nests, so no pending phi can survive into this lookup.
+        if (const IR::Value def{current_def.Def(root_block, variable)}; !def.IsEmpty()) {
+            return def;
+        }
         // Reads walk back through every block until they find a definition, often dozens deep:
         // reuse one stack instead of growing a new vector on every read.
         auto& stack{read_stack};

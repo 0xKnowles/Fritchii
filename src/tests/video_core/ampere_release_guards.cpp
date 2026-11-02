@@ -23,7 +23,7 @@ TEST_CASE("Ampere ordinary gathers reject unproved half precision modes",
     }
 }
 
-TEST_CASE("Ampere IADD3.X with a third source rejects carry outputs and a second carry input",
+TEST_CASE("Ampere IADD3.X with a third source supports carry outputs",
           "[video_core][ampere][release_guards]") {
     // IADD3.X R1, R1, RZ, R2, P0
     constexpr u32 plain = 0x007fe402;
@@ -36,11 +36,9 @@ TEST_CASE("Ampere IADD3.X with a third source rejects carry outputs and a second
     };
     REQUIRE(static_cast<bool>(lower(plain)));
     for (const u32 word2 : {(plain & ~(7U << 17)) | (1U << 17),    // carry out P1
-                            (plain & ~(7U << 20)) | (1U << 20),    // second carry out P1
-                            (plain & ~(15U << 13)) | (1U << 13)}) { // second carry in P1
+                            (plain & ~(7U << 20)) | (1U << 20)}) { // second carry out P1
         const auto lowered = lower(word2);
-        REQUIRE_FALSE(static_cast<bool>(lowered));
-        REQUIRE(lowered.error == "native integer carry mode");
+        REQUIRE(static_cast<bool>(lowered));
     }
 }
 

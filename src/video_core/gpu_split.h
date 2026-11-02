@@ -11,6 +11,9 @@
 #include <type_traits>
 
 #include "common/common_types.h"
+#include "video_core/gpu_split_metrics.h"
+#include "video_core/command_write_frontier.h"
+#include "video_core/engines/engine_interface.h"
 
 namespace Core {
 class System;
@@ -68,7 +71,7 @@ public:
         if (segment != nullptr) {
             entry[1] = *segment;
         }
-        Commit(words);
+        Commit(words, engine->execution_mask[method]);
     }
     void MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
                      u32 amount, u32 methods_pending, const GPUVAddr* segment);
@@ -102,7 +105,11 @@ public:
     /// Makes what was sent visible to the back.
     void Publish();
     /// Waits until the back executed everything sent so far.
-    void Drain();
+    void Drain(SplitDrainReason reason = SplitDrainReason::Other);
+    /// Wait for possible command-memory writers; leave inert sink appends queued.
+    void DrainCommandReads();
+    /// Profile the decision made after command-fetch synchronization, without changing it.
+    void NoteCommandFetch(u64 bytes, bool historical_hit, bool flushed);
 
 private:
     enum class Kind : u64 {
@@ -136,13 +143,15 @@ private:
         return ReserveSlow(words);
     }
     u64* ReserveSlow(size_t words);
-    void Commit(size_t words) {
+    void Commit(size_t words, bool may_write = true) {
         write_position += words;
+        command_writes.Commit(write_position, may_write);
         if (write_position - published_local >= publish_every) {
             Publish();
         }
     }
     void WaitForSpace(size_t words);
+    void DrainTo(u64 target, SplitDrainReason reason);
     void SelectEngine(Tegra::Engines::EngineInterface* engine) {
         if (engine != front_engine) [[unlikely]] {
             SwitchEngine(engine);
@@ -162,6 +171,7 @@ private:
     u64 write_position{};
     u64 published_local{};
     u64 consumed_cache{};
+    CommandWriteFrontier command_writes;
     /// Words between publishes: small right after a drain, while the back has nothing to do.
     size_t publish_every{PublishEvery};
     Tegra::Engines::EngineInterface* front_engine{};

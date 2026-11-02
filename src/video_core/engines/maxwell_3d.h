@@ -26,6 +26,7 @@
 #include "video_core/engines/engine_upload.h"
 #include "video_core/gpu.h"
 #include "video_core/macro.h"
+#include "video_core/native_root_table.h"
 #include "video_core/textures/texture.h"
 #include "video_core/engines/maxwell_3d.h"
 
@@ -83,7 +84,7 @@ public:
         static constexpr std::size_t MaxShaderProgram = 6;
         static constexpr std::size_t MaxShaderStage = 5;
         // Maximum number of const buffers per shader stage.
-        static constexpr std::size_t MaxConstBuffers = 18;
+        static constexpr std::size_t MaxConstBuffers = 32;
         static constexpr std::size_t MaxConstBufferSize = 0x10000;
 
         struct ID {
@@ -3144,6 +3145,7 @@ public:
     };
 
     State state{};
+    NativeRootTables native_root_tables;
 
     /// Reads a register value located at the input method address
     u32 GetRegisterValue(u32 method) const;

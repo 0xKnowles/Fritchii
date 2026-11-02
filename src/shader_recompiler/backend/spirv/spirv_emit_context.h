@@ -363,10 +363,13 @@ public:
 
     Id load_global_func_u32{};
     Id load_global_func_u32x2{};
+    std::array<Id, 2> software_matrix_functions{};
     Id load_global_func_u32x4{};
     Id write_global_func_u32{};
     Id write_global_func_u32x2{};
     Id write_global_func_u32x4{};
+    Id write_global_subword_func{};
+    std::array<Id, 11> global_atomic_funcs{};
 
     bool need_input_position_indirect{};
     Id input_position{};

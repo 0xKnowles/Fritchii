@@ -420,7 +420,7 @@ bool DmaPusher::Step() {
                                              return memory_manager.GpuToCpuAddress(page);
                                          }))) {
                     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
-                        split.Drain();
+                        split.Drain(VideoCommon::SplitDrainReason::ParameterFlush);
                     }
                     const GPUVAddr address = dma_state.dma_get;
                     const size_t bytes = words * sizeof(u32);
@@ -439,7 +439,7 @@ bool DmaPusher::Step() {
                 } else if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
                     // The caches behind IsMemoryDirty belong to the split's back thread.
                     if (g_nx2_ampere.load(std::memory_order_relaxed)) {
-                        split.Drain();
+                        split.Drain(VideoCommon::SplitDrainReason::ParameterDirty);
                         engine_state->current_dirty = memory_manager.IsMemoryDirty(
                             dma_state.dma_get, words * sizeof(u32));
                     } else {
@@ -532,7 +532,7 @@ bool DmaPusher::Step() {
     }
 
     if (signal_sync) {
-        VideoCommon::GpuSplit::Get().Drain();
+        VideoCommon::GpuSplit::Get().Drain(VideoCommon::SplitDrainReason::SubmissionFence);
         rasterizer->SignalFence([this]() {
             std::scoped_lock lk(sync_mutex);
             synced = true;
@@ -852,16 +852,23 @@ void DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
     if (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) || size == 0) {
         return;
     }
+    bool historical_hit = false;
+    bool flushed = false;
     Nx2SynchronizeGpuWrittenCommands(address, size,
         [] {
-            if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) split.Drain();
+            if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+                split.DrainCommandReads();
+            }
         },
         [&](GPUVAddr page) { return memory_manager.GpuToCpuAddress(page); },
         [&] {
+            historical_hit = true;
             if (memory_manager.IsMemoryDirty(address, size, VideoCommon::CacheType::BufferCache)) {
                 memory_manager.FlushRegion(address, size, VideoCommon::CacheType::BufferCache);
+                flushed = true;
             }
         });
+    VideoCommon::GpuSplit::Get().NoteCommandFetch(size, historical_hit, flushed);
 }
 
 void DmaPusher::ReportUnboundSubchannel() {

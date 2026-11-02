@@ -106,7 +106,7 @@ IR::F64 UnpackCbuf(TranslatorVisitor& v, u64 insn) {
         BitField<20, 14, s64> offset;
         BitField<34, 5, u64> binding;
     } const cbuf{insn};
-    if (cbuf.binding >= 18) {
+    if (cbuf.binding >= 18 && !(v.env.HasNativeInstructions() && cbuf.binding >= 24)) {
         throw NotImplementedException("Out of bounds constant buffer binding {}", cbuf.binding);
     }
     if (cbuf.offset >= 0x4'000 || cbuf.offset < 0) {

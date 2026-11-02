@@ -54,6 +54,12 @@ public:
         : RuntimeError{"native matrix multiply rejected: {}", reason} {}
 };
 
+// Dispatch-dependent failures must not enter the shader cache's permanent rejection table.
+class NativeTrapGuardError : public RuntimeError {
+public:
+    NativeTrapGuardError() : RuntimeError{"Native compute trap is reachable or its uniform guard is unknown"} {}
+};
+
 class NotImplementedException : public Exception {
 public:
     template <typename... Args>

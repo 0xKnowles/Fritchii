@@ -15,6 +15,7 @@
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/buffer_cache/memory_tracker_base.h"
 #include "video_core/buffer_cache/usage_tracker.h"
+#include "video_core/buffer_cache/uniform_upload_cache.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_multi_range_buffer.h"
@@ -275,15 +276,8 @@ private:
     VkDeviceSize multi_range_total{};
 
     struct UniformStreamReuse {
-        static constexpr u32 MaxBytes = 4096;
-        struct Slot {
-            StagingBufferRef ref{};
-            u64 tick{};
-            u32 size{};
-            std::array<u8, MaxBytes> bytes{};
-        };
-        std::array<std::array<Slot, 18>, 5> slots{};
-        std::array<u8, MaxBytes> scratch{};
+        VideoCommon::UniformUploadCache<StagingBufferRef> cache;
+        std::array<u8, VideoCommon::UniformUploadCache<StagingBufferRef>::MaxBytes> scratch{};
     };
     std::unique_ptr<UniformStreamReuse> uniform_stream_reuse;
 

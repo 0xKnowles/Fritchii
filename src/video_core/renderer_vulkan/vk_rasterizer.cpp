@@ -25,6 +25,7 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/compute_dispatch.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/native_query_trace.h"
@@ -867,7 +868,11 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     }
 
     query_cache.NotifySegment(true);
-    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
+    // A deferred load-op clear has no active render pass. Starting a query here would
+    // begin it outside the pass and end it inside the subsequently realized pass.
+    // The first real draw enables its own counter after requesting that render pass.
+    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
+                              !can_defer_clear && regs.zpass_pixel_count_enable);
     UpdateViewportsState(regs);
 
     const u32 color_attachment = regs.clear_surface.RT;
@@ -952,25 +957,61 @@ void RasterizerVulkan::Clear(u32 layer_count) {
 }
 
 void RasterizerVulkan::DispatchCompute() {
-    VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Compute};
-    FlushWork();
-    gpu_memory->FlushCaching();
+    namespace Profile = VideoCommon::Nx2Profile;
+    Profile::Scope profile_scope{Profile::Zone::Compute};
+    {
+        Profile::Scope scope{Profile::Zone::ComputeFlush};
+        FlushWork();
+        gpu_memory->FlushCaching();
+    }
+    const auto& qmd{kepler_compute->launch_description};
+    const auto indirect_address = kepler_compute->GetIndirectComputeAddress();
+    const std::array<u32, 3> dim{qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z};
+    const auto record_read_barrier = [&] {
+        Profile::Scope scope{Profile::Zone::ComputeRecord};
+        scheduler.RequestOutsideRenderPassOperationContext();
+        static constexpr VkMemoryBarrier READ_BARRIER{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
+        };
+        scheduler.Record([](vk::CommandBuffer cmdbuf) {
+            cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, READ_BARRIER);
+        });
+    };
+    if (VideoCommon::IsEmptyDirectComputeDispatch(indirect_address.has_value(), dim)) {
+        // A zero-sized direct grid executes no shader and writes no storage buffers.
+        // Keep the pre-dispatch ordering, but avoid resource setup/false dirty tracking.
+        record_read_barrier();
+        Profile::Add(Profile::Counter::EmptyComputeSkipped, 1);
+        return;
+    }
 
-    ComputePipeline* const pipeline{pipeline_cache.CurrentComputePipeline()};
+    ComputePipeline* pipeline{};
+    {
+        Profile::Scope scope{Profile::Zone::ComputePipeline};
+        pipeline = pipeline_cache.CurrentComputePipeline();
+    }
     if (!pipeline) {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute pipeline unavailable");
         return;
     }
-    std::scoped_lock lock{texture_cache.mutex, buffer_cache.mutex};
+    std::unique_lock texture_lock{texture_cache.mutex, std::defer_lock};
+    std::unique_lock buffer_lock{buffer_cache.mutex, std::defer_lock};
+    {
+        Profile::Scope scope{Profile::Zone::ComputeLocks};
+        std::lock(texture_lock, buffer_lock);
+    }
     if (!pipeline->Configure(*kepler_compute, *gpu_memory, scheduler, buffer_cache,
                              texture_cache)) {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute resources unavailable");
         return;
     }
 
-    const auto& qmd{kepler_compute->launch_description};
-    auto indirect_address = kepler_compute->GetIndirectComputeAddress();
     if (indirect_address) {
+        Profile::Scope scope{Profile::Zone::ComputeRecord};
         // DispatchIndirect
         static constexpr auto sync_info = VideoCommon::ObtainBufferSynchronize::FullSynchronize;
         const auto post_op = VideoCommon::ObtainBufferOperation::DiscardWrite;
@@ -986,20 +1027,12 @@ void RasterizerVulkan::DispatchCompute() {
         });
         return;
     }
-    const std::array<u32, 3> dim{qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z};
     const std::array<u32, 3> max_dim{device.GetMaxComputeWorkGroupCount()};
     if (dim[0] > max_dim[0] || dim[1] > max_dim[1] || dim[2] > max_dim[2]) {
         return;
     }
-    scheduler.RequestOutsideRenderPassOperationContext();
-    static constexpr VkMemoryBarrier READ_BARRIER{
-        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-        .pNext = nullptr,
-        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
-    };
-    scheduler.Record([](vk::CommandBuffer cmdbuf) { cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                               0, READ_BARRIER); });
+    record_read_barrier();
+    Profile::Scope record_scope{Profile::Zone::ComputeRecord};
     scheduler.Record([pipeline, dim](vk::CommandBuffer cmdbuf) {
         if (!pipeline->IsBound()) {
             return;
@@ -1120,8 +1153,10 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
     }
     if (buffer_cache.FlushesOnCpuRead()) {
         std::scoped_lock lock{buffer_cache.mutex};
-        auto area = buffer_cache.GetFlushArea(result.start_address,
-                                              result.end_address - result.start_address);
+        // A whole texture may need flushing, but only the original CPU-read pages
+        // should become eagerly downloaded buffer pages. Completed readback paths
+        // limit reusable CPU coverage to these same pages before returning it.
+        auto area = buffer_cache.GetFlushArea(addr, size);
         if (area) {
             result.start_address = (std::min)(result.start_address, area->start_address);
             result.end_address = (std::max)(result.end_address, area->end_address);

@@ -8,6 +8,16 @@
 
 namespace AudioCore::Renderer {
 
+template <size_t N>
+static constexpr bool IsResampleLutBounded(const std::array<f32, N>& lut) {
+    for (const auto coefficient : lut) {
+        if (!(coefficient >= -1.0f && coefficient <= 1.0f)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void ResampleLowQuality(std::span<s32> output, std::span<const s16> input, const Common::FixedPoint<49, 15>& sample_rate_ratio, Common::FixedPoint<49, 15>& fraction, const u32 samples_to_write) {
     u32 read_index{0};
     for (u32 i = 0; i < samples_to_write; i++) {
@@ -287,14 +297,20 @@ static void ResampleNormalQuality(std::span<s32> output, std::span<const s16> in
         }
     };
 
+    static_assert(IsResampleLutBounded(lut0) && IsResampleLutBounded(lut1) &&
+                  IsResampleLutBounded(lut2));
+    // Four s16 taps with coefficients bounded by 1 and eight fractional bits sum
+    // to at most 4 * 32768 * 256 (2^25). Narrowing permits packed conversion while
+    // preserving each tap's truncation and the final arithmetic right shift.
+    using ResampleSample = Common::FixedPoint<24, 8>;
     auto lut{get_lut()};
     u32 read_index{0};
     for (u32 i = 0; i < samples_to_write; i++) {
         const auto lut_index = ((fraction.get_frac() >> 8) << 2) & 511;
-        const Common::FixedPoint<56, 8> sample0{input[read_index + 0] * lut[lut_index + 0]};
-        const Common::FixedPoint<56, 8> sample1{input[read_index + 1] * lut[lut_index + 1]};
-        const Common::FixedPoint<56, 8> sample2{input[read_index + 2] * lut[lut_index + 2]};
-        const Common::FixedPoint<56, 8> sample3{input[read_index + 3] * lut[lut_index + 3]};
+        const ResampleSample sample0{input[read_index + 0] * lut[lut_index + 0]};
+        const ResampleSample sample1{input[read_index + 1] * lut[lut_index + 1]};
+        const ResampleSample sample2{input[read_index + 2] * lut[lut_index + 2]};
+        const ResampleSample sample3{input[read_index + 3] * lut[lut_index + 3]};
         output[i] = (sample0 + sample1 + sample2 + sample3).to_int_floor();
         fraction += sample_rate_ratio;
         read_index += static_cast<u32>(fraction.to_int_floor());

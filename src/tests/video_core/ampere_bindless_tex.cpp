@@ -5,6 +5,7 @@
 #include <catch2/generators/catch_generators.hpp>
 
 #include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
+#include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
 #include "shader_recompiler/frontend/ir/program.h"
 #include "shader_recompiler/frontend/maxwell/translate/translate.h"
@@ -34,7 +35,10 @@ Instruction Branch(s32 relative, u32 predicate = 7) {
 
 class TextureEnvironment final : public Shader::Environment {
 public:
-    explicit TextureEnvironment(std::span<const u64> instructions_) : instructions{instructions_} {}
+    explicit TextureEnvironment(std::span<const u64> instructions_,
+                                Shader::TextureType type_ = Shader::TextureType::Color2D)
+        : instructions{instructions_}, type{type_} {}
+    bool HasNativeInstructions() const override { return true; }
 
     u64 ReadInstruction(u32 address) override {
         for (u32 i = 0; i < instructions.size(); ++i) {
@@ -50,7 +54,7 @@ public:
     }
     Shader::TextureType ReadTextureType(u32 handle) override {
         REQUIRE((handle == 0x123abcde || handle == 0x123bcdef));
-        return Shader::TextureType::Color2D;
+        return type;
     }
     Shader::TexturePixelFormat ReadTexturePixelFormat(u32 handle) override {
         REQUIRE((handle == 0x123abcde || handle == 0x123bcdef));
@@ -76,6 +80,7 @@ public:
 
 private:
     std::span<const u64> instructions;
+    Shader::TextureType type;
 };
 
 TEST_CASE("Ampere uniform bindless TEX traces both merged cbuf handle sources",
@@ -155,6 +160,50 @@ TEST_CASE("Ampere uniform bindless TEX traces both merged cbuf handle sources",
     REQUIRE(descriptor.shift_left == 0);
     REQUIRE(descriptor.secondary_shift_left == 0);
     REQUIRE(descriptor.count == 1);
+}
+
+TEST_CASE("Native texture pair proof follows SSA values rather than unrelated branches",
+          "[video_core][ampere][bindless_tex]") {
+    const bool clobber = GENERATE(false, true);
+    const std::array<Instruction, 7> code{{
+        {{0x00047ab9, 0x00805a00, 0x00000800, 0x000fe400}},
+        {{0x00057ab9, 0x00815a00, 0x00000800, 0x000fe400}},
+        {{0x04047292, 0x00000005, 0x0f8efc3f, 0x000fc800}},
+        sample[0], sample[1], {{0x00007941, 0, 0x03800000, 0}}, sample[2],
+    }};
+    const auto lowered = LowerToMaxwell(code);
+    REQUIRE(static_cast<bool>(lowered));
+    TextureEnvironment env{lowered.instructions};
+    Shader::ObjectPool<Shader::IR::Inst> pool;
+    Shader::IR::Block block{pool};
+    Shader::IR::Program program;
+    program.blocks = {&block};
+    program.post_order_blocks = {&block};
+    const u32 last = static_cast<u32>(lowered.instructions.size() - 1);
+    Shader::Maxwell::Translate(env, &block, 0x50, 0x50 + last * 8 + ((last + 1) / 3) * 8);
+    Shader::Optimization::SsaRewritePass(program);
+    Shader::Optimization::ConstantPropagationPass(env, program);
+    auto packed = std::find_if(block.begin(), block.end(), [](const auto& inst) {
+        return inst.GetOpcode() == Shader::IR::Opcode::BitFieldInsert;
+    });
+    REQUIRE(packed != block.end());
+    if (clobber) {
+        // A path supplying a different sampler must not be silently treated as the packed low word.
+        packed->SetArg(1, Shader::IR::Value{42U});
+    }
+    Shader::HostTranslateInfo host_info;
+    host_info.ApplyDescriptorLimitPolicy();
+    if (clobber) {
+        REQUIRE_THROWS_AS(Shader::Optimization::TexturePass(env, program, host_info),
+                          Shader::NotImplementedException);
+    } else {
+        Shader::Optimization::TexturePass(env, program, host_info);
+        REQUIRE(program.info.texture_descriptors.size() == 1);
+        const auto& descriptor = program.info.texture_descriptors.front();
+        REQUIRE(descriptor.has_secondary);
+        REQUIRE(descriptor.cbuf_offset == 0x168);
+        REQUIRE(descriptor.secondary_cbuf_offset == 0x568);
+    }
 }
 
 class MixedFetchEnvironment final : public Shader::Environment {
@@ -343,7 +392,7 @@ TEST_CASE("Ampere uniform bindless TEX preserves two captured independently merg
     }
 }
 
-TEST_CASE("Ampere uniform bindless TEX admits only forward branches outside its protected interval",
+TEST_CASE("Ampere uniform bindless TEX defers complex control flow to SSA",
           "[video_core][ampere][bindless_tex]") {
     for (const u32 predicate : {0U, 7U, 8U}) {
         const std::array<Instruction, 5> later{{
@@ -367,20 +416,23 @@ TEST_CASE("Ampere uniform bindless TEX admits only forward branches outside its 
         const std::array<Instruction, 5> enter_interval{{
             Branch(relative), sample[0], {{0x09047220, 4, 0x0041c000, 0}}, sample[1], sample[2],
         }};
-        const auto rejected = LowerToMaxwell(enter_interval);
-        REQUIRE_FALSE(static_cast<bool>(rejected));
-        REQUIRE(rejected.error_offset == 48);
+        const auto deferred = LowerToMaxwell(enter_interval);
+        REQUIRE(static_cast<bool>(deferred));
+        REQUIRE(((deferred.instructions[deferred.source_instruction_offsets[3] + 2] >> 44) & 15) == 11);
     }
     const std::array<Instruction, 5> loop_clobber{{
         sample[0], sample[1], {{0x00047882, 0, 0, 0}}, Branch(-64), sample[2],
     }};
-    REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(loop_clobber)));
+    REQUIRE(static_cast<bool>(LowerToMaxwell(loop_clobber)));
     for (const s32 relative : {-48, -16, 1, 1024}) {
         const std::array<Instruction, 4> invalid{{sample[0], sample[1], Branch(relative), sample[2]}};
         const auto rejected = LowerToMaxwell(invalid);
-        REQUIRE_FALSE(static_cast<bool>(rejected));
-        REQUIRE(rejected.error_offset == 16);
-        REQUIRE(rejected.instructions.empty());
+        if (relative == -48 || relative == -16) {
+            REQUIRE(static_cast<bool>(rejected));
+        } else {
+            REQUIRE_FALSE(static_cast<bool>(rejected));
+            REQUIRE(rejected.instructions.empty());
+        }
     }
     for (const u32 bit : {16U, 84U, 96U}) {
         auto unknown_branch = Branch(0);
@@ -390,6 +442,17 @@ TEST_CASE("Ampere uniform bindless TEX admits only forward branches outside its 
     }
     const std::array<Instruction, 4> interrupted{{sample[0], Branch(0), sample[1], sample[2]}};
     REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(interrupted)));
+}
+
+TEST_CASE("Ampere uniform texture handle survives immediate FFMA on ordinary registers",
+          "[video_core][ampere][bindless_tex]") {
+    const std::array<Instruction, 4> code{{
+        sample[0], {{0x2f2f7423, 0x3f000000, 0x00010826, 0}}, sample[1], sample[2],
+    }};
+    REQUIRE(LowerToMaxwell(code));
+    auto clobbered = code;
+    clobbered[1] = {{0x00047882, 0, 0, 0}};
+    REQUIRE_FALSE(LowerToMaxwell(clobbered));
 }
 
 TEST_CASE("Ampere uniform bindless TEX preserves predicates and accepts verified even handles",
@@ -547,9 +610,12 @@ TEST_CASE("Ampere uniform bindless TEX rejects unverified handle pairs and contr
                                              {{0x7000U | opcode, 0, 0x03800000, 0}},
                                              sample[2]}};
         const auto lowered = LowerToMaxwell(code);
-        REQUIRE_FALSE(static_cast<bool>(lowered));
-        REQUIRE(lowered.error_offset == 16);
-        REQUIRE(lowered.instructions.empty());
+        if (opcode == 0x941 || opcode == 0x942 || opcode == 0x945) {
+            REQUIRE(static_cast<bool>(lowered));
+        } else {
+            REQUIRE_FALSE(static_cast<bool>(lowered));
+            REQUIRE(lowered.instructions.empty());
+        }
     }
     for (const bool forward : {false, true}) {
         const std::array<Instruction, 4> code{{
@@ -558,9 +624,7 @@ TEST_CASE("Ampere uniform bindless TEX rejects unverified handle pairs and contr
             sample[0], sample[1], sample[2],
         }};
         const auto lowered = LowerToMaxwell(code);
-        REQUIRE_FALSE(static_cast<bool>(lowered));
-        REQUIRE(lowered.error_offset == 32);
-        REQUIRE(lowered.instructions.empty());
+        REQUIRE(static_cast<bool>(lowered));
     }
 }
 
@@ -614,8 +678,9 @@ TEST_CASE("Ampere uniform bindless TEX protects uniform state and output pairs",
     const std::array<Instruction, 4> alias{{{{0x00dc7802, 0, 0xf00, 0}}, sample[0],
                                           sample[1], sample[2]}};
     const auto aliased = LowerToMaxwell(alias);
-    REQUIRE_FALSE(static_cast<bool>(aliased));
-    REQUIRE(aliased.error_offset == 0);
+    REQUIRE(static_cast<bool>(aliased));
+    REQUIRE(aliased.instructions.front() == Shader::Ampere::NativeRegisterCopy(2, 212, 0, 212));
+    REQUIRE(aliased.instructions[9] == Shader::Ampere::NativeRegisterCopy(1, 220, 0, 212));
 }
 TEST_CASE("Ampere uniform bindless TEX compacts noncontiguous masks and discards unused outputs",
           "[video_core][ampere][bindless_tex]") {
@@ -724,6 +789,172 @@ TEST_CASE("Ampere uniform bindless TEX preserves distinct explicit LOD operands"
     REQUIRE(program.info.texture_descriptors.front().has_secondary);
     REQUIRE(program.info.texture_descriptors.front().cbuf_offset == 0x168);
     REQUIRE(program.info.texture_descriptors.front().secondary_cbuf_offset == 0x568);
+}
+
+TEST_CASE("Ampere uniform cube TEX preserves the captured XYZ split before aliased outputs",
+          "[video_core][ampere][bindless_tex]") {
+    const u32 lod = GENERATE(0U, 1U);
+    const u32 mask = GENERATE(1U, 7U, 15U);
+    const u32 predicate = GENERATE(0U, 7U, 10U);
+    const u32 nodep = GENERATE(0U, 1U);
+    std::array<Instruction, 3> code{{
+        sample[0], {{0x16027f60, 0x70000402, 0x0c9e0710, 0x00014200}}, sample[2],
+    }};
+    code[1].words[0] = (code[1].words[0] & ~0xf000U) | (predicate << 12);
+    code[1].words[2] = 0x081e0000U | (nodep << 26) | (lod << 23) | (mask << 8) |
+                        (mask == 1 ? 255U : 16U);
+    const auto lowered = LowerToMaxwell(code);
+    REQUIRE(lowered);
+    REQUIRE(lowered.required_texture_buffer == ~0U);
+    REQUIRE(lowered.instructions[1] == Copy(250, 22, predicate));
+    REQUIRE(lowered.instructions[2] == Copy(251, 23, predicate));
+    REQUIRE(lowered.instructions[3] == Copy(252, 2, predicate));
+    REQUIRE(lowered.instructions[4] ==
+            (0xde80000000000000ULL | (u64{predicate} << 16) | 250 | (250ULL << 8) |
+             (220ULL << 20) | (6ULL << 28) | (u64{mask} << 31) | (u64{lod} << 37) |
+             (u64{nodep} << 49) | (7ULL << 51)));
+    for (u32 i = 0; i < static_cast<u32>(std::popcount(mask)); ++i)
+        REQUIRE(lowered.instructions[5 + i] == Copy(i < 2 ? 2 + i : 14 + i, 250 + i, predicate));
+}
+
+TEST_CASE("Ampere uniform cube TEX tracks cube descriptors and all three coordinates in IR",
+          "[video_core][ampere][bindless_tex]") {
+    const bool deferred = GENERATE(false, true);
+    std::vector<Instruction> code{
+        {{0x00047ab9, 0x00805a00, 0x00000800, 0}},
+        {{0x00057ab9, 0x00815a00, 0x00000800, 0}},
+        {{0x04047292, 0x00000005, 0x0f8efc3f, 0}},
+        {{0x00167802, 0x3e800000, 0x00000f00, 0}},
+        {{0x00177802, 0x3f000000, 0x00000f00, 0}},
+        {{0x00027802, 0xbf800000, 0x00000f00, 0}},
+        sample[0], {{0x16027f60, 0x70000402, 0x0c9e0710, 0x00014200}},
+    };
+    if (deferred) code.push_back({{0x00007941, 0, 0x03800000, 0}});
+    code.push_back(sample[2]);
+    const auto lowered = LowerToMaxwell(code);
+    REQUIRE(lowered);
+    TextureEnvironment env{lowered.instructions, Shader::TextureType::ColorCube};
+    Shader::ObjectPool<Shader::IR::Inst> pool;
+    Shader::IR::Block block{pool};
+    Shader::IR::Program program;
+    program.blocks = {&block};
+    program.post_order_blocks = {&block};
+    const u32 last = static_cast<u32>(lowered.instructions.size() - 1);
+    Shader::Maxwell::Translate(env, &block, 0x50, 0x50 + last * 8 + ((last + 1) / 3) * 8);
+    Shader::Optimization::SsaRewritePass(program);
+    Shader::Optimization::ConstantPropagationPass(env, program);
+    Shader::HostTranslateInfo host_info;
+    host_info.ApplyDescriptorLimitPolicy();
+    Shader::Optimization::TexturePass(env, program, host_info);
+    u32 samples = 0;
+    for (const auto& inst : block) {
+        if (inst.GetOpcode() != Shader::IR::Opcode::ImageSampleExplicitLod) continue;
+        ++samples;
+        const auto* coords = inst.Arg(1).InstRecursive();
+        REQUIRE(coords->GetOpcode() == Shader::IR::Opcode::CompositeConstructF32x3);
+        REQUIRE(coords->Arg(0).Resolve().F32() == 0.25f);
+        REQUIRE(coords->Arg(1).Resolve().F32() == 0.5f);
+        REQUIRE(coords->Arg(2).Resolve().F32() == -1.0f);
+        REQUIRE(inst.Arg(2).Resolve().F32() == 0.0f);
+    }
+    REQUIRE(samples == 1);
+    REQUIRE(program.info.texture_descriptors.size() == 1);
+    const auto& descriptor = program.info.texture_descriptors.front();
+    REQUIRE(descriptor.type == Shader::TextureType::ColorCube);
+    REQUIRE(descriptor.has_secondary);
+    REQUIRE(descriptor.cbuf_offset == 0x168);
+    REQUIRE(descriptor.secondary_cbuf_offset == 0x568);
+}
+
+TEST_CASE("Ampere uniform cube TEX rejects unimplemented modes and misaligned pairs",
+          "[video_core][ampere][bindless_tex]") {
+    std::array<Instruction, 3> code{{
+        sample[0], {{0x16027f60, 0x70000402, 0x0c9e0710, 0x00014200}}, sample[2],
+    }};
+    for (const u32 lod : {2U, 3U, 4U, 6U, 7U}) {
+        auto invalid = code;
+        invalid[1].words[2] = (invalid[1].words[2] & ~(7U << 23)) | (lod << 23);
+        REQUIRE_FALSE(LowerToMaxwell(invalid));
+    }
+    for (const u32 source : {21U, 215U, 216U, 254U}) {
+        auto invalid = code;
+        invalid[1].words[0] = (invalid[1].words[0] & 0x00ffffffU) | (source << 24);
+        REQUIRE_FALSE(LowerToMaxwell(invalid));
+    }
+    for (const u32 dimension : {0U, 2U, 4U, 5U, 6U, 7U}) {
+        auto invalid = code;
+        invalid[1].words[1] = 0x10000402U | (dimension << 29);
+        REQUIRE_FALSE(LowerToMaxwell(invalid));
+    }
+}
+
+TEST_CASE("Ampere uniform texture handles survive captured FADD and bound samples",
+          "[video_core][ampere][bindless_tex]") {
+    // Gameplay material programs 16088/16092 interleave bound samples before the uniform sample.
+    const std::array<Instruction, 7> code{{
+        sample[0], {{0x09347421, 0x3f000000, 0x00012000, 0}},
+        {{0x0c357421, 0x3f000000, 0x00012000, 0}},
+        {{0x34347b60, 0x3100462f, 0x049e01ff, 0}},
+        {{0x35357b60, 0x3100482e, 0x049e01ff, 0}}, sample[1], sample[2],
+    }};
+    const auto lowered = LowerToMaxwell(code);
+    REQUIRE(lowered);
+    REQUIRE(lowered.required_texture_buffer == 4);
+    for (const u32 target : {4U, 5U}) {
+        auto clobbered = code;
+        clobbered[2] = {{0x7882U | (target << 16), 0, 0, 0}};
+        REQUIRE_FALSE(LowerToMaxwell(clobbered));
+    }
+}
+
+TEST_CASE("Ampere gameplay FSET reads the uniform float operand and preserves comparison semantics",
+          "[video_core][ampere][bindless_tex]") {
+    const u32 input = GENERATE(0x3f000000U, 0x3f800000U, 0x40000000U, 0x7fc00000U);
+    const std::array<Instruction, 4> code{{
+        {{0x00087882, 0x3f800000, 0, 0}},
+        {{0x000b7802, input, 0x00000f00, 0}},
+        {{0x0b117c0a, 0x00000008, 0x0b81e000, 0}}, sample[2],
+    }};
+    const auto lowered = LowerToMaxwell(code);
+    REQUIRE(lowered);
+    const u64 comparison = lowered.instructions[lowered.source_instruction_offsets[2]];
+    REQUIRE(((comparison >> 20) & 255) == 224); // UR8, not GPR8.
+    TextureEnvironment env{lowered.instructions};
+    Shader::ObjectPool<Shader::IR::Inst> pool;
+    Shader::IR::Block block{pool};
+    Shader::IR::Program program;
+    program.blocks = {&block};
+    program.post_order_blocks = {&block};
+    const u32 last = static_cast<u32>(lowered.instructions.size() - 1);
+    Shader::Maxwell::Translate(env, &block, 0x50, 0x50 + last * 8 + ((last + 1) / 3) * 8);
+    Shader::IR::IREmitter ir{block};
+    ir.WriteShared(32, ir.Imm32(0), ir.GetReg(static_cast<Shader::IR::Reg>(17)));
+    const auto* output = &block.back();
+    Shader::Optimization::SsaRewritePass(program);
+    Shader::Optimization::ConstantPropagationPass(env, program);
+    // Captured FSET.GEU.FTZ: greater-or-equal OR unordered, with a floating 1/0 result.
+    // FP comparisons are deliberately not constant-folded by this optimizer.
+    const auto* select = output->Arg(1).InstRecursive();
+    REQUIRE(select->GetOpcode() == Shader::IR::Opcode::SelectU32);
+    REQUIRE(select->Arg(1).Resolve().IsImmediate());
+    REQUIRE(select->Arg(1).Resolve().U32() == 0x3f800000U);
+    REQUIRE(select->Arg(2).Resolve().IsImmediate());
+    REQUIRE(select->Arg(2).Resolve().U32() == 0);
+    const auto* comparison_ir = select->Arg(0).InstRecursive();
+    REQUIRE(comparison_ir->GetOpcode() == Shader::IR::Opcode::FPUnordGreaterThanEqual32);
+    REQUIRE(comparison_ir->Flags<Shader::IR::FpControl>().fmz_mode == Shader::IR::FmzMode::FTZ);
+    REQUIRE(comparison_ir->Arg(0).Resolve().IsImmediate());
+    REQUIRE(std::bit_cast<u32>(comparison_ir->Arg(0).Resolve().F32()) == input);
+    REQUIRE(comparison_ir->Arg(1).Resolve().IsImmediate());
+    REQUIRE(comparison_ir->Arg(1).Resolve().F32() == 1.0f);
+    for (const u32 invalid_word : {28U, 62U, 0x100U, 0x10000008U}) {
+        auto invalid = code;
+        invalid[2].words[1] = invalid_word;
+        REQUIRE_FALSE(LowerToMaxwell(invalid));
+    }
+    auto missing_uniform_mode = code;
+    missing_uniform_mode[2].words[2] &= ~(1U << 27);
+    REQUIRE_FALSE(LowerToMaxwell(missing_uniform_mode));
 }
 
 TEST_CASE("Ampere uniform bindless TEX treats WARPSYNC as a provenance scan boundary",

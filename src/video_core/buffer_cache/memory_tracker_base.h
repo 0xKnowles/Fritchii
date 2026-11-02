@@ -70,6 +70,29 @@ public:
         });
     }
 
+    /// Enumerate only preflushable bytes inside the query, without clearing their state.
+    /// WordManager reports whole pages; clip those pages to the caller's actual write.
+    template <typename Func>
+    void ForEachPreflushableRange(VAddr address, u64 size, Func&& func) {
+        IteratePages<false>(address, size, [&func](Manager* manager, u64 offset, size_t length) {
+            const VAddr begin = manager->cpu_addr + offset;
+            const VAddr end = begin + length;
+            manager->ForEachModifiedRange(Type::Preflushable, false, begin, length,
+                [&](VAddr page_begin, u64 page_size) {
+                    const VAddr clipped_begin = (std::max)(begin, page_begin);
+                    const VAddr clipped_end = (std::min)(end, page_begin + page_size);
+                    func(clipped_begin, clipped_end - clipped_begin);
+                });
+        });
+    }
+
+    /// An overlap is insufficient to skip a reactive flush of a multi-page CPU read.
+    [[nodiscard]] bool IsRegionFullyPreflushable(VAddr address, u64 size) {
+        u64 covered = 0;
+        ForEachPreflushableRange(address, size, [&](VAddr, u64 length) { covered += length; });
+        return covered == size;
+    }
+
     /// Mark region as CPU modified, notifying the device_tracker about this change
     void MarkRegionAsCpuModified(VAddr dirty_cpu_addr, u64 query_size) {
         IteratePages<true>(dirty_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {

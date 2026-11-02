@@ -133,7 +133,12 @@ void Traverse(EmitContext& ctx, IR::Program& program) {
             current_block = node.data.block;
             ctx.AddLabel(label);
             for (IR::Inst& inst : node.data.block->Instructions()) {
-                EmitInst(ctx, &inst);
+                try {
+                    EmitInst(ctx, &inst);
+                } catch (NotImplementedException& error) {
+                    error.Prepend(fmt::format("SPIR-V {}: ", IR::NameOf(inst.GetOpcode())));
+                    throw;
+                }
             }
             break;
         }
@@ -552,6 +557,7 @@ void RewriteOpcodes(std::vector<u32>& code, std::span<const std::pair<u32, spv::
 
 std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info, IR::Program& program, Bindings& bindings) {
     EmitContext ctx{profile, runtime_info, program, bindings};
+    DefineSoftwareMatrixFunctions(ctx, program);
     const Id main{DefineMain(ctx, program)};
     DefineEntryPoint(program, ctx, main);
     if (profile.support_float_controls) {

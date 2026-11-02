@@ -11,6 +11,7 @@
 #include <fmt/format.h>
 
 #include "shader_recompiler/exception.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -164,18 +165,26 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
 bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                                 Tegra::MemoryManager& gpu_memory, Scheduler& scheduler,
                                 BufferCache& buffer_cache, TextureCache& texture_cache) {
-    guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
-
-    buffer_cache.SetComputeUniformBufferState(info.constant_buffer_mask, &uniform_buffer_sizes);
-    buffer_cache.UnbindComputeStorageBuffers();
-    size_t ssbo_index{};
-    for (const auto& desc : info.storage_buffers_descriptors) {
-        ASSERT(desc.count == 1);
-        buffer_cache.BindComputeStorageBuffer(ssbo_index, desc.cbuf_index, desc.cbuf_offset,
-                                              desc.is_written);
-        ++ssbo_index;
+    namespace Profile = VideoCommon::Nx2Profile;
+    {
+        Profile::Scope scope{Profile::Zone::ComputeDescriptors};
+        guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
+    }
+    {
+        Profile::Scope scope{Profile::Zone::ComputeStorage};
+        buffer_cache.SetComputeUniformBufferState(info.constant_buffer_mask, &uniform_buffer_sizes);
+        buffer_cache.UnbindComputeStorageBuffers();
+        size_t ssbo_index{};
+        for (const auto& desc : info.storage_buffers_descriptors) {
+            ASSERT(desc.count == 1);
+            buffer_cache.BindComputeStorageBuffer(ssbo_index, desc.cbuf_index, desc.cbuf_offset,
+                                                  desc.is_written);
+            ++ssbo_index;
+        }
     }
 
+    // This zone excludes the nested buffer/descriptor zones below.
+    Profile::Scope textures_scope{Profile::Zone::ComputeTextures};
     texture_cache.SynchronizeDescriptors(true);
 
     boost::container::small_vector<VideoCommon::ImageViewInOut, 64> views;
@@ -258,13 +267,20 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     std::ranges::for_each(info.texture_buffer_descriptors, add_buffer);
     std::ranges::for_each(info.image_buffer_descriptors, add_buffer);
 
-    buffer_cache.UpdateComputeBuffers();
-    buffer_cache.BindHostComputeBuffers();
-    if (buffer_cache.any_buffer_uploaded) {
-        buffer_cache.runtime.PostCopyBarrier();
-        buffer_cache.any_buffer_uploaded = false;
+    {
+        Profile::Scope scope{Profile::Zone::ComputeUpdateBuffers};
+        buffer_cache.UpdateComputeBuffers();
+    }
+    {
+        Profile::Scope scope{Profile::Zone::ComputeBindBuffers};
+        buffer_cache.BindHostComputeBuffers();
+        if (buffer_cache.any_buffer_uploaded) {
+            buffer_cache.runtime.PostCopyBarrier();
+            buffer_cache.any_buffer_uploaded = false;
+        }
     }
 
+    Profile::Scope descriptors_scope{Profile::Zone::ComputeDescriptors};
     RescalingPushConstant rescaling;
     const VideoCommon::SamplerId* samplers_it{samplers.data()};
     const VideoCommon::ImageViewInOut* views_it{views.data()};
@@ -304,6 +320,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         uses_descriptor_buffer && scheduler.UpdateDescriptorBufferChunk(descriptor_buffer_chunk)};
 
     const bool is_rescaling = !info.texture_descriptors.empty() || !info.image_descriptors.empty();
+    Profile::Scope record_scope{Profile::Zone::ComputeRecord};
     scheduler.Record([this, descriptor_data, is_rescaling, descriptor_buffer_offset,
                       descriptor_buffer_chunk, bind_descriptor_buffer,
                       rescaling_data = rescaling.Data()](vk::CommandBuffer cmdbuf) {

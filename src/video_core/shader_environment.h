@@ -21,18 +21,26 @@
 #include "common/polyfill_thread.h"
 #include "common/unique_function.h"
 #include "shader_recompiler/environment.h"
+#include "shader_recompiler/frontend/ampere/instruction.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 
 namespace Tegra {
-class Memorymanager;
+class MemoryManager;
+namespace Engines {
+class KeplerCompute;
+}
 }
 
 namespace VideoCommon {
 
+std::optional<u32> ReadNativeGuardConstant(Tegra::Engines::KeplerCompute& compute,
+                                         Tegra::MemoryManager& memory, u32 bank, u32 offset);
+
 /// A native (Switch 2) program after capture and lowering to Maxwell code. The shader cache keeps
 /// it so the environments built for the program's pipelines don't capture and lower it again.
 struct LoweredNativeCode {
+    std::vector<Shader::Ampere::Instruction> trap_prefix;
     /// Shader header, lowered instructions with Maxwell scheduling words, then the native
     /// address map (what the environment's `code` used to be filled with).
     std::vector<u64> code;
@@ -66,6 +74,7 @@ public:
     [[nodiscard]] u64 ReadInstruction(u32 address) final;
 
     [[nodiscard]] u32 TranslateProgramAddress(u32 address) const override;
+    [[nodiscard]] bool IsCbufStorageBufferPointer(u32 index, u32 offset) override;
 
     [[nodiscard]] std::optional<u64> Analyze();
 
@@ -86,6 +95,7 @@ public:
     }
 
     [[nodiscard]] bool CanBeSerialized() const noexcept;
+    [[nodiscard]] bool HasNativeInstructions() const override;
 
     [[nodiscard]] u64 CalculateHash() const;
 
@@ -98,6 +108,7 @@ public:
     }
 
 protected:
+    virtual std::optional<u32> ReadTrapGuardConstant(u32, u32) { return std::nullopt; }
     std::optional<u64> TryFindSize();
 
     /// Adopts an already lowered native program, or captures and lowers it when there is none.
@@ -117,6 +128,8 @@ protected:
     ::Common::unordered_map<u32, Shader::TextureType> texture_types;
     ::Common::unordered_map<u32, Shader::TexturePixelFormat> texture_pixel_formats;
     ::Common::unordered_map<u64, u32> cbuf_values;
+    ::Common::unordered_map<u64, u8> storage_pointer_types;
+    bool storage_pointer_snapshot_complete{};
     ::Common::unordered_map<u64, Shader::ReplaceConstant> cbuf_replacements;
 
     u32 local_memory_size{};
@@ -184,6 +197,7 @@ private:
             std::vector<u8> bytes;
         };
         std::array<ConstBuffer, Tegra::Engines::Maxwell3D::Regs::MaxConstBuffers> const_buffers;
+        Tegra::NativeRootTables root_tables;
 
         /// Texture descriptors (TIC entries 0 to the pool limit) when the environment was
         /// detached.
@@ -231,10 +245,12 @@ public:
 
 private:
     Tegra::Engines::KeplerCompute* kepler_compute{};
+    std::optional<u32> ReadTrapGuardConstant(u32 bank, u32 offset) override;
 };
 
 class FileEnvironment final : public Shader::Environment {
 public:
+    [[nodiscard]] bool HasNativeInstructions() const override;
     FileEnvironment() = default;
     ~FileEnvironment() override = default;
 
@@ -249,6 +265,7 @@ public:
     [[nodiscard]] u64 ReadInstruction(u32 address) override;
 
     [[nodiscard]] u32 TranslateProgramAddress(u32 address) const override;
+    [[nodiscard]] bool IsCbufStorageBufferPointer(u32 index, u32 offset) override;
 
     [[nodiscard]] u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) override;
 
@@ -284,6 +301,7 @@ private:
     ::Common::unordered_map<u32, Shader::TextureType> texture_types;
     ::Common::unordered_map<u32, Shader::TexturePixelFormat> texture_pixel_formats;
     ::Common::unordered_map<u64, u32> cbuf_values;
+    ::Common::unordered_map<u64, u8> storage_pointer_types;
     ::Common::unordered_map<u64, Shader::ReplaceConstant> cbuf_replacements;
     std::array<u32, 3> workgroup_size{};
     u32 local_memory_size{};

@@ -110,6 +110,8 @@ public:
 
     std::vector<VirtualFile> GetFiles() const override;
     std::vector<VirtualDir> GetSubdirectories() const override;
+    VirtualFile GetFile(std::string_view name) const override;
+    VirtualDir GetSubdirectory(std::string_view name) const override;
     bool IsWritable() const override;
     bool IsReadable() const override;
     std::string GetName() const override;

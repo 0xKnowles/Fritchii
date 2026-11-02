@@ -128,10 +128,13 @@ TEST_CASE("Ampere SURED preserves predicate and register operands",
     code[0].words[1] |= data;
     const auto lowered = LowerToMaxwell(code);
     REQUIRE(static_cast<bool>(lowered));
-    REQUIRE(lowered.instructions.size() == (predicate == 15 ? 1U : 2U));
+    const bool shadow = data >= 244 && data != 255 || coordinate >= 244;
+    REQUIRE(lowered.instructions.size() == (predicate == 15 ? 1U : shadow ? 18U : 2U));
     if (predicate != 15) {
-        REQUIRE(lowered.instructions.front() ==
-                (0xeb4800c600000000ULL | (u64{predicate} << 16) | (u64{coordinate} << 8) | data));
+        const u32 lowered_coordinate = coordinate >= 244 ? coordinate - 4 : coordinate;
+        const u32 lowered_data = data == 245 ? 241 : data;
+        REQUIRE(lowered.instructions[shadow ? 8 : 0] ==
+                (0xeb4800c600000000ULL | (u64{predicate} << 16) | (u64{lowered_coordinate} << 8) | lowered_data));
     }
 }
 
@@ -149,11 +152,11 @@ TEST_CASE("Ampere SURED rejects unsupported formats and descriptor conflicts",
     code[0].words[1] |= 18U << 22;
     REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(code)));
     code[0] = captured;
-    code[0].words[0] = 0xf500759f;
+    code[0].words[0] = 0xff00759f;
     REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(code)));
     code[0] = captured;
     code[0].words[1] |= 246;
-    REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(code)));
+    REQUIRE(static_cast<bool>(LowerToMaxwell(code)));
     std::array conflicting{captured, captured, exit_instruction};
     conflicting[1].words[1] |= 1U << 22;
     REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(conflicting)));

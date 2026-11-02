@@ -15,6 +15,9 @@
 namespace Shader::Optimization {
 namespace {
 void AddConstantBufferDescriptor(Info& info, u32 index, u32 count) {
+    if (index >= Info::MAX_CBUFS) {
+        throw NotImplementedException("Constant buffer bank {} exceeds descriptor capacity", index);
+    }
     if (count != 1) {
         throw NotImplementedException("Constant buffer descriptor indexing");
     }
@@ -374,6 +377,16 @@ void VisitUsages(Info& info, IR::Inst& inst) {
     case IR::Opcode::WriteGlobalS8:
     case IR::Opcode::WriteGlobalU16:
     case IR::Opcode::WriteGlobalS16:
+        info.uses_global_subword_write = true;
+        break;
+    default:
+        break;
+    }
+    switch (inst.GetOpcode()) {
+    case IR::Opcode::WriteGlobalU8:
+    case IR::Opcode::WriteGlobalS8:
+    case IR::Opcode::WriteGlobalU16:
+    case IR::Opcode::WriteGlobalS16:
     case IR::Opcode::WriteGlobal32:
     case IR::Opcode::WriteGlobal64:
     case IR::Opcode::WriteGlobal128:
@@ -424,6 +437,9 @@ void VisitUsages(Info& info, IR::Inst& inst) {
     case IR::Opcode::LoadGlobal128:
         info.uses_int64 = true;
         info.uses_global_memory = true;
+        if (const IR::Opcode op{inst.GetOpcode()};
+            op >= IR::Opcode::GlobalAtomicIAdd32 && op <= IR::Opcode::GlobalAtomicExchange32)
+            info.uses_global_atomics = true;
         info.used_constant_buffer_types |= IR::Type::U32 | IR::Type::U32x2;
         info.used_storage_buffer_types |= IR::Type::U32 | IR::Type::U32x2 | IR::Type::U32x4;
         break;
@@ -493,7 +509,12 @@ void VisitUsages(Info& info, IR::Inst& inst) {
         info.uses_subgroup_invocation_id = true;
         break;
     case IR::Opcode::TensorMulAdd:
-        info.uses_tensor_mul_add = true;
+        if (inst.Flags<u32>() == 0) {
+            info.uses_tensor_mul_add = true;
+        } else {
+            info.uses_subgroup_shuffles = true;
+            info.uses_fp32_denorms_preserve = true;
+        }
         info.uses_subgroup_invocation_id = true;
         break;
     case IR::Opcode::ShuffleIndex:
@@ -989,6 +1010,11 @@ void CollectShaderInfoPass(Environment& env, IR::Program& program) {
         }
     }
     GatherInfoFromHeader(env, info);
+    // Graphics root-table banks are not present in the eight-entry compute QMD.
+    // Reject them before a backend indexes its compute binding arrays.
+    if (program.stage == Stage::Compute && (info.constant_buffer_mask & ~0xffU)) {
+        throw NotImplementedException("Compute shader uses an unavailable constant bank");
+    }
 }
 
 } // namespace Shader::Optimization

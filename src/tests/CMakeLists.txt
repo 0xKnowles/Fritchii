@@ -15,6 +15,7 @@ add_executable(tests
     common/range_map.cpp
     common/ring_buffer.cpp
     common/scratch_buffer.cpp
+    common/slot_vector.cpp
     common/undefined_fix.cpp
     common/unique_function.cpp
     core/core_timing.cpp
@@ -23,6 +24,7 @@ add_executable(tests
     core/read_traps.cpp
     core/nx2_readback_cache.cpp
     core/nx2_core_readback_capacity.cpp
+    core/nx2_display.cpp
     core/nso.cpp
     core/nrr.cpp
     core/ncz_decompressor.cpp
@@ -46,6 +48,16 @@ add_executable(tests
     video_core/ampere_returns.cpp
     video_core/ampere_f2i.cpp
     video_core/compute_storage_buffers.cpp
+    video_core/compute_dispatch.cpp
+    video_core/gpu_split_metrics.cpp
+    video_core/draw_table_snapshot.cpp
+    video_core/virtual_range_cache.cpp
+    video_core/uniform_upload_cache.cpp
+    video_core/storage_binding_sync.cpp
+    video_core/command_write_frontier.cpp
+    video_core/native_storage_mappings.cpp
+    video_core/native_qmd_write.cpp
+    video_core/readback_coverage.cpp
     video_core/cooperative_matrix.cpp
     video_core/ampere_kirby.cpp
     video_core/ampere_geometry.cpp
@@ -53,6 +65,12 @@ add_executable(tests
     video_core/ampere_geometry_exit.cpp
     video_core/ampere_uniform_lea.cpp
     video_core/ampere_integer_multiply.cpp
+    video_core/ampere_async_copy.cpp
+    video_core/buffer_texture.cpp
+    video_core/shader_reuse.cpp
+    video_core/native_root_table.cpp
+    video_core/ampere_matrix.cpp
+    video_core/ampere_trap_guards.cpp
     video_core/ampere_program_override.cpp
     video_core/x8d24_conversion.cpp
     video_core/ampere_bindless_tex.cpp

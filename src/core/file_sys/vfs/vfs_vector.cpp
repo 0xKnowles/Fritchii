@@ -78,6 +78,18 @@ std::vector<VirtualDir> VectorVfsDirectory::GetSubdirectories() const {
     return dirs;
 }
 
+VirtualFile VectorVfsDirectory::GetFile(std::string_view name) const {
+    const auto iter = std::find_if(files.begin(), files.end(),
+                                   [name](const auto& file) { return name == file->GetName(); });
+    return iter == files.end() ? nullptr : *iter;
+}
+
+VirtualDir VectorVfsDirectory::GetSubdirectory(std::string_view name) const {
+    const auto iter = std::find_if(dirs.begin(), dirs.end(),
+                                   [name](const auto& dir) { return name == dir->GetName(); });
+    return iter == dirs.end() ? nullptr : *iter;
+}
+
 bool VectorVfsDirectory::IsWritable() const {
     return false;
 }

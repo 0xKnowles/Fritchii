@@ -146,6 +146,8 @@ bool Maxwell3D::IsMethodExecutable(u32 method) {
         return true;
     }
     switch (method) {
+    case NativeRootTables::SelectorMethod:
+    case NativeRootTables::LoadMethod:
     case MAXWELL3D_REG_INDEX(draw.end):
     case MAXWELL3D_REG_INDEX(draw.begin):
     case MAXWELL3D_REG_INDEX(vertex_buffer.first):
@@ -358,6 +360,15 @@ void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argume
         LOG_DEBUG(HW_GPU, "Native GPU surface clear: value={:#x}", argument);
     }
     switch (method) {
+    case NativeRootTables::SelectorMethod:
+        if (GetNativeMacroEngine().native_turing) native_root_tables.Select(argument);
+        return;
+    case NativeRootTables::LoadMethod:
+        if (GetNativeMacroEngine().native_turing && !native_root_tables.Load(argument)) {
+            GetNativeMacroEngine().native_execution_failed = true;
+            LOG_ERROR(HW_GPU, "Invalid native root-table upload");
+        }
+        return;
     case MAXWELL3D_REG_INDEX(wait_for_idle):
         return rasterizer->WaitForIdle();
     case MAXWELL3D_REG_INDEX(shadow_ram_control):
@@ -841,6 +852,8 @@ bool FrontHandledOutsideDrawManager(u32 method) {
         return true;
     }
     switch (method) {
+    case NativeRootTables::SelectorMethod:
+    case NativeRootTables::LoadMethod:
     case MAXWELL3D_REG_INDEX(wait_for_idle):
     case MAXWELL3D_REG_INDEX(shadow_ram_control):
     case MAXWELL3D_REG_INDEX(load_mme.instruction_ptr):

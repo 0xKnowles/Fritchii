@@ -31,6 +31,7 @@
 #include "common/thread.h"
 #include "core/core.h"
 #include "core/hle/service/nx2_present.h"
+#include "core/hle/service/nx2_display.h"
 #include "core/hle/service/nx2_sparse_region.h"
 #include "core/device_memory.h"
 #include "video_core/rasterizer_interface.h"
@@ -1214,11 +1215,11 @@ public:
             {21, &INx2Vi2Session::GetNotifications, "GetNotifications"},
             {31, &INx2Vi2Session::GetVsyncEvent, "GetVsyncEvent (guessed)"},
             {32, &INx2Vi2Session::GetVsyncEvent, "GetDisplayVsyncEvent (guessed)"},
-            // Title 1 calls these ~75 times a second with the display name "default"; the
-            // auto stub's empty success reply works, but logged two lines per call (a 50 MB log
-            // in an 18 minute session).
-            {104, &INx2Vi2Session::SucceedQuietly, "Unknown104 (display \"default\")"},
-            {105, &INx2Vi2Session::SucceedQuietly, "Unknown105 (display \"default\")"},
+            {104, &INx2Vi2Session::QueryDisplay, "GetHdrStatus"},
+            {105, &INx2Vi2Session::QueryDisplay, "GetDisplayState105"},
+            {106, &INx2Vi2Session::QueryDisplay, "GetBufferMaxResolution"},
+            {107, &INx2Vi2Session::QueryDisplay, "GetDisplayState107"},
+            {354, &INx2Vi2Session::QueryDisplay, "GetDisplayState354"},
             // Display/client setup (title 2): nothing to track while presents composite directly.
             {51, &INx2Vi2Session::SucceedQuietly, "ConfigureRequestGroups"},
             {101, &INx2Vi2Session::OpenDisplay, "OpenDisplay"},
@@ -1251,6 +1252,18 @@ public:
     }
 
 private:
+    void QueryDisplay(HLERequestContext& ctx) {
+        const auto reply = Nx2QueryDisplay(
+            std::span<const u32>{ctx.CommandBuffer(), IPC::COMMAND_BUFFER_LENGTH},
+            Settings::IsDockedMode());
+        IPC::ResponseBuilder rb{ctx, 2 + reply.word_count};
+        // TIPC has a one-word result; the HIPC Result overload adds a padding word.
+        rb.Push(reply.result.raw);
+        for (u32 i = 0; i < reply.word_count; ++i) {
+            rb.Push(reply.words[i]);
+        }
+    }
+
     // 229(u64 client token, u32 slot, u32 image, ...fences): result, u64 mask of buffer slots the
     // client may acquire next, four zero words. Nothing is shown yet; every slot is handed back
     // at once (changes.patch's default mask is 0x7fff).

@@ -14,6 +14,7 @@
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/readback_diagnostics.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
@@ -430,30 +431,30 @@ void BufferCacheRuntime::TickFrame(Common::SlotVector<Buffer>& slot_buffers) noe
 bool BufferCacheRuntime::BindSmallUniformReusing(
     Tegra::MaxwellDeviceMemoryManager& device_memory, size_t stage, u32 index,
     DAddr device_addr, u32 size) {
-    static const bool enabled = [] {
-        const char* value = std::getenv("EDEN_NX2_UBOREUSE");
-        return value != nullptr && value[0] == '1' && value[1] == '\0';
-    }();
-    if (!enabled || size == 0 || size > UniformStreamReuse::MaxBytes || stage >= 5 || index >= 18) {
+    using Cache = VideoCommon::UniformUploadCache<StagingBufferRef>;
+    if (size == 0 || size > Cache::MaxBytes || stage >= Cache::Stages || index >= Cache::Banks) {
         return false;
     }
     if (!uniform_stream_reuse) {
         uniform_stream_reuse = std::make_unique<UniformStreamReuse>();
     }
     auto& reuse = *uniform_stream_reuse;
-    auto& slot = reuse.slots[stage][index];
     device_memory.ReadBlockUnsafe(device_addr, reuse.scratch.data(), size);
-    if (slot.size != size || slot.tick != scheduler.CurrentTick() ||
-        std::memcmp(slot.bytes.data(), reuse.scratch.data(), size) != 0) {
-        slot.ref = staging_pool.Request(size, MemoryUsage::Upload, true);
-        staging_pool.FreeDeferred(slot.ref);
-        std::memcpy(slot.ref.mapped_span.data(), reuse.scratch.data(), size);
-        std::memcpy(slot.bytes.data(), reuse.scratch.data(), size);
-        slot.size = size;
-        slot.tick = scheduler.CurrentTick();
-    }
-    guest_descriptor_queue.AddBuffer(slot.ref.buffer, slot.ref.device_address,
-                                    static_cast<u32>(slot.ref.offset), size);
+    const auto result = reuse.cache.Get(stage, index, scheduler.CurrentTick(),
+        std::span<const u8>{reuse.scratch.data(), size}, [&](std::span<const u8> bytes) {
+            // Normal stream allocations remain alive for this tick. Do not make
+            // a separate deferred/VMA allocation for every changed small uniform.
+            const auto ref = staging_pool.Request(size, MemoryUsage::Upload);
+            std::memcpy(ref.mapped_span.data(), bytes.data(), bytes.size());
+            return ref;
+        });
+    ASSERT(result);
+    VideoCommon::Nx2Profile::Add(result->reused
+        ? VideoCommon::Nx2Profile::Counter::UniformUploadHits
+        : VideoCommon::Nx2Profile::Counter::UniformUploadMisses, 1);
+    const auto& ref = result->ref;
+    guest_descriptor_queue.AddBuffer(ref.buffer, ref.device_address,
+                                    static_cast<u32>(ref.offset), size);
     return true;
 }
 

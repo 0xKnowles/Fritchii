@@ -41,6 +41,7 @@
 #include "video_core/host1x/syncpoint_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/readback_coverage.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
 
@@ -240,7 +241,7 @@ struct GPU::Impl {
                 raster_area.start_address, raster_area.end_address - raster_area.start_address);
             raster_area.preemtive = true;
             raster_area.completed_generation = 0;
-            return raster_area;
+            return VideoCommon::LimitReadbackReuseCoverage(raster_area, addr, size);
         }
         static const bool unsafe_preemptive_reads = [] {
             const char* value = std::getenv("EDEN_NX2_UNSAFE_PREEMPTIVE_READS");
@@ -256,7 +257,7 @@ struct GPU::Impl {
                     return true;
                 }();
                 area.completed_generation = 0;
-                return area;
+                return VideoCommon::LimitReadbackReuseCoverage(area, addr, size);
             }
         }
         return gpu_thread.ReadMemory(addr, size, is_async);

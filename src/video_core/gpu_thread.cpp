@@ -20,6 +20,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/readback_diagnostics.h"
+#include "video_core/readback_coverage.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/renderer_base.h"
 
@@ -59,7 +60,7 @@ VideoCore::RasterizerDownloadArea ReadMemory(VideoCore::RasterizerInterface& ras
                 ? generation
                 : 0;
     }
-    return area;
+    return LimitReadbackReuseCoverage(area, addr, size);
 }
 
 // Tells a CPU thread waiting in PushCommand that its command ran.

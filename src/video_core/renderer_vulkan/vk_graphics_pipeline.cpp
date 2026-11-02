@@ -30,6 +30,7 @@
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "common/settings.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/draw_table_snapshot.h"
 
 #if defined(__clang__) && defined(NDEBUG)
 #define LAMBDA_FORCEINLINE __attribute__((always_inline))
@@ -354,6 +355,7 @@ void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
 template <typename Spec>
 bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     boost::container::small_vector<VideoCommon::ImageViewInOut, 64> views;
+    boost::container::small_vector<size_t, 64> excluded_views;
     boost::container::small_vector<VideoCommon::SamplerId, 64> samplers;
     views.reserve(num_image_elements);
     samplers.reserve(num_textures);
@@ -368,6 +370,20 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
 
     const auto& regs{maxwell3d->regs};
     const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
+    // Adapted from Duck912/eden-fefw: synchronize and copy each handle table once per draw,
+    // then resolve its records without repeated GPU reads. Never persist guest host pointers.
+    const Shader::TextureDescriptor* buffer_texture_desc{};
+    static thread_local VideoCommon::DrawTableSnapshotCache table_snapshots;
+    table_snapshots.BeginDraw();
+    std::span<const u8> buffer_texture_bytes;
+    const auto read_buffer_texture_word = [&](u64 offset) {
+        if (offset > buffer_texture_bytes.size() ||
+            buffer_texture_bytes.size() - offset < sizeof(u32))
+            throw Shader::RuntimeError("Texture-handle field outside captured table");
+        u32 word;
+        std::memcpy(&word, buffer_texture_bytes.data() + offset, sizeof(word));
+        return word;
+    };
     const auto config_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         const Shader::Info& info{stage_infos[stage]};
         buffer_cache.UnbindGraphicsStorageBuffers(stage);
@@ -381,26 +397,74 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             }
         }
         const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
+        const auto read_word = [&](u32 bank, u32 offset) {
+            if (maxwell3d->GetNativeMacroEngine().native_turing &&
+                Tegra::NativeRootTables::IsBank(bank)) {
+                return maxwell3d->native_root_tables.Read(bank, offset);
+            }
+            if (bank >= cbufs.size() || !cbufs[bank].enabled)
+                throw Shader::RuntimeError("Texture handle constant bank {} is unavailable", bank);
+            return gpu_memory->Read<u32>(cbufs[bank].address + offset);
+        };
         const auto read_handle{[&](const auto& desc, u32 index) {
-            ASSERT(cbufs[desc.cbuf_index].enabled);
+            if constexpr (std::is_same_v<decltype(desc), const Shader::TextureDescriptor&>) {
+                if (desc.buffer_source.enabled) {
+                    const auto& source = desc.buffer_source;
+                    if (index == 0 || buffer_texture_desc != &desc) {
+                        const auto& cbuf = cbufs[desc.cbuf_index];
+                        if (!cbuf.enabled || desc.cbuf_offset > cbuf.size ||
+                            cbuf.size - desc.cbuf_offset < 16 ||
+                            !gpu_memory->IsFullyMappedRange(cbuf.address + desc.cbuf_offset, 16))
+                            throw Shader::RuntimeError("Buffer-backed texture root is unavailable");
+                        const GPUVAddr root = cbuf.address + desc.cbuf_offset;
+                        const GPUVAddr base = gpu_memory->Read<u64>(root);
+                        if (!source.size || gpu_memory->Read<u64>(root + 8) != source.size ||
+                            !base || base + source.size < base ||
+                            !gpu_memory->IsFullyMappedRange(base, source.size))
+                            throw Shader::RuntimeError("Buffer-backed texture array changed or is unmapped");
+                        const auto snapshot = table_snapshots.Read(
+                            gpu_memory->GetID(), base, source.size, [&](std::span<u8> bytes) {
+                                GPUVAddr expected = base;
+                                for (const auto& [address, size] : gpu_memory->GetSubmappedRange(base, source.size)) {
+                                    const auto device_address = gpu_memory->GpuToCpuAddress(address);
+                                    if (address != expected || !size || !device_address)
+                                        throw Shader::RuntimeError("Unmapped texture-handle buffer segment");
+                                    buffer_cache.DownloadMemory(*device_address, size);
+                                    expected += size;
+                                }
+                                if (expected != base + source.size)
+                                    throw Shader::RuntimeError("Incomplete texture-handle buffer mapping");
+                                gpu_memory->ReadBlockUnsafe(base, bytes.data(), bytes.size());
+                            });
+                        Profile::Add(snapshot.reused ? Profile::Counter::HandleTableSnapshotReuseHits
+                                                     : Profile::Counter::HandleTableSnapshotLoads, 1);
+                        if (snapshot.reused) {
+                            Profile::Add(Profile::Counter::HandleTableSnapshotBytesAvoided, source.size);
+                        }
+                        buffer_texture_desc = &desc;
+                        buffer_texture_bytes = snapshot.bytes;
+                    }
+                    const auto pair = TexturePair(read_buffer_texture_word(
+                        source.offset + u64{index} * source.stride), via_header_index);
+                    if (pair.first > regs.tex_header.limit || pair.second > regs.tex_sampler.limit)
+                        throw Shader::RuntimeError("Buffer-backed texture handle outside descriptor tables");
+                    return pair;
+                }
+            }
             const u32 index_offset{index << desc.size_shift};
             const u32 offset{desc.cbuf_offset + index_offset};
-            const GPUVAddr addr{cbufs[desc.cbuf_index].address + offset};
             if constexpr (std::is_same_v<decltype(desc), const Shader::TextureDescriptor&> ||
                           std::is_same_v<decltype(desc), const Shader::TextureBufferDescriptor&>) {
                 if (desc.has_secondary) {
-                    ASSERT(cbufs[desc.secondary_cbuf_index].enabled);
                     const u32 second_offset{desc.secondary_cbuf_offset + index_offset};
-                    const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].address +
-                                                 second_offset};
-                    const u32 lhs_raw{gpu_memory->Read<u32>(addr) << desc.shift_left};
-                    const u32 rhs_raw{gpu_memory->Read<u32>(separate_addr)
+                    const u32 lhs_raw{read_word(desc.cbuf_index, offset) << desc.shift_left};
+                    const u32 rhs_raw{read_word(desc.secondary_cbuf_index, second_offset)
                                       << desc.secondary_shift_left};
                     const u32 raw{lhs_raw | rhs_raw};
                     return TexturePair(raw, via_header_index);
                 }
             }
-            return TexturePair(gpu_memory->Read<u32>(addr), via_header_index);
+            return TexturePair(read_word(desc.cbuf_index, offset), via_header_index);
         }};
         const auto add_image{[&](const auto& desc, bool blacklist) LAMBDA_FORCEINLINE {
             for (u32 index = 0; index < desc.count; ++index) {
@@ -425,6 +489,19 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         for (const auto& desc : info.texture_descriptors) {
             for (u32 index = 0; index < desc.count; ++index) {
                 const auto handle{read_handle(desc, index)};
+                if (desc.buffer_source.enabled) {
+                    const auto& source = desc.buffer_source;
+                    for (const auto& exclusion : source.exclusions) {
+                        if (!exclusion.mask) continue;
+                        if (exclusion.offset > source.stride || source.stride - exclusion.offset < sizeof(u32))
+                            throw Shader::RuntimeError("Invalid buffer texture exclusion field");
+                        if (exclusion.Matches(read_buffer_texture_word(
+                                u64{index} * source.stride + exclusion.offset))) {
+                            excluded_views.push_back(views.size());
+                            break;
+                        }
+                    }
+                }
                 views.push_back({handle.first});
 
                 VideoCommon::SamplerId sampler{texture_cache.GetSamplerId(handle.second, false)};
@@ -466,6 +543,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }
 
     VideoCommon::ImageViewInOut* texture_buffer_it{views.data()};
+    // Only records proven unreachable for every use of this descriptor are excluded.
+    for (const size_t index : excluded_views) views[index].id = VideoCommon::NULL_IMAGE_VIEW_ID;
     const auto bind_stage_info{[&](size_t stage) LAMBDA_FORCEINLINE {
         size_t index{};
         const auto add_buffer{[&](const auto& desc) {
@@ -1008,7 +1087,9 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         dynamic_states.insert(dynamic_states.end(), extended.begin(), extended.end());
 
         // VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE_EXT
-        if (!key.state.dynamic_vertex_input) {
+        // Binding descriptions include unused guest slots. Only fetched attributes
+        // require dynamic strides; procedural full-screen draws bind no vertex buffers.
+        if (!key.state.dynamic_vertex_input && !vertex_attributes.empty()) {
             dynamic_states.push_back(VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE_EXT);
         }
     }

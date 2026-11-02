@@ -56,6 +56,8 @@ struct StorageInfo {
     StorageBufferSet set;
     StorageInstVector to_replace;
     StorageWritesSet writes;
+    bool native_runtime_bounds{};
+    std::unordered_map<const IR::Inst*, small_vector<StorageBufferAddr, 4>> native_tracks;
     /// Track results by the instruction the search starts from, with and without the NVN bias:
     /// accesses through the same address share them, and a search can walk thousands of
     /// instructions (the IR does not change while storage buffers are collected).
@@ -346,8 +348,10 @@ std::optional<LowAddrInfo> TrackLowAddress(IR::Inst* inst) {
 
 /// Tries to track the storage buffer address used by a global memory instruction
 std::optional<StorageBufferAddr> Track(const IR::Value& value, const Bias* bias,
-                                       std::unordered_set<const IR::Inst*>& exhausted) {
-    const auto pred{[bias](const IR::Inst* inst) -> std::optional<StorageBufferAddr> {
+                                       std::unordered_set<const IR::Inst*>& exhausted,
+                                       Environment* native_env = nullptr,
+                                       small_vector<StorageBufferAddr, 4>* candidates = nullptr) {
+    const auto pred{[bias, native_env](const IR::Inst* inst) -> std::optional<StorageBufferAddr> {
         if (inst->GetOpcode() != IR::Opcode::GetCbufU32 &&
             inst->GetOpcode() != IR::Opcode::GetCbufU32x2) {
             return std::nullopt;
@@ -377,13 +381,72 @@ std::optional<StorageBufferAddr> Track(const IR::Value& value, const Bias* bias,
             // point to them
             return std::nullopt;
         }
+        if (native_env && (storage_buffer.index >= Info::MAX_CBUFS ||
+                           storage_buffer.offset > 0xfff8 ||
+                           !native_env->IsCbufStorageBufferPointer(storage_buffer.index,
+                                                                  storage_buffer.offset))) {
+            return std::nullopt;
+        }
         return storage_buffer;
     }};
-    return BreadthFirstSearchPruned(value, pred, exhausted);
+    if (!native_env) {
+        return BreadthFirstSearchPruned(value, pred, exhausted);
+    }
+    // A base pointer survives addition and selection, but not multiplication or a
+    // predicate calculation. Searching those expressions can find strides first.
+    small_vector<const IR::Inst*, 16> pending;
+    std::unordered_set<const IR::Inst*> visited;
+    const auto enqueue = [&](const IR::Value& candidate) {
+        if (candidate.IsImmediate()) return;
+        const auto* candidate_inst = candidate.InstRecursive();
+        if (visited.insert(candidate_inst).second) {
+            pending.push_back(candidate_inst);
+        }
+    };
+    enqueue(value);
+    // Keep searching after the first pointer: a phi of a predicated address (for example a register
+    // that held another buffer's address before) can reach several pointers.
+    std::optional<StorageBufferAddr> first;
+    small_vector<StorageBufferAddr, 4> others;
+    for (size_t next = 0; next < pending.size(); ++next) {
+        const auto* inst = pending[next];
+        if (const auto result = pred(inst)) {
+            if (!first) {
+                first = result;
+            } else if (*result != *first &&
+                       std::ranges::find_if(others, [&](const auto& o) { return o == *result; }) ==
+                           others.end()) {
+                others.push_back(*result);
+            }
+            continue;
+        }
+        switch (inst->GetOpcode()) {
+        case IR::Opcode::IAdd32:
+        case IR::Opcode::Phi:
+            for (size_t arg = inst->NumArgs(); arg--;) enqueue(inst->Arg(arg));
+            break;
+        case IR::Opcode::SelectU32:
+            enqueue(inst->Arg(1));
+            enqueue(inst->Arg(2));
+            break;
+        case IR::Opcode::CompositeExtractU32x2:
+            if (inst->Arg(1).IsImmediate() && inst->Arg(1).U32() == 0) {
+                enqueue(inst->Arg(0));
+            }
+            break;
+        default:
+            break;
+        }
+    }
+    if (candidates && first) {
+        candidates->push_back(*first);
+        candidates->insert(candidates->end(), others.begin(), others.end());
+    }
+    return first;
 }
 
 /// Collects the storage buffer used by a global memory instruction and the instruction itself
-void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info) {
+void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, Environment& env) {
     // NVN puts storage buffers in a specific range, we have to bias towards these addresses to
     // avoid getting false positives
     static constexpr Bias nvn_bias{
@@ -412,10 +475,32 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info) 
         cache.emplace(start, result);
         return result;
     };
-    std::optional<StorageBufferAddr> storage_buffer{cached_track(&nvn_bias, info.biased_tracks, info.biased_exhausted)};
+    const bool native = env.HasNativeInstructions();
+    std::optional<StorageBufferAddr> storage_buffer;
+    if (native) {
+        small_vector<StorageBufferAddr, 4> candidates;
+        const auto* start = low_addr.TryInstRecursive();
+        if (const auto found = info.native_tracks.find(start); found != info.native_tracks.end()) {
+            candidates = found->second;
+        } else {
+            Track(low_addr, nullptr, info.unbiased_exhausted, &env, &candidates);
+            info.native_tracks.emplace(start, candidates);
+        }
+        if (!candidates.empty()) storage_buffer = candidates.front();
+        if (candidates.size() > 1) {
+            for (const auto& candidate : candidates) {
+                info.set.insert(candidate);
+                if (IsGlobalMemoryWrite(inst)) info.writes.insert(candidate);
+            }
+            info.native_runtime_bounds = true;
+            return;
+        }
+    } else {
+        storage_buffer = cached_track(&nvn_bias, info.biased_tracks, info.biased_exhausted);
+    }
     if (!storage_buffer) {
         // If it fails, track without a bias
-        storage_buffer = cached_track(nullptr, info.unbiased_tracks, info.unbiased_exhausted);
+        if (!native) storage_buffer = cached_track(nullptr, info.unbiased_tracks, info.unbiased_exhausted);
         if (!storage_buffer) {
             // If that also fails, use NVN fallbacks
             LOG_WARNING(Shader, "Storage buffer failed to track, using global memory fallbacks");
@@ -548,16 +633,19 @@ void Replace(IR::Block& block, IR::Inst& inst, const IR::U32& storage_index,
 }
 } // Anonymous namespace
 
-void GlobalMemoryToStorageBufferPass(IR::Program& program, const HostTranslateInfo& host_info) {
+void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program, const HostTranslateInfo& host_info) {
     StorageInfo info;
     for (IR::Block* const block : program.post_order_blocks) {
         for (IR::Inst& inst : block->Instructions()) {
             if (!IsGlobalMemory(inst)) {
                 continue;
             }
-            CollectStorageBuffers(*block, inst, info);
+            CollectStorageBuffers(*block, inst, info, env);
         }
     }
+    program.info.native_global_bounds |= info.native_runtime_bounds;
+    if (info.set.size() > Info::MAX_SSBOS - program.info.storage_buffers_descriptors.size())
+        throw NotImplementedException("Too many storage buffer pointer candidates");
     for (const StorageBufferAddr& storage_buffer : info.set) {
         program.info.storage_buffers_descriptors.push_back({
             .cbuf_index = storage_buffer.index,
@@ -579,6 +667,7 @@ void GlobalMemoryToStorageBufferPass(IR::Program& program, const HostTranslateIn
 }
 
 void JoinStorageInfo(Info& base, Info& source) {
+    base.native_global_bounds |= source.native_global_bounds;
     auto& descriptors = base.storage_buffers_descriptors;
     for (auto& desc : source.storage_buffers_descriptors) {
         auto it{std::ranges::find_if(descriptors, [&desc](const auto& existing) {

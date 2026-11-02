@@ -32,6 +32,7 @@
 #include "common/slot_vector.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/buffer_cache/buffer_base.h"
+#include "video_core/buffer_cache/fence_download_ranges.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/nx2.h"
@@ -57,7 +58,7 @@ constexpr u32 NUM_VERTEX_BUFFERS = 16;
 constexpr u32 NUM_VERTEX_BUFFERS = 32;
 #endif
 constexpr u32 NUM_TRANSFORM_FEEDBACK_BUFFERS = 4;
-constexpr u32 NUM_GRAPHICS_UNIFORM_BUFFERS = 18;
+constexpr u32 NUM_GRAPHICS_UNIFORM_BUFFERS = 32;
 constexpr u32 NUM_COMPUTE_UNIFORM_BUFFERS = 8;
 constexpr u32 NUM_STORAGE_BUFFERS = Shader::Info::MAX_SSBOS;
 constexpr u32 NUM_COMPUTE_STORAGE_BUFFERS = Shader::Info::MAX_SSBOS;
@@ -110,6 +111,13 @@ static constexpr Binding NULL_BINDING{
     .size = 0,
     .buffer_id = NULL_BUFFER_ID,
 };
+
+// Preserve the descriptor slot when its source bank is disabled, but never reuse
+// a binding left by an earlier dispatch. Do not resolve an unavailable bank.
+template <typename Resolve>
+void RefreshComputeStorageBinding(Binding& binding, bool source_enabled, Resolve&& resolve) {
+    binding = source_enabled ? resolve() : NULL_BINDING;
+}
 
 template <typename Buffer>
 struct HostBindings {
@@ -236,6 +244,9 @@ public:
 
     void ResolveMultiRangeStorage(Binding& binding, bool is_written,
                                   std::vector<MultiRangeSegment>& pool);
+
+    /// Re-resolve segments invalidated by a later buffer join in the same update.
+    void RefreshMultiRangeSegments(std::vector<MultiRangeSegment>& pool);
 
     void UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size);
 
@@ -488,7 +499,7 @@ private:
     void DeleteBuffer(BufferId buffer_id, bool do_not_mark = false);
 
     [[nodiscard]] Binding StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
-                                               bool is_written) const;
+                                               bool is_written, bool native_pointer) const;
 
     [[nodiscard]] TextureBufferBinding GetTextureBufferBinding(GPUVAddr gpu_addr, u32 size,
                                                                PixelFormat format);
@@ -553,15 +564,8 @@ private:
                Tegra::Nx2NeedsBufferDownloads();
     }
 
-    /// Whether a GPU write to this range is copied back at the next fence. Ranges the guest CPU
-    /// has read (Preflushable, set by the first reactive flush) always are: later reads skip the
-    /// flush and rely on these downloads, e.g. collision meshes skinned by compute shaders.
-    bool DownloadsAtFence(DAddr device_addr, u64 size) noexcept {
-        return AsyncBufferDownloads() || memory_tracker.IsRegionPreflushable(device_addr, size);
-    }
-
     /// GPU writes that are not downloaded at fences: trap the guest CPU's next read of their
-    /// pages, which flushes them once and marks them Preflushable (then DownloadsAtFence).
+    /// pages, which flushes them once and marks them Preflushable for later fence downloads.
     void ArmReadTraps(DAddr device_addr, u64 size) {
         const DAddr begin = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
         const DAddr end = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
@@ -589,14 +593,10 @@ private:
     /// Queues the parts of a GPU write to [addr, addr + size) that are copied back at the next
     /// fence.
     void QueueDownload(DAddr addr, u64 size) {
-        if (DownloadsAtFence(addr, size)) {
-            uncommitted_gpu_modified_ranges.Add(addr, size);
-            return;
+        if (QueueFenceDownloadRanges(AsyncBufferDownloads(), addr, size, memory_tracker,
+                                     cpu_read_ranges, uncommitted_gpu_modified_ranges)) {
+            ArmReadTraps(addr, size);
         }
-        cpu_read_ranges.ForEachInRange(addr, size, [this](DAddr start, DAddr end) {
-            uncommitted_gpu_modified_ranges.Add(start, end - start);
-        });
-        ArmReadTraps(addr, size);
     }
 
     // Async Buffers
@@ -615,7 +615,7 @@ private:
         using TickType = u64;
     };
     Common::LeastRecentlyUsedCache<LRUItemParams> lru_cache;
-    VirtualRangeCache virtual_ranges;
+    mutable VirtualRangeCache virtual_ranges;
     std::vector<MultiRangeSegment> graphics_segments;
     std::vector<MultiRangeSegment> compute_segments;
     u64 frame_tick = 0;

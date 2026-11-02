@@ -32,3 +32,39 @@ TEST_CASE("Compute storage bindings cover every shader descriptor and mask bit",
     }
     REQUIRE(visited == count);
 }
+
+TEST_CASE("Compute storage rebind clears a disabled source without shifting descriptor slots",
+          "[video_core][compute_storage]") {
+    using namespace VideoCommon;
+    std::array<Binding, 3> bindings{NULL_BINDING, NULL_BINDING, NULL_BINDING};
+    unsigned resolved = 0;
+    const auto resolve = [&] {
+        ++resolved;
+        Binding result = NULL_BINDING;
+        result.device_addr = 0x20000;
+        result.size = 4096;
+        result.gpu_addr = 0x40000;
+        result.segment_first = 7;
+        result.segment_count = 2;
+        return result;
+    };
+    RefreshComputeStorageBinding(bindings[1], true, resolve);
+    REQUIRE(resolved == 1);
+    REQUIRE(bindings[1].device_addr == 0x20000);
+    bindings[2].device_addr = 0x80000;
+    bindings[2].size = 128;
+
+    RefreshComputeStorageBinding(bindings[1], false, resolve);
+    REQUIRE(resolved == 1);
+    REQUIRE(bindings[1].device_addr == 0);
+    REQUIRE(bindings[1].size == 0);
+    REQUIRE(bindings[1].buffer_id == NULL_BUFFER_ID);
+    REQUIRE(bindings[1].gpu_addr == 0);
+    REQUIRE(bindings[1].segment_first == 0);
+    REQUIRE(bindings[1].segment_count == 0);
+    REQUIRE(bindings[2].device_addr == 0x80000);
+    REQUIRE(bindings[2].size == 128);
+    RefreshComputeStorageBinding(bindings[1], true, resolve);
+    REQUIRE(resolved == 2);
+    REQUIRE(bindings[1].device_addr == 0x20000);
+}

@@ -401,6 +401,8 @@ std::string_view GetTessSpacing(TessSpacing spacing) {
 std::string EmitGLASM(const Profile& profile, const RuntimeInfo& runtime_info, IR::Program& program,
                       Bindings& bindings) {
     EmitContext ctx{program, bindings, profile, runtime_info};
+    if (program.info.native_global_bounds)
+        throw NotImplementedException("Native multi-pointer storage selection in GLASM");
     Precolor(program);
     EmitCode(ctx, program);
     std::string header{StageHeader(program.stage)};
