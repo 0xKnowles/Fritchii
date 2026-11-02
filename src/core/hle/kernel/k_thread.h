@@ -355,6 +355,10 @@ public:
 
     Result Sleep(KernelCore& kernel, s64 timeout);
 
+    // The starting thread owns these references; Finalize also releases unconsumed entries.
+    void RecordStartupThread(KernelCore& kernel, KThread* thread);
+    void WaitForStartupThreads(KernelCore& kernel);
+
     s64 GetYieldScheduleCount() const {
         return m_schedule_count;
     }
@@ -889,6 +893,7 @@ private:
     SyncObjectBuffer m_sync_object_buffer{};
     s64 m_schedule_count{};
     s64 m_last_scheduled_tick{};
+    std::vector<KThread*> m_pending_started_threads;
     std::array<QueueEntry, Core::Hardware::NUM_CPU_CORES> m_per_core_priority_queue_entry{};
     KThreadQueue* m_wait_queue{};
     LockWithPriorityInheritanceInfoList m_held_lock_info_list{};

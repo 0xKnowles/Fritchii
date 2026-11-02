@@ -165,6 +165,8 @@ private:
 
     void FlushWork();
 
+    bool TryNativeIndirectReset(bool is_indexed, u32 instance_count);
+
     void UpdateDynamicStates();
 
     void HandleTransformFeedback();

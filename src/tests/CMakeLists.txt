@@ -5,6 +5,27 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 add_executable(tests
+    hid_core/sensor_info.cpp
+    common/paged_scalar.cpp
+    common/queue_lifetime.cpp
+    common/queue_timed_wait.cpp
+    common/range_set_move.cpp
+    video_core/uniform_cache_history.cpp
+    video_core/x8d24_conversion.cpp
+    video_core/ampere_ported_half_compare.cpp
+    video_core/ampere_geometry_capture.cpp
+    video_core/ampere_geometry_exit.cpp
+    video_core/ampere_geometry_lowering.cpp
+    video_core/ampere_ported_conversions.cpp
+    video_core/ampere_ported_uniform_vote.cpp
+    video_core/ampere_ported_textures.cpp
+    video_core/ampere_tennis_i2f.cpp
+    video_core/pipeline_cache_files.cpp
+    video_core/storage_binding_capacity.cpp
+    video_core/native_indirect_reset.cpp
+    video_core/ampere_matrix.cpp
+    video_core/spirv_software_matrix.cpp
+    video_core/spirv_builtin_capabilities.cpp
     common/bit_field.cpp
     common/cityhash.cpp
     common/container_hash.cpp
@@ -17,6 +38,7 @@ add_executable(tests
     common/undefined_fix.cpp
     common/unique_function.cpp
     core/core_timing.cpp
+    core/thread_startup_policy.cpp
     core/nup_writer.cpp
     core/internal_network/network.cpp
     video_core/memory_tracker.cpp

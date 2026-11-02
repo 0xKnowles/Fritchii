@@ -109,6 +109,18 @@ bool DmaPusher::Step() {
             if (kepler_payload || macro_payload) {
                 const size_t words = std::min<size_t>(dma_state.method_count, header.size);
                 auto* const engine_state = subchannels[dma_state.subchannel];
+                if (g_nx2_ampere.load(std::memory_order_relaxed) && words != 0) {
+                    // Continued native macro arguments can be GPU-generated indirect records.
+                    // Drain before checking dirty state, including a page's first GPU write,
+                    // and flush before selecting a submitted-word snapshot below.
+                    VideoCommon::GpuSplit::Get().Drain();
+                    const size_t bytes = words * sizeof(u32);
+                    if (memory_manager.IsMemoryDirty(dma_state.dma_get, bytes,
+                                                     VideoCommon::CacheType::BufferCache)) {
+                        memory_manager.FlushRegion(dma_state.dma_get, bytes,
+                                                   VideoCommon::CacheType::BufferCache);
+                    }
+                }
                 if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
                     // The caches behind IsMemoryDirty belong to the split's back thread.
                     split.Defer([engine_state, memory = &memory_manager, address = GPUVAddr{dma_state.dma_get},

@@ -30,6 +30,7 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/slot_vector.h"
+#include "shader_recompiler/shader_info.h"
 #include "video_core/buffer_cache/buffer_base.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
 #include "video_core/control/channel_state_cache.h"
@@ -57,7 +58,10 @@ constexpr u32 NUM_VERTEX_BUFFERS = 32;
 constexpr u32 NUM_TRANSFORM_FEEDBACK_BUFFERS = 4;
 constexpr u32 NUM_GRAPHICS_UNIFORM_BUFFERS = 18;
 constexpr u32 NUM_COMPUTE_UNIFORM_BUFFERS = 8;
-constexpr u32 NUM_STORAGE_BUFFERS = 16;
+// Native shaders can reference more than 16 storage buffers. Dropping a binding
+// shifts all following descriptor payloads into the wrong descriptor types.
+constexpr u32 NUM_STORAGE_BUFFERS = Shader::Info::MAX_SSBOS;
+static_assert(NUM_STORAGE_BUFFERS <= 32, "storage binding masks must fit u32");
 constexpr u32 NUM_TEXTURE_BUFFERS = 32;
 constexpr u32 NUM_STAGES = 5;
 

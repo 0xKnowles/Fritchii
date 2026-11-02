@@ -131,6 +131,29 @@ public:
     explicit INx2NvsrvSession(Core::System& system_) : ServiceFramework{system_, "nx2:nvsrv"} {}
 };
 
+// GPU time session handed out by gsv 1121. Welcome Tour opens it during graphics setup and
+// terminated with InvalidHandle (0xe401) when the zeroed reply carried no session handle.
+class INx2GpuTimeSession final : public ServiceFramework<INx2GpuTimeSession> {
+public:
+    explicit INx2GpuTimeSession(Core::System& system_)
+        : ServiceFramework{system_, "nx2:gpu_time"} {
+        RegisterHandlersTipc({
+            {0, &INx2GpuTimeSession::Handshake, "Handshake"},
+            {11, &INx2GpuTimeSession::QueryApplicationGpuTimeSpan, "QueryApplicationGpuTimeSpan"},
+        });
+    }
+
+private:
+    void Handshake(HLERequestContext& ctx) {
+        TipcHandshake(ctx, "nx2:gpu_time");
+    }
+
+    void QueryApplicationGpuTimeSpan(HLERequestContext& ctx) {
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.PushRaw<u32>(IPC::ResultNotSupported.raw);
+    }
+};
+
 // Placeholder for the Switch 2 syncpoint server (nn::syncpt), handed out by gsv 202. TIPC 1
 // returns a u32 the SDK requires to be < 0x400 and then passes min(value, 63) to TIPC 21.
 // Everything else is auto-stubbed through the nx2: prefix.
@@ -2907,7 +2930,7 @@ public:
             {1111, &INx2GraphicsSystemSession::SetFeatureVersion, "SetFeatureVersion"},
             {1112, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown1112"},
             {1113, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown1113"},
-            {1121, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown1121"},
+            {1121, &INx2GraphicsSystemSession::OpenGpuTimeSession, "OpenGpuTimeSession"},
             {1203, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown1203"},
             {1212, &INx2GraphicsSystemSession::DestroyNativeImage, "DestroyFeatureImagePool1212"},
             {1501, &INx2GraphicsSystemSession::CheckPermission, "CheckPermission1501"},
@@ -3040,6 +3063,11 @@ private:
         // Used by nn::syncpt::sdk::InitializeEx; handle at word 3, result at word 4.
         LOG_WARNING(Service, "(STUBBED) nx2:gsv TIPC 202, returning a nx2:syncpt session");
         ReturnRawSession(system, ctx, std::make_shared<INx2SyncptSession>(system));
+    }
+
+    void OpenGpuTimeSession(HLERequestContext& ctx) {
+        LOG_INFO(Service, "nx2:gsv TIPC 1121, returning a nx2:gpu_time session");
+        ReturnRawSession(system, ctx, std::make_shared<INx2GpuTimeSession>(system));
     }
 
     // nn::syncpt::sdk::InitializeEx sends two transfer memories (0x1000 bytes RW, then 0x2000

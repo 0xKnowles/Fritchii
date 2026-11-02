@@ -636,4 +636,6 @@ Id EmitDPdyFine(EmitContext& ctx, Id op_a);
 Id EmitDPdxCoarse(EmitContext& ctx, Id op_a);
 Id EmitDPdyCoarse(EmitContext& ctx, Id op_a);
 
+Id EmitTensorMulAdd(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c);
+
 } // namespace Shader::Backend::SPIRV

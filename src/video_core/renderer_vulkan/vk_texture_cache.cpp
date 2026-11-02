@@ -382,6 +382,11 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
     return host;
 }
 
+[[nodiscard]] bool IsCubeCompatible(const Device& device, const ImageInfo& info) {
+    return info.type == ImageType::e2D && info.resources.layers >= 6 &&
+           info.size.width == info.size.height && !device.HasBrokenCubeImageCompatibility();
+}
+
 [[nodiscard]] VkImageCreateInfo MakeImageCreateInfo(const Device& device, const ImageInfo& info,
                                                     std::optional<VkFormat> format_override = {}) {
     auto format_info =
@@ -392,8 +397,7 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
         format_info.storage = true;
     }
     VkImageCreateFlags flags{};
-    if (info.type == ImageType::e2D && info.resources.layers >= 6 &&
-        info.size.width == info.size.height && !device.HasBrokenCubeImageCompatibility()) {
+    if (IsCubeCompatible(device, info)) {
         flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     }
     if (info.type == ImageType::e3D) {
@@ -1225,7 +1229,8 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
     }
     for (size_t index_a = 0; index_a < VideoCore::Surface::MaxPixelFormat; index_a++) {
         const auto image_format = static_cast<PixelFormat>(index_a);
-        if (IsPixelFormatASTC(image_format) && !device.IsOptimalAstcSupported()) {
+        if (IsPixelFormatASTC(image_format) && !device.IsOptimalAstcSupported() &&
+            Settings::GetAstcRecompression() == Settings::AstcRecompression::Uncompressed) {
             view_formats[index_a].push_back(VK_FORMAT_A8B8G8R8_UNORM_PACK32);
         }
         for (size_t index_b = 0; index_b < VideoCore::Surface::MaxPixelFormat; index_b++) {
@@ -1857,6 +1862,9 @@ void TextureCacheRuntime::ConvertImage(Framebuffer* dst, ImageView& dst_view, Im
         }
         break;
     case PixelFormat::A8B8G8R8_UNORM:
+        if (src_view.format == PixelFormat::X8_D24_UNORM) {
+            return blit_image_helper.ConvertX8D24ToABGR8(dst, src_view);
+        }
         if (src_view.format == PixelFormat::S8_UINT_D24_UNORM) {
             return blit_image_helper.ConvertD24S8ToABGR8(dst, src_view);
         }
@@ -1875,6 +1883,11 @@ void TextureCacheRuntime::ConvertImage(Framebuffer* dst, ImageView& dst_view, Im
     case PixelFormat::D16_UNORM:
         if (src_view.format == PixelFormat::R16_UNORM) {
             return blit_image_helper.ConvertR16ToD16(dst, src_view);
+        }
+        break;
+    case PixelFormat::X8_D24_UNORM:
+        if (src_view.format == PixelFormat::A8B8G8R8_UNORM) {
+            return blit_image_helper.ConvertABGR8ToX8D24(dst, src_view);
         }
         break;
     case PixelFormat::S8_UINT_D24_UNORM:
@@ -3741,6 +3754,15 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
         create(TextureType::Color2D, 1);
         create(TextureType::ColorArray2D, std::nullopt);
         render_target = Handle(Shader::TextureType::ColorArray2D);
+        // Native shaders can sample six layers of a 2D array as a cube (point-light shadows).
+        // Adapted from Duck912/eden-fefw a1b23ac3.
+        if (info.type == VideoCommon::ImageViewType::e2DArray && info.range.extent.layers >= 6 &&
+            image.info.num_samples == 1 && IsCubeCompatible(*device, image.info)) {
+            create(TextureType::ColorCube, 6);
+            if (info.range.extent.layers % 6 == 0) {
+                create(TextureType::ColorArrayCube, std::nullopt);
+            }
+        }
         break;
     case VideoCommon::ImageViewType::e3D:
         create(TextureType::Color3D, std::nullopt);
@@ -4330,7 +4352,9 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     const u32 height = info.size.height;
     const u32 levels = static_cast<u32>(info.resources.levels);
     const u32 layers = static_cast<u32>(info.resources.layers);
-    constexpr VkFormat DecodeFormat = VK_FORMAT_A8B8G8R8_UNORM_PACK32;
+    // The BC encoder declares layout(rgba8). Identical byte layout is not enough:
+    // its storage image view must have the matching R8G8B8A8_UNORM format.
+    constexpr VkFormat DecodeFormat = VK_FORMAT_R8G8B8A8_UNORM;
     // A decode image of the same shape the GPU is done with: title 1's title screen decodes
     // dozens of textures a frame, mostly of a few shapes. Making one took 263 us; from VMA's
     // shared blocks 90 us, but freeing them there left ~1 GB of those blocks unused.

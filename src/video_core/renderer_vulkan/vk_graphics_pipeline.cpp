@@ -630,6 +630,11 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
 
 bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                                      const RenderAreaPushConstant& render_area) {
+    if (guest_descriptor_queue.UpdateCount() != num_descriptor_entries) {
+        LOG_CRITICAL(Render_Vulkan, "Graphics descriptor count mismatch: expected {}, got {}",
+                     num_descriptor_entries, guest_descriptor_queue.UpdateCount());
+        return false;
+    }
     const void* const descriptor_data{guest_descriptor_queue.UpdateData()};
 
     VkDeviceSize descriptor_buffer_offset{};

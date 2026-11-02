@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <memory>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -28,6 +29,7 @@
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/native_query_trace.h"
+#include "video_core/native_indirect_reset.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -454,8 +456,70 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 }
 } // Anonymous namespace
 
+bool RasterizerVulkan::TryNativeIndirectReset(bool is_indexed, u32 instance_count) {
+    namespace Reset = VideoCommon::NativeIndirectReset;
+    const auto& regs = maxwell3d->regs;
+    const auto& draw = maxwell3d->draw_manager.draw_state;
+    if (is_indexed || instance_count != 1 || regs.IsMeshEnabled() ||
+        draw.topology != Maxwell::PrimitiveTopology::Points ||
+        !maxwell3d->GetNativeMacroEngine().native_turing) {
+        return false;
+    }
+    const auto& cbuf = maxwell3d->state.shader_stages[0].const_buffers[0];
+    if (!cbuf.enabled || cbuf.size < 0x118) {
+        return false;
+    }
+    const GPUVAddr program =
+        (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
+    std::array<u32, Reset::Program.size()> code{};
+    if (!gpu_memory->IsFullyMappedRange(program + 128, sizeof(code))) {
+        return false;
+    }
+    gpu_memory->ReadBlock(program + 128, code.data(), sizeof(code));
+    if (!Reset::Matches(code)) {
+        return false;
+    }
+    FlushWork();
+    gpu_memory->FlushCaching();
+    if (!gpu_memory->IsFullyMappedRange(cbuf.address + 0x110, sizeof(u64))) {
+        return false;
+    }
+    u64 list{};
+    gpu_memory->ReadBlock(cbuf.address + 0x110, &list, sizeof(list));
+    const auto range = Reset::GetListRange(list, draw.vertex_buffer.first, draw.vertex_buffer.count);
+    if (!range || !gpu_memory->IsFullyMappedRange(range->address, range->bytes)) {
+        return false;
+    }
+    std::vector<u64> pointers(draw.vertex_buffer.count);
+    // Safe reads observe earlier GPU writes to the pointer list before the CPU stand-in runs.
+    gpu_memory->ReadBlock(range->address, pointers.data(), range->bytes);
+    for (const u64 pointer : pointers) {
+        if (!pointer || pointer > (std::numeric_limits<u64>::max)() - sizeof(Reset::Record) ||
+            !gpu_memory->IsFullyMappedRange(pointer, sizeof(Reset::Record)) ||
+            (pointer < range->address + range->bytes &&
+             pointer + sizeof(Reset::Record) > range->address)) {
+            return false;
+        }
+    }
+    const std::span<const u8> bytes{reinterpret_cast<const u8*>(Reset::Record.data()),
+                                   sizeof(Reset::Record)};
+    for (const u64 pointer : pointers) {
+        AccelerateInlineToMemory(pointer, bytes.size(), bytes);
+    }
+    static u32 reset_logs{};
+    if (reset_logs++ < 5) {
+        LOG_INFO(HW_GPU, "Native indirect reset: {} records from list {:#x}",
+                 pointers.size(), range->address);
+    }
+    gpu.TickWork();
+    return true;
+}
+
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
+    if (TryNativeIndirectReset(is_indexed, instance_count)) {
+        return;
+    }
     TraceWindowTarget(*maxwell3d, *gpu_memory, is_indexed ? "draw-indexed" : "draw",
                       is_indexed ? maxwell3d->draw_manager.draw_state.index_buffer.count
                                  : maxwell3d->draw_manager.draw_state.vertex_buffer.count);
@@ -827,7 +891,10 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     }
 
     query_cache.NotifySegment(true);
-    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
+    // Deferred load-op clears have no render pass yet. Starting a query here
+    // would begin it outside the pass and end it inside the next draw's pass.
+    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
+                              !can_defer_clear && regs.zpass_pixel_count_enable);
     UpdateViewportsState(regs);
 
     const u32 color_attachment = regs.clear_surface.RT;

@@ -13,6 +13,7 @@
 #include <string_view>
 #include <vector>
 #include "common/common_types.h"
+#include "shader_recompiler/frontend/ampere/geometry_exit.h"
 
 namespace Shader::Ampere {
 
@@ -46,7 +47,8 @@ struct LoweredProgram {
 // Lower only operations whose semantics are representable by the existing
 // Maxwell frontend. These are new instructions, not reinterpretations of the
 // native bytes. Scheduling/control words are added by the environment adapter.
-inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 high_uniforms) {
+inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 high_uniforms,
+                                        bool geometry_stage, bool compact_matrix) {
     LoweredProgram result;
     // UR28 and up (when used) live just below R216: UR28 at R(216 - high_uniforms).
     const u32 high_uniform_base = 216 - high_uniforms;
@@ -83,9 +85,19 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         return result;
     };
     if (code.empty() || code.size() > 65536) return fail(0, "invalid native program size");
+    std::optional<GeometryExitEnvelope> geometry_exit;
+    if (code.front().Bits(0, 12) == 0x34e) {
+        if (!geometry_stage) return fail(0, "native program counter load outside geometry stage");
+        geometry_exit = AnalyzeGeometryExit(code);
+        if (!*geometry_exit)
+            return fail(geometry_exit->error_offset / sizeof(Instruction), geometry_exit->error);
+    }
     for (u32 index = 0; index < code.size(); ++index) {
         auto insn = code[index];
         result.source_instruction_offsets.push_back(static_cast<u32>(result.instructions.size()));
+        if (geometry_exit && (index < GeometryExitSetupInstructions ||
+            index * sizeof(Instruction) == geometry_exit->handler + sizeof(Instruction)))
+            continue;
         u32 opcode = insn.Bits(0, 12);
         if (insn.Bits(12, 4) == 15) continue; // @!PT: never executes (compiler padding)
         std::optional<u32> active_link;
@@ -433,6 +445,20 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             }
             break;
         }
+        case 0x233: case 0x433: case 0x633: { // HSET2, two half comparisons with predicate combine.
+            const u32 combine = insn.Bits(69, 2);
+            if (insn.Bits(64, 5) || combine > 2 || insn.Bits(81, 6) || insn.Bits(91, 1) ||
+                (opcode == 0x233 && (insn.words[1] & 0x0fffff00U)))
+                return fail(index, "native packed half comparison mode");
+            const auto a = half_source(0), b = half_source(opcode == 0x233 ? 1 : 2);
+            emit(base(0x5d18000000000000ULL) | (u64{a.reg} << 8) | (u64{b.reg} << 20) |
+                 (u64{b.swizzle} << 28) | (u64{b.absolute} << 30) | (u64{b.negate} << 31) |
+                 (u64{insn.Bits(76, 4)} << 35) | (u64{insn.Bits(87, 4)} << 39) |
+                 (u64{a.negate} << 43) | (u64{a.absolute} << 44) | (u64{combine} << 45) |
+                 (u64{a.swizzle} << 47) | (u64{insn.Bits(71, 1)} << 49) |
+                 (u64{insn.Bits(80, 1)} << 50));
+            break;
+        }
         case 0x240: case 0x840: { // HMNMX2, exact half promotion for min/max
             if (insn.Bits(76, 11) || insn.Bits(91, 1))
                 return fail(index, "native half min/max mode");
@@ -708,13 +734,14 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         }
         case 0x886: { // VOTEU ballot and independent uniform predicate output.
             const u32 output = insn.Bits(81, 3), target = insn.Bits(16, 8);
-            if ((target >= 16 && target != 63) || insn.words[1] ||
-                insn.Bits(72, 2) > 2 || native_predicate != 7)
+            const u32 mapped_target = uniform_register(target);
+            if (mapped_target == ~0U || insn.Bits(24, 8) || insn.words[1] ||
+                (insn.words[2] & ~0x078e0300U) || insn.Bits(72, 2) > 2 || native_predicate != 7)
                 return fail(index, "native uniform vote mode");
             const u32 temporary = output == 7 ? 7 : 6 - output;
             const u32 mask = 1U << temporary;
             if (output != 7) emit(0x38e8000000070000ULL | 253 | (u64{255} << 8) | (u64{mask} << 20));
-            emit(0x50d8000000070000ULL | uniform_register(target) |
+            emit(0x50d8000000070000ULL | mapped_target |
                 (u64{insn.Bits(87, 4)} << 39) | (u64{temporary} << 45) | (u64{insn.Bits(72, 2)} << 48));
             if (output != 7) {
                 emit(0x38e8000000070000ULL | 239 | (u64{239} << 8) | (u64{mask} << 20));
@@ -866,7 +893,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             // .IS: Ra + offset addresses all constant buffers as one space, the buffer in its high
             // half (Kirby Air Riders' vertex shaders), which Eden's Maxwell LDC implements.
             const u32 width = insn.Bits(73, 3), mode = insn.Bits(78, 2);
-            if ((width != 4 && width != 5) || (mode != 0 && mode != 2) || insn.Bits(91, 1) ||
+            if (width > 5 || (mode != 0 && mode != 2) ||
+                (insn.words[2] & ~0xce00U) || (insn.words[1] & 0xf800003fU) ||
                 bank() >= 18 ||
                 (width == 5 && ((dest & 1) || dest >= 254))) return fail(index, "native indexed constant load mode");
             emit(base(0xef90000000000000ULL) | (u64{insn.Bits(24, 8)} << 8) |
@@ -1264,71 +1292,72 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             emit(0x5c18000000000000ULL | predicate | dest | (u64{248} << 8) | (u64{247} << 20) | (u64{16} << 39));
             break;
         }
-        case 0x23c: { // HMMA.16816.F16: D(16x8) = A(16x16) * B(16x8) + C, f16 fragments.
-            // Lane t (group g = t/4, i = t%4): A regs hold rows g / g+8 at k 2i..2i+1 (a0, a1) and
-            // 8+2i.. (a2, a3); B regs hold k 2i.. (b0) / 8+2i.. (b1) of column g; D holds rows
-            // g / g+8 at columns 2i, 2i+1. Rebuilt from shuffles with HFMA2, accumulating in R252/R253.
-            // The expansion is correct but large: title 4's 372-HMMA network takes the host driver
-            // minutes to compile, so it stays opt-in (the QMD still completes when rejected).
-            // EDEN_NX2_TENSOR=stub keeps the rest of the program but makes every HMMA D = C.
-            static const char* const mode = std::getenv("EDEN_NX2_TENSOR");
-            if (!mode) return fail(index, "native matrix multiply (set EDEN_NX2_TENSOR to emulate)");
+        case 0x23c: { // HMMA.1688/.16816.F16, software warp expansion (no tensor extension required).
             const u32 a = insn.Bits(24, 8), b = insn.Bits(32, 8), c = insn.Bits(64, 8);
-            if ((insn.words[1] & ~0xffU) || (insn.words[2] & ~0xffU) != 0x800 || dest + 2 > 246 ||
-                a + 4 > 246 || b + 2 > 246 || (c != 255 && c + 2 > 246))
-                return fail(index, "native matrix multiply mode");
-            if (std::string_view{mode} == "stub") {
-                for (u32 row = 0; row < 2; ++row) {
-                    if (c == 255) mov_imm(static_cast<u32>(dest) + row, 0);
-                    else if (c != dest) emit(0x5c98000000000000ULL | predicate | (dest + row) | (u64{15} << 39) | (u64{c + row} << 20));
-                }
+            const u32 mode = insn.words[2] & ~0xffU;
+            const u32 depth = mode == 0 ? 8U : 16U;
+            const u32 a_count = depth / 4, b_count = depth / 8;
+            const u32 limit = uses_uniform_bank ? high_uniform_base : 246U;
+            if (native_predicate != 7 || (mode != 0 && mode != 0x800) ||
+                (insn.words[1] & ~0xffU) || (insn.words[3] & 0xc00001ffU) ||
+                dest % 2 || dest + 2 > limit || a % a_count || a + a_count > limit ||
+                b % b_count || b + b_count > limit || (c != 255 && (c % 2 || c + 2 > limit)))
+                return fail(index, "native half matrix multiply mode");
+            if (compact_matrix) {
+                // A software collective, not an NV cooperative-matrix operation. The backend
+                // shares a bounded loop helper instead of duplicating hundreds of instructions
+                // at every HMMA site. Bit 48 tags software; bit 49 selects K=8 rather than K=16.
+                emit(0x5d30000000000000ULL | predicate | dest | (u64{a} << 8) |
+                     (u64{b} << 20) | (u64{c} << 39) | (u64{1} << 48) |
+                     (u64{depth == 8} << 49));
                 break;
             }
-            const auto shuffle = [&](u32 target, u32 source_reg) {
-                emit(0xef10000000000000ULL | predicate | target | (u64{source_reg} << 8) | (u64{246} << 20) |
-                     (u64{1} << 29) | (u64{31} << 34) | (u64{7} << 48));
+            // Four accumulators and five temporaries, all in R246..R254. In particular, R240..245
+            // can hold live GPRs or emulated uniform registers and must not be borrowed.
+            const auto shuffle = [&](u32 target, u32 source, u32 lane) {
+                emit(0xef10000000000000ULL | predicate | target | (u64{source} << 8) |
+                     (u64{lane} << 20) | (u64{1} << 29) | (u64{0x1f} << 34) | (u64{7} << 48));
             };
-            const auto lane_a = [&](u32 i) { // 4g + i
-                emit(0xf0c8000000000000ULL | predicate | 246);
-                emit(0x0400000000000000ULL | predicate | 246 | (u64{246} << 8) | (u64{0x1c} << 20));
-                if (i) emit(0x1c00000000000000ULL | predicate | 246 | (u64{246} << 8) | (u64{i} << 20));
+            const auto round_half = [&](u32 reg) {
+                emit(0x5ca8000000000000ULL | predicate | reg | (u64{1} << 8) |
+                     (u64{2} << 10) | (u64{reg} << 20));
             };
-            const auto lane_b = [&](u32 add) { // 8(t%4) + add: column 2(t%4) (+1 when add >= 4)
-                emit(0xf0c8000000000000ULL | predicate | 246);
-                emit(0x0400000000000000ULL | predicate | 246 | (u64{246} << 8) | (u64{3} << 20));
-                emit(0x3848000000000000ULL | predicate | 246 | (u64{246} << 8) | (u64{3} << 20));
-                if (add) emit(0x1c00000000000000ULL | predicate | 246 | (u64{246} << 8) | (u64{add} << 20));
-            };
-            const auto hfma2 = [&](u32 accumulator, u32 swizzle_a, u32 pair) {
-                emit(0x5d00000000000000ULL | predicate | accumulator | (u64{251} << 8) | (u64{pair} << 20) |
-                     (u64{accumulator} << 39) | (u64{swizzle_a} << 47));
-            };
-            for (u32 row = 0; row < 2; ++row) {
-                if (c == 255) mov_imm(252 + row, 0);
-                else emit(0x5c98000000000000ULL | predicate | (252 + row) | (u64{15} << 39) | (u64{c + row} << 20));
-            }
-            for (u32 i = 0; i < 4; ++i) {
-                for (u32 k_block = 0; k_block < 2; ++k_block) {
-                    lane_b(i);
-                    shuffle(247, b + k_block);
-                    lane_b(4 + i);
-                    shuffle(248, b + k_block);
-                    // P0 = (B[2i][2t], B[2i][2t+1]), P1 = (B[2i+1][2t], B[2i+1][2t+1])
-                    emit(0x0400000000000000ULL | predicate | 249 | (u64{247} << 8) | (u64{0xffff} << 20));
-                    emit(0x5c18000000000000ULL | predicate | 249 | (u64{248} << 8) | (u64{249} << 20) | (u64{16} << 39));
-                    emit(0x3828000000000000ULL | predicate | 250 | (u64{247} << 8) | (u64{16} << 20));
-                    emit(0x0400000000000000ULL | predicate | 248 | (u64{248} << 8) | (u64{0xffff0000} << 20));
-                    emit(0x5c10000000000000ULL | predicate | 250 | (u64{250} << 8) | (u64{248} << 20));
-                    for (u32 row = 0; row < 2; ++row) {
-                        lane_a(i);
-                        shuffle(251, a + k_block * 2 + row);
-                        hfma2(252 + row, 2, 249); // A.H0 broadcast * P0
-                        hfma2(252 + row, 3, 250); // A.H1 broadcast * P1
+            for (u32 row = 0; row < 2; ++row)
+                for (u32 col = 0; col < 2; ++col)
+                    extract_half({c == 255 ? 255 : c + row, 0, false, false}, col, 246 + row * 2 + col);
+            for (u32 pair = 0; pair < depth / 2; ++pair) {
+                emit(0xf0c8000000000000ULL | predicate | 250); // LaneId
+                emit(0x0400000000000000ULL | predicate | 251 | (u64{250} << 8) | (u64{3} << 20));
+                emit(0x3848000000000000ULL | predicate | 251 | (u64{251} << 8) | (u64{3} << 20));
+                emit(0x0400000000000000ULL | predicate | 250 | (u64{250} << 8) | (u64{0x1c} << 20));
+                mov_imm(254, pair & 3);
+                for (u32 reg : {250U, 251U})
+                    emit(0x5c10000000000000ULL | predicate | reg | (u64{reg} << 8) | (u64{254} << 20));
+                for (u32 row = 0; row < 2; ++row) {
+                    for (u32 half = 0; half < 2; ++half) {
+                        shuffle(252, a + (pair >= 4 ? 2 : 0) + row, 250);
+                        extract_half({252, 0, false, false}, half, 252);
+                        for (u32 col = 0; col < 2; ++col) {
+                            mov_imm(254, col * 4);
+                            emit(0x5c10000000000000ULL | predicate | 254 | (u64{251} << 8) | (u64{254} << 20));
+                            shuffle(253, b + pair / 4, 254);
+                            extract_half({253, 0, false, false}, half, 253);
+                            const u32 acc = 246 + row * 2 + col;
+                            emit(0x5980000000000000ULL | predicate | acc | (u64{252} << 8) |
+                                 (u64{253} << 20) | (u64{acc} << 39));
+                        }
+                    }
+                }
+                if ((pair & 3) == 3) {
+                    for (u32 reg = 246; reg < 250; ++reg) {
+                        round_half(reg);
+                        if (pair + 1 < depth / 2) extract_half({reg, 2, false, false}, 0, reg);
                     }
                 }
             }
             for (u32 row = 0; row < 2; ++row)
-                emit(0x5c98000000000000ULL | predicate | (dest + row) | (u64{15} << 39) | (u64{252 + row} << 20));
+                emit(0x5c18000000000000ULL | predicate | (dest + row) |
+                     (u64{247 + row * 2} << 8) | (u64{246 + row * 2} << 20) | (u64{16} << 39));
             break;
         }
         case 0x83b: { // LDSM.16.M88.{1,2,4} (ldmatrix): 8x8 16-bit matrices from shared memory.
@@ -1336,14 +1365,21 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             // row t/4, byte (t%4)*4 of each matrix in Rd+m. Emulated with SHFL.IDX + LDS.32.
             const u32 count = 1U << insn.Bits(72, 2);
             const bool transpose = insn.Bits(78, 1) != 0;
-            if (insn.Bits(72, 2) == 3 || (insn.words[2] & ~0x4300U) || insn.Bits(32, 8) ||
-                dest + count > 246)
+            const bool uniform_offset = insn.Bits(91, 1);
+            if (native_predicate != 7 || insn.Bits(72, 2) == 3 ||
+                (insn.words[2] & ~0x08004300U) || (!uniform_offset && insn.Bits(32, 8)) ||
+                dest % count || dest + count > (uses_uniform_bank ? high_uniform_base : 246U))
                 return fail(index, "native matrix load mode");
             u32 address = insn.Bits(24, 8);
             const u64 offset = insn.Bits(40, 24);
-            if (address != 255 && address >= dest && address < dest + count) {
-                emit(0x5c10000000000000ULL | predicate | 253 | (u64{address} << 8) | (u64{255} << 20));
-                address = 253;
+            if (uniform_offset) {
+                const u32 uniform = uniform_register(insn.Bits(32, 8));
+                if (uniform == ~0U) return fail(index, "native matrix load uniform offset");
+                emit(0x5c10000000000000ULL | predicate | 254 | (u64{address} << 8) | (u64{uniform} << 20));
+                address = 254;
+            } else if (address != 255 && address >= dest && address < dest + count) {
+                emit(0x5c10000000000000ULL | predicate | 254 | (u64{address} << 8) | (u64{255} << 20));
+                address = 254;
             }
             if (transpose) {
                 // .MT88: lane t receives stored rows 2(t%4) and 2(t%4)+1 at column t/4 (16 bits each).
@@ -1571,13 +1607,20 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                  (u64{insn.Bits(32, 8)} << 20) | (u64{insn.Bits(78, 2)} << 39));
             break;
         }
+
         case 0x305: case 0xb05: case 0xd05: { // F2I NTZ, register/constant-buffer/uniform source
             const u32 mode = insn.words[2] & ~(opcode == 0xd05 ? 0x08000000U : 0U);
             const bool half = opcode == 0x305 && mode == 0x0010f000;
-            const bool small = mode == 0x00212800;
-            const bool floor = (mode & ~0x10100U) == 0x00207000;
-            const bool nearest = (mode & ~0x10100U) == 0x00203000;
-            if ((!half && !small && !floor && !nearest && (mode & ~0x10100U) != 0x0020f000) ||
+            const bool small = (mode & ~0xc000U) == 0x00212800;
+            const bool byte = (mode & ~0x10100U) == 0x0020e000;
+            const bool word = (mode & ~0x1c100U) == 0x00203000;
+            const bool extended_word =
+                word && (insn.Bits(78, 2) == 2 || (insn.Bits(78, 2) == 3 && !insn.Bits(80, 1)));
+            if ((!half && !small && !byte && !word) ||
+                ((byte || small || extended_word) &&
+                 (insn.Bits(24, 8) || (insn.words[3] & 0xc00001ffU) ||
+                  (opcode == 0xb05 && insn.Bits(62, 2)) ||
+                  insn.Bits(91, 1) != static_cast<u32>(opcode == 0xd05))) ||
                 (opcode != 0xb05 && (insn.words[1] & 0xffffff00U)) ||
                 (opcode == 0xd05 && uniform_register(insn.Bits(32, 8)) == ~0U)) {
                 return fail(index, "native float-to-integer conversion mode");
@@ -1589,7 +1632,19 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 extract_half({source, 2, false, false}, 0, 252);
                 source = 252;
             }
-            if (!is_signed) {
+            if (byte) {
+                emit(0x5800000000000000ULL | predicate | 250 | (u64{source} << 8) |
+                     (u64{source} << 20) | (u64{7} << 39) | (u64{7} << 48));
+                emit(0x5c40000000000000ULL | predicate | 250 | (u64{source} << 8) |
+                     (u64{250} << 20) | (u64{7} << 48));
+                mov_imm(252, is_signed ? 0xc3000000U : 0U);
+                emit(0x5c60000000000000ULL | predicate | 250 | (u64{250} << 8) |
+                     (u64{252} << 20) | (u64{15} << 39));
+                mov_imm(252, is_signed ? 0x42fe0000U : 0x437f0000U);
+                emit(0x5c60000000000000ULL | predicate | 250 | (u64{250} << 8) |
+                     (u64{252} << 20) | (u64{7} << 39));
+                source = 250;
+            } else if (!is_signed) {
                 // Clear NaNs without consuming a guest predicate. Clamp the
                 // conversion below 2^32, retaining an overflow mask for saturation.
                 emit(0x5800000000000000ULL | predicate | 250 | (u64{source} << 8) |
@@ -1608,8 +1663,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             }
             emit(base(0x5cb0000000000000ULL) | (u64{small ? 1U : 2U} << 8) | (u64{2} << 10) |
                  (u64{is_signed} << 12) | (u64{source} << 20) |
-                 (u64{small || nearest ? 0U : floor ? 1U : 3U} << 39) | (u64{insn.Bits(80, 1)} << 44));
-            if (!is_signed && !small) {
+                 (u64{insn.Bits(78, 2)} << 39) | (u64{insn.Bits(80, 1)} << 44));
+            if (!is_signed && !small && !byte) {
                 emit(base(0x5c40000000000000ULL) | (dest << 8) | (u64{251} << 20) |
                      (u64{1} << 41) | (u64{7} << 48));
             }
@@ -1651,6 +1706,9 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             // Bit 76: a texel offset after the coordinates and level. 2D only, as Maxwell TLDS
             // 2D.LZ.AOFFI (x, y in Ra, Ra+1, offsets in Rb) or 2D.LL.AOFFI (level, offsets in Rb, Rb+1).
             const bool offsets = insn.Bits(76, 1) != 0;
+            // Bit 79 (.F16): half2 results, (c0, c1) in the first register and (c2, c3) in the
+            // second, as Maxwell TLDS.F16 (bit 59 clear) stores them.
+            const bool half = insn.Bits(79, 1) != 0;
             const u32 dimension = insn.Bits(61, 3);
             const bool array = dimension == 5;
             const bool volume = dimension == 2;
@@ -1666,7 +1724,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 for (u32 i = 0; i < rg_masks.size(); ++i) if (rg_masks[i] == mask) swizzle = i;
             }
             if (!insn.Bits(60, 1) || (dimension != 0 && dimension != 1 && !array && !volume) ||
-                swizzle == ~0U || (insn.Bits(76, 5) & ~1U) ||
+                swizzle == ~0U || (insn.Bits(76, 5) & ~0x9U) || (half && array && level) ||
                 (offsets && (dimension != 1 || (source_a & 1) || source_a >= 254 || source_b == 255 ||
                              (level && ((source_b & 1) || source_b >= 254)))) ||
                 insn.Bits(81, 3) != 7 || (insn.Bits(87, 3) != 1 && !level) || (level && volume) ||
@@ -1682,7 +1740,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             }
             const u32 binding = insn.Bits(54, 5);
             if (!bind_texture_buffer(binding)) {
-                if (level || offsets)
+                if (level || offsets || half)
                     return fail(index, "native texture descriptor buffer conflict");
                 // A second descriptor buffer: TLD.B (LZ) with the coordinates in R250.. (array
                 // index or Z after Ra) and the handle, loaded from that buffer, in R253.
@@ -1726,7 +1784,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 emit(0x5c98000000000000ULL | predicate | 251 | (u64{15} << 39) | (u64{source_b} << 20));
                 source_b = 250;
             }
-            emit(0xda00000000000000ULL | predicate | dest | (u64{source_a} << 8) |
+            emit((0xda00000000000000ULL & ~(u64{half} << 59)) | predicate | dest | (u64{source_a} << 8) |
                  (u64{source_b} << 20) | (u64{insn.Bits(64, 8)} << 28) |
                  (u64{insn.Bits(40, 14)} << 36) | (u64{insn.Bits(90, 1)} << 49) |
                  (u64{swizzle} << 50) |
@@ -1812,7 +1870,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             }
             break;
         }
-        case 0xb63: case 0xf63: { // TLD4 (gather), 2D without offsets or depth compare; component at bits 87-88.
+        case 0xb63: case 0xf63: { // TLD4 (gather), 2D without depth compare; component at bits 87-88.
             // 0xf63: the handle in a uniform register (bit 91), Maxwell TLD4.B with the handle in Rb.
             const bool bindless = opcode == 0xf63;
             const u32 handle = bindless ? uniform_register(insn.Bits(40, 6)) : 255;
@@ -1822,17 +1880,85 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             // Bit 76: a texel offset after the coordinates (x, y in Ra, Ra+1, offsets in Rb, as
             // for TEX); Maxwell TLD4 takes it as AOFFI (bits 54-55) from Rb.
             const bool offsets = insn.Bits(76, 1) != 0;
-            if (insn.Bits(61, 3) != 1 || insn.Bits(77, 3) || insn.Bits(81, 3) != 7 || insn.Bits(59, 1) ||
+            // Bits 76-77 = 2: per-tap offsets (PTP), x and y in Ra, Ra+1 and the packed offsets in
+            // Rb, Rb+1. The host gather needs them as constants, so they must be proven immediates.
+            const bool per_tap = insn.Bits(76, 2) == 2;
+            if (insn.Bits(61, 3) != 1 || (insn.Bits(77, 3) && !per_tap) || insn.Bits(81, 3) != 7 ||
+                insn.Bits(59, 1) ||
                 (offsets && (bindless || source_b == 255 || (source_a != 255 && source_a >= 245))) ||
+                (per_tap && (bindless || insn.Bits(78, 3) || insn.Bits(91, 1))) ||
                 insn.Bits(89, 1) || mask == 0 ||
                 (bindless ? (handle >= 246 || insn.Bits(46, 13) || !insn.Bits(91, 1))
                           : (insn.Bits(40, 14) > 0x1fff || binding >= 18 ||
                              (result.required_texture_buffer != ~0U && result.required_texture_buffer != binding))))
                 return fail(index, "native texture gather mode");
+            if (per_tap) {
+                const u32 register_limit = uses_uniform_bank ? high_uniform_base : 246U;
+                if (!insn.Bits(60, 1) || mask != 15 || source_a + 1 >= register_limit ||
+                    source_b + 1 >= register_limit || (dest != 255 && dest + 1 >= register_limit) ||
+                    (second_dest != 255 && second_dest + 1 >= register_limit))
+                    return fail(index, "native per-tap gather operands");
+                // The backward scan below is only sound for straight-line programs: every
+                // instruction up to the terminal EXIT must be one of these non-branching forms.
+                bool terminal = false;
+                for (const auto& instruction : code) {
+                    if (instruction.Bits(12, 4) == 15) continue;
+                    const u32 op = instruction.Bits(0, 12);
+        uses_uniform_bank |= op == 0x83b && instruction.Bits(91, 1);
+                    if (op == 0x94d && instruction.Bits(12, 4) == 7) {
+                        terminal = true;
+                        break;
+                    }
+                    if (op != 0x326 && op != 0x802 && op != 0x307 && op != 0x421 &&
+                        op != 0xa20 && op != 0xb63 && op != 0x221 && op != 0x823 &&
+                        op != 0x423 && op != 0x223 && op != 0x308 && op != 0x220 && op != 0x820)
+                        return fail(index, "native per-tap gather control-flow proof");
+                }
+                if (!terminal) return fail(index, "native per-tap gather terminal proof");
+                std::array<std::optional<u32>, 2> packed_offsets;
+                for (u32 cursor = index; cursor > 0 && (!packed_offsets[0] || !packed_offsets[1]);) {
+                    const auto& definition = code[--cursor];
+                    if (definition.Bits(12, 4) == 15) continue;
+                    const u32 op = definition.Bits(0, 12), target = definition.Bits(16, 8);
+                    if (op == 0xb63) {
+                        const u32 count = static_cast<u32>(std::popcount(definition.Bits(72, 4)));
+                        const u32 high = definition.Bits(64, 8);
+                        for (u32 i = 0; i < 2; ++i) {
+                            if (packed_offsets[i]) continue;
+                            const u32 reg = source_b + i;
+                            if ((target != 255 && reg >= target &&
+                                 reg < target + (high == 255 ? count : (std::min)(count, 2U))) ||
+                                (high != 255 && count > 2 && reg >= high && reg < high + count - 2))
+                                return fail(index, "native per-tap gather offset clobber");
+                        }
+                        continue;
+                    }
+                    if (op != 0x802 && op != 0x307 && op != 0x421 && op != 0xa20)
+                        return fail(index, "native per-tap gather offset proof");
+                    for (u32 i = 0; i < 2; ++i) {
+                        if (packed_offsets[i] || target != source_b + i) continue;
+                        if (op != 0x802 || definition.Bits(12, 4) != 7 || definition.Bits(24, 8) ||
+                            definition.words[2] != 0x00000f00)
+                            return fail(index, "native per-tap gather nonconstant offsets");
+                        packed_offsets[i] = definition.words[1];
+                    }
+                }
+                for (const auto& packed : packed_offsets) {
+                    if (!packed) return fail(index, "native per-tap gather missing offsets");
+                    // Each byte is a signed 6-bit offset; the gather reads only the low six bits.
+                    for (u32 shift = 0; shift < 32; shift += 8) {
+                        const u32 value = (*packed >> shift) & 255;
+                        if (value > 31 && value < 224)
+                            return fail(index, "native per-tap gather offset range");
+                    }
+                }
+                for (u32 i = 0; i < packed_offsets.size(); ++i)
+                    mov_imm(248 + i, *packed_offsets[i]);
+            }
             if (!bindless) result.required_texture_buffer = binding;
             // Two coordinates: x in Ra, y in Rb (the coordinate list splits evenly across them);
             // with an offset, x and y in Ra, Ra+1 and the offset in Rb.
-            const u32 y = !offsets ? source_b : source_a == 255 ? 255U : source_a + 1;
+            const u32 y = !offsets && !per_tap ? source_b : source_a == 255 ? 255U : source_a + 1;
             emit(0x5c98000000000000ULL | predicate | 250 | (u64{15} << 39) | (u64{source_a} << 20));
             emit(0x5c98000000000000ULL | predicate | 251 | (u64{15} << 39) | (u64{y} << 20));
             if (offsets) {
@@ -1845,9 +1971,9 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                      (u64{insn.Bits(90, 1)} << 49) | (u64{7} << 51));
             } else {
             emit(0xc800000000000000ULL | predicate | 250 | (u64{250} << 8) |
-                 (u64{offsets ? 246U : 255U} << 20) | (u64{2} << 28) | (u64{mask} << 31) |
+                 (u64{per_tap ? 248U : offsets ? 246U : 255U} << 20) | (u64{2} << 28) | (u64{mask} << 31) |
                  (u64{insn.Bits(40, 14)} << 36) | (u64{insn.Bits(90, 1)} << 49) | (u64{7} << 51) |
-                 (u64{offsets ? 1U : 0U} << 54) | (u64{insn.Bits(87, 2)} << 56));
+                 (u64{per_tap ? 2U : offsets ? 1U : 0U} << 54) | (u64{insn.Bits(87, 2)} << 56));
             }
             const u32 components = static_cast<u32>(std::popcount(mask));
             const bool split = second_dest != 255;
@@ -1880,10 +2006,11 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const u32 source_a = insn.Bits(24, 8), source_b = insn.Bits(32, 8);
             if (!bindless && dimension == 5 && depth_compare && lod == 0 && !split && mask == 1) {
                 if (!insn.Bits(60, 1) || insn.Bits(76, 2) || insn.Bits(81, 3) != 7 ||
-                    insn.Bits(59, 1) || insn.Bits(40, 14) > 0x1fff || insn.Bits(54, 5) != 2 ||
+                    insn.Bits(59, 1) || insn.Bits(40, 14) > 0x1fff || insn.Bits(54, 5) >= 18 ||
                     (source_a & 1) || (source_b & 1) || source_a >= 248 || source_b >= 248 || dest >= 248)
                     return fail(index, "native array depth comparison sample mode");
-                if (!bind_texture_buffer(2)) return fail(index, "native texture descriptor buffer conflict");
+                if (!bind_texture_buffer(insn.Bits(54, 5)))
+                    return fail(index, "native texture descriptor buffer conflict");
                 for (u32 i = 0; i < 3; ++i) {
                     const u32 source = i < 2 ? source_a + i : source_b;
                     emit(0x5c98000000000000ULL | predicate | (250 + i) |
@@ -1964,12 +2091,13 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 const u32 components = static_cast<u32>(std::popcount(mask));
                 if (insn.Bits(79, 1)) {
                     // FP16 results: (c0, c1) packed into the first destination, (c2, c3) into
-                    // the second (F2F writes the half in the low 16 bits; ISCADD merges).
+                    // the second, the first of each pair in the low half as Maxwell TEXS.F16 packs
+                    // (F2F writes the half in the low 16 bits; ISCADD Rd = (Ra << 16) + Rb merges).
                     const auto pack = [&](u32 target, u32 low, u32 high) {
                         if (target == 255) return;
                         emit(0x5ca8000000000000ULL | predicate | 246 | (u64{1} << 8) | (u64{2} << 10) | (u64{low} << 20));
                         emit(0x5ca8000000000000ULL | predicate | 247 | (u64{1} << 8) | (u64{2} << 10) | (u64{high} << 20));
-                        emit(0x5c18000000000000ULL | predicate | target | (u64{246} << 8) | (u64{247} << 20) | (u64{16} << 39));
+                        emit(0x5c18000000000000ULL | predicate | target | (u64{247} << 8) | (u64{246} << 20) | (u64{16} << 39));
                     };
                     pack(static_cast<u32>(dest), 250, components > 1 ? 251U : 255U);
                     if (components > 2) {
@@ -2056,6 +2184,26 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                  (opcode == 0xb07 ? cbuf() : u64{insn.Bits(32, 8)} << 20) | (u64{8 + insn.Bits(78, 2)} << 39) |
                  (u64{insn.Bits(80, 1)} << 44) | (u64{insn.Bits(63, 1)} << 45) |
                  (u64{insn.Bits(62, 1)} << 49));
+            break;
+        }
+        case 0x324: case 0x924: {
+            if (!geometry_stage) return fail(index, "native geometry output outside geometry stage");
+            const u32 type = insn.Bits(78, 2);
+            if (insn.words[2] & ~0xc000U)
+                return fail(index, "native geometry output mode");
+            if (type == 0 && (opcode != 0x324 || dest != 255 || insn.words[1] != 255))
+                return fail(index, "native geometry finalization mode");
+            const u64 handle = u64{insn.Bits(24, 8)} << 8;
+            const u64 flags = u64{type} << 39;
+            if (opcode == 0x324) {
+                if (insn.words[1] & ~0xffU)
+                    return fail(index, "native geometry output stream");
+                emit(base(0xfbe0000000000000ULL) | handle | (u64{insn.words[1]} << 20) | flags);
+            } else {
+                if (insn.words[1] > 0x7ffff)
+                    return fail(index, "native geometry output stream");
+                emit(base(0xf6e0000000000000ULL) | handle | (u64{insn.words[1]} << 20) | flags);
+            }
             break;
         }
         case 0x321: // ALD
@@ -2279,9 +2427,11 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         }
         case 0x306: case 0xd06: { // I2F.F32.U8, round-to-nearest (0xd06: uniform source)
             const u32 source = opcode == 0xd06 ? uniform_register(insn.Bits(32, 8)) : insn.Bits(32, 8);
-            if (opcode == 0x306 && insn.words[2] == 0x00101000 && !(insn.words[1] & 0xcfffff00U)) {
-                // I2F.U16 Rd, Rs(.H1): Maxwell's 16-bit source format, byte selector 0 or 2.
-                emit(base(0x5cb8000000000000ULL) | (u64{2} << 8) | (u64{1} << 10) | (u64{source} << 20) |
+            if (opcode == 0x306 && (insn.words[2] & ~0x400U) == 0x00101000 &&
+                !(insn.words[1] & 0xcfffff00U)) {
+                // I2F.U16/S16 Rd, Rs(.H1): signedness and the halfword selector are independent.
+                emit(base(0x5cb8000000000000ULL) | (u64{2} << 8) | (u64{1} << 10) |
+                     (u64{insn.Bits(74, 1)} << 13) | (u64{source} << 20) |
                      (u64{insn.Bits(60, 2) * 2} << 41));
                 break;
             }
@@ -2812,6 +2962,14 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             break;
         }
         case 0x923: case 0x927: { // ISBERD / ISBEWR: task and mesh programs' stage buffer.
+            if (geometry_stage) {
+                if (opcode != 0x923 || insn.words[1] || insn.words[2] ||
+                    insn.Bits(24, 8) == 255)
+                    return fail(index, "native geometry stage buffer read mode");
+                emit(base(0x5c98000000000000ULL) | (u64{15} << 39) |
+                     (u64{insn.Bits(24, 8)} << 20));
+                break;
+            }
             // Ampere: Ra 24-31, offset 40-63, ISBERD dest 16-23, ISBEWR data 32-39; 75 = .32 (else
             // U8), 76-77 = 3 .ATTR (0 the map region), 78 = .SKEW, 79 = .O (the output buffer).
             // Kept as an nx2 pseudo instruction (Maxwell 0xefc0, free there) that the frontend
@@ -2830,6 +2988,12 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             break;
         }
         case 0x94d: { // EXIT
+            if (geometry_exit && index * sizeof(Instruction) < geometry_exit->handler) {
+                relocations.push_back({static_cast<u32>(result.instructions.size()),
+                                       static_cast<s64>(geometry_exit->handler / sizeof(Instruction))});
+                emit(0xe24000000000000fULL | predicate);
+                break;
+            }
             if (insn.Bits(84, 2)) {
                 return fail(index, "native conditional/special EXIT");
             }
@@ -2879,11 +3043,12 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
     return fail(static_cast<u32>(code.size()), main_exited ? "native program lacks captured library return" : "native program has no unconditional EXIT");
 }
 
-inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
+inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code, bool geometry_stage = false,
+                                    bool compact_matrix = false) {
     // Programs using uniform registers above UR27 are lowered again with mirrors for them.
     u32 high_uniforms = 0;
     for (;;) {
-        LoweredProgram lowered = LowerToMaxwellWith(code, high_uniforms);
+        LoweredProgram lowered = LowerToMaxwellWith(code, high_uniforms, geometry_stage, compact_matrix);
         if (lowered || lowered.high_uniform_registers <= high_uniforms) return lowered;
         high_uniforms = lowered.high_uniform_registers;
     }

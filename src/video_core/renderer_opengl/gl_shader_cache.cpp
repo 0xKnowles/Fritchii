@@ -54,7 +54,7 @@ using VideoCommon::LoadPipelines;
 using VideoCommon::SerializePipeline;
 using Context = ShaderContext::Context;
 
-constexpr u32 CACHE_VERSION = 15;
+constexpr u32 CACHE_VERSION = 40;
 
 template <typename Container>
 auto MakeSpan(Container& container) {
@@ -289,7 +289,7 @@ void ShaderCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
         LOG_ERROR(Common_Filesystem, "Failed to create shader cache directories");
         return;
     }
-    shader_cache_filename = base_dir / "opengl.bin";
+    shader_cache_filename = base_dir / "opengl.fork-v40.bin";
 
     if (!workers && !strict_context_required) {
         workers = CreateWorkers();

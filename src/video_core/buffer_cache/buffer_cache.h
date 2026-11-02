@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include "video_core/buffer_cache/uniform_cache_history.h"
+
 #include <algorithm>
 #include <memory>
 #include <numeric>
@@ -127,14 +129,8 @@ void BufferCache<P>::TickFrame() {
                                  channel_state->uniform_cache_hits.end());
     const u32 shots = std::reduce(channel_state->uniform_cache_shots.begin(),
                                   channel_state->uniform_cache_shots.end());
-    std::copy_n(channel_state->uniform_cache_hits.begin(),
-                channel_state->uniform_cache_hits.size() - 1,
-                channel_state->uniform_cache_hits.begin() + 1);
-    std::copy_n(channel_state->uniform_cache_shots.begin(),
-                channel_state->uniform_cache_shots.size() - 1,
-                channel_state->uniform_cache_shots.begin() + 1);
-    channel_state->uniform_cache_hits[0] = 0;
-    channel_state->uniform_cache_shots[0] = 0;
+    AdvanceUniformCacheHistory(channel_state->uniform_cache_hits);
+    AdvanceUniformCacheHistory(channel_state->uniform_cache_shots);
 
     const bool skip_preferred = hits * 256 < shots * 251;
     channel_state->uniform_buffer_skip_cache_size = skip_preferred ? DEFAULT_SKIP_CACHE_SIZE : 0;
@@ -500,6 +496,11 @@ void BufferCache<P>::UnbindGraphicsStorageBuffers(size_t stage) {
 template <class P>
 bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, u32 cbuf_index,
                                                u32 cbuf_offset, bool is_written) {
+    if (stage >= NUM_STAGES || ssbo_index >= NUM_STORAGE_BUFFERS) {
+        LOG_ERROR(HW_GPU, "Invalid graphics storage buffer binding: stage {}, index {}",
+                  stage, ssbo_index);
+        return false;
+    }
     const bool already_enabled =
         ((channel_state->enabled_storage_buffers[stage] >> ssbo_index) & 1U) != 0;
     if constexpr (requires { runtime.ShouldLimitDynamicStorageBuffers(); }) {

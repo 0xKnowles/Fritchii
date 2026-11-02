@@ -1496,6 +1496,8 @@ void EmitContext::DefineInputs(const IR::Program& program) {
     if (loads[IR::Attribute::PrimitiveId]) {
         primitive_id = DefineInput(*this, U32[1], false, spv::BuiltIn::PrimitiveId);
         if (stage == Stage::Fragment) {
+            // A fragment PrimitiveId input requires Geometry (geometryShader is a required feature).
+            AddCapability(spv::Capability::Geometry);
             Decorate(primitive_id, spv::Decoration::Flat);
         }
     }
@@ -1527,34 +1529,40 @@ void EmitContext::DefineInputs(const IR::Program& program) {
             }
         }
     }
+    // BaseInstance, BaseVertex and DrawIndex are only valid with the DrawParameters capability.
+    const auto define_draw_parameter{[this](spv::BuiltIn builtin) {
+        AddExtension("SPV_KHR_shader_draw_parameters");
+        AddCapability(spv::Capability::DrawParameters);
+        return DefineInput(*this, U32[1], true, builtin);
+    }};
     if (loads[IR::Attribute::InstanceId]) {
         if (profile.support_vertex_instance_id) {
             instance_id = DefineInput(*this, U32[1], true, spv::BuiltIn::InstanceId);
             if (loads[IR::Attribute::BaseInstance]) {
-                base_instance = DefineInput(*this, U32[1], true, spv::BuiltIn::BaseInstance);
+                base_instance = define_draw_parameter(spv::BuiltIn::BaseInstance);
             }
         } else {
             instance_index = DefineInput(*this, U32[1], true, spv::BuiltIn::InstanceIndex);
-            base_instance = DefineInput(*this, U32[1], true, spv::BuiltIn::BaseInstance);
+            base_instance = define_draw_parameter(spv::BuiltIn::BaseInstance);
         }
     } else if (loads[IR::Attribute::BaseInstance]) {
-        base_instance = DefineInput(*this, U32[1], true, spv::BuiltIn::BaseInstance);
+        base_instance = define_draw_parameter(spv::BuiltIn::BaseInstance);
     }
     if (loads[IR::Attribute::VertexId]) {
         if (profile.support_vertex_instance_id) {
             vertex_id = DefineInput(*this, U32[1], true, spv::BuiltIn::VertexId);
             if (loads[IR::Attribute::BaseVertex]) {
-                base_vertex = DefineInput(*this, U32[1], true, spv::BuiltIn::BaseVertex);
+                base_vertex = define_draw_parameter(spv::BuiltIn::BaseVertex);
             }
         } else {
             vertex_index = DefineInput(*this, U32[1], true, spv::BuiltIn::VertexIndex);
-            base_vertex = DefineInput(*this, U32[1], true, spv::BuiltIn::BaseVertex);
+            base_vertex = define_draw_parameter(spv::BuiltIn::BaseVertex);
         }
     } else if (loads[IR::Attribute::BaseVertex]) {
-        base_vertex = DefineInput(*this, U32[1], true, spv::BuiltIn::BaseVertex);
+        base_vertex = define_draw_parameter(spv::BuiltIn::BaseVertex);
     }
     if (loads[IR::Attribute::DrawID]) {
-        draw_index = DefineInput(*this, U32[1], true, spv::BuiltIn::DrawIndex);
+        draw_index = define_draw_parameter(spv::BuiltIn::DrawIndex);
     }
     if (loads[IR::Attribute::FrontFace]) {
         front_face = DefineInput(*this, U1, true, spv::BuiltIn::FrontFacing);

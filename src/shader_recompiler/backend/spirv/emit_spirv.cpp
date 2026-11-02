@@ -19,6 +19,8 @@
 #include "shader_recompiler/frontend/ir/program.h"
 
 namespace Shader::Backend::SPIRV {
+void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program);
+
 namespace {
 template <class Func>
 struct FuncTraits {};
@@ -448,11 +450,6 @@ void SetupCapabilities(const Profile& profile, const Info& info, EmitContext& ct
             ctx.AddCapability(spv::Capability::ShaderViewportIndexLayerEXT);
         }
     }
-    if (!profile.support_vertex_instance_id &&
-        (info.loads[IR::Attribute::InstanceId] || info.loads[IR::Attribute::VertexId])) {
-        ctx.AddExtension("SPV_KHR_shader_draw_parameters");
-        ctx.AddCapability(spv::Capability::DrawParameters);
-    }
     if ((info.uses_subgroup_vote || info.uses_subgroup_invocation_id ||
          info.uses_subgroup_shuffles || info.uses_subgroup_mask) &&
         profile.support_vote && profile.SupportsSubgroupStage(ctx.stage)) {
@@ -611,6 +608,7 @@ void PatchMeshInstructions(std::vector<u32>& code, const EmitContext& ctx) {
 
 std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info, IR::Program& program, Bindings& bindings) {
     EmitContext ctx{profile, runtime_info, program, bindings};
+    DefineSoftwareMatrixFunctions(ctx, program);
     const Id main{DefineMain(ctx, program)};
     DefineEntryPoint(program, ctx, main);
     if (profile.support_float_controls) {

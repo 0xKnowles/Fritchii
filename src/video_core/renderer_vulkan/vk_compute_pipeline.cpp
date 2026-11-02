@@ -276,6 +276,12 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     PushImageDescriptors(texture_cache, guest_descriptor_queue, info, rescaling, samplers_it,
                          views_it);
 
+    if (guest_descriptor_queue.UpdateCount() != num_descriptor_entries) {
+        LOG_CRITICAL(Render_Vulkan, "Compute descriptor count mismatch: expected {}, got {}",
+                     num_descriptor_entries, guest_descriptor_queue.UpdateCount());
+        return false;
+    }
+
     if (!is_built.load(std::memory_order::relaxed)) {
         // Wait for the pipeline to be built
         scheduler.Record([this](vk::CommandBuffer) {

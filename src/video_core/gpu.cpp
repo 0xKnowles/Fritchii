@@ -62,7 +62,12 @@ struct GPU::Impl {
         , is_async{is_async_}
     {}
 
-    ~Impl() = default;
+    ~Impl() {
+        NotifyShutdown();
+        // Rasterizer teardown flushes commands and invalidates the bound engine's dirty flags.
+        // Keep channels, their scheduler references, and the graphics context alive until then.
+        renderer.reset();
+    }
 
     std::shared_ptr<Control::ChannelState> CreateChannel(s32 channel_id) {
         auto channel_state = std::make_shared<Tegra::Control::ChannelState>(channel_id);
