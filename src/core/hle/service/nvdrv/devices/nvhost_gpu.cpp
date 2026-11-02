@@ -450,16 +450,9 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
             LOG_TRACE(Service_NVDRV, "nx2 GPFIFO entry raw={:#018x} addr={:#x} size={:#x}", entry.raw,
                      entry.addr.Value(), entry.size.Value());
         }
-        static const bool check = std::getenv("EDEN_NX2_PB_CHECK") != nullptr;
-        if (check) {
-            std::vector<u32> words;
-            for (const auto& entry : entries.command_lists) {
-                words.resize(entry.size);
-                system.ApplicationMemory().ReadBlock(entry.addr.Value(), words.data(),
-                                                     words.size() * sizeof(u32));
-                entries.submit_hashes.push_back(Tegra::HashPushbufferWords(words));
-            }
-        }
+        // EDEN_NX2_PB_CHECK records the synchronized fetch in DmaPusher instead.
+        // A GPU virtual address is not a CPU virtual address; speculative reads
+        // here also race command writers before the GPU has ordered this entry.
     }
 
     auto& flags = params.flags;

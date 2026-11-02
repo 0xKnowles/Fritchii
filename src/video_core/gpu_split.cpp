@@ -21,6 +21,7 @@
 #include "common/thread.h"
 #include "core/core.h"
 #include "video_core/engines/engine_interface.h"
+#include "video_core/engines/split_front_ownership.h"
 #include "video_core/gpu_split.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
@@ -75,6 +76,8 @@ struct BackActivitySnapshot {
 struct DrainProfileData {
     SplitDrainMetrics metrics;
     CommandFetchSyncAudit audit;
+    SplitPublicationMetrics publication; ///< Command-fetch drains that had to wait
+    u64 hints_start{};
     BackActivitySnapshot back_start;
     u64 window_start{};
     u32 events{};
@@ -85,6 +88,7 @@ void StartDrainProfileWindow(DrainProfileData& data, u64 now) {
     data = {};
     data.window_start = now;
     data.back_start = BackActivitySnapshot::Take();
+    data.hints_start = GpuSplit::Get().PublicationHints();
 }
 
 void ReportDrainProfile() {
@@ -140,6 +144,15 @@ void ReportDrainProfile() {
              per_second(audit.candidates), per_second(audit.candidate_waits),
              static_cast<double>(audit.candidate_wait_ns) * 1000.0 / window,
              audit.first_write_hits);
+    // Whether the writer a command fetch waited for was already visible to the back when the
+    // wait began (split_publication.h). Wait time itself is the "command fetch" ms/s above.
+    const auto& publication = data.publication;
+    LOG_INFO(HW_GPU,
+             "GPU split publication: writer hints {:.0f}/s | waiting command-fetch drains "
+             "{:.0f}/s, target not yet visible {:.0f}/s ({:.0f} words/s), back asleep {:.0f}/s",
+             per_second(GpuSplit::Get().PublicationHints() - data.hints_start),
+             per_second(publication.pending_drains), per_second(publication.withheld_drains),
+             per_second(publication.withheld_words), per_second(publication.asleep_drains));
     StartDrainProfileWindow(data, now);
 }
 
@@ -251,6 +264,9 @@ void GpuSplit::Stop() {
     wake.fetch_add(1, std::memory_order_seq_cst);
     wake.notify_one();
     back_thread.join();
+    // The back is no longer accessing engines. Restore macro ownership and
+    // partial calls; a subsequent split start takes a fresh register snapshot.
+    Tegra::Engines::SplitFrontOwnership::ReturnAll();
     active = false;
     // The split is static and outlives the emulation session. The next session's back thread
     // starts reading at 0: with the old positions kept it skipped through the new, empty ring a
@@ -259,6 +275,7 @@ void GpuSplit::Stop() {
     ring.reset();
     write_position = 0;
     published_local = 0;
+    hinted_local = 0; // publication_hints stays monotonic for the per-window report deltas
     consumed_cache = 0;
     command_writes.Reset();
     completion.Reset();
@@ -310,7 +327,7 @@ void GpuSplit::Publish() {
         return;
     }
     published_local = write_position;
-    publish_every = std::min<size_t>(publish_every * 2, PublishEvery);
+    publish_every = static_cast<size_t>(SplitPublication::NextInterval(publish_every));
     published.store(write_position, std::memory_order_seq_cst);
     if (back_waiting.load(std::memory_order_seq_cst)) {
         wake.fetch_add(1, std::memory_order_seq_cst);
@@ -341,6 +358,11 @@ void GpuSplit::DrainTo(u64 target, SplitDrainReason reason) {
     if (consumed_cache >= target) {
         return;
     }
+    if (reason == SplitDrainReason::CommandFetch) {
+        drain_profile.publication.RecordPendingDrain(
+            SplitPublication::Withheld(target, published_local, hinted_local),
+            back_waiting.load(std::memory_order_relaxed));
+    }
     // A frontier can be in the middle of an already published batch. Ask the
     // back to acknowledge it without waiting for the unrelated tail or 4096
     // more words. Publish remains the release of the ring's actual contents.
@@ -350,7 +372,7 @@ void GpuSplit::DrainTo(u64 target, SplitDrainReason reason) {
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache >= target) {
-            publish_every = 8;
+            publish_every = SplitPublication::MinimumInterval;
             return;
         }
         if (spins < 16384) {

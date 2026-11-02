@@ -33,6 +33,7 @@
 #include "shader_recompiler/shader_info.h"
 #include "video_core/buffer_cache/buffer_base.h"
 #include "video_core/buffer_cache/fence_download_ranges.h"
+#include "video_core/buffer_cache/pending_fence_readback.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/nx2.h"
@@ -111,6 +112,22 @@ static constexpr Binding NULL_BINDING{
     .size = 0,
     .buffer_id = NULL_BUFFER_ID,
 };
+
+// Upstream 46b2577: an unmapped uniform address disables the binding, rather
+// than dereferencing an empty translation and retaining invalid device data.
+inline Binding MakeGraphicsUniformBinding(std::optional<DAddr> address, u32 size) {
+    if (!address) {
+        return NULL_BINDING;
+    }
+    return Binding{.device_addr = *address, .size = size, .buffer_id = BufferId{}};
+}
+
+// Upstream a407703: guest-provided addresses must be checked before indexing
+// the fixed device-page table. This guards the starting page, not every range operation.
+inline std::optional<u64> CheckedBufferPage(DAddr address, u32 page_bits, u64 page_count) {
+    const u64 page = address >> page_bits;
+    return address != 0 && page < page_count ? std::optional<u64>{page} : std::nullopt;
+}
 
 // Preserve the descriptor slot when its source bank is disabled, but never reuse
 // a binding left by an earlier dispatch. Do not resolve an unavailable bank.
@@ -339,10 +356,6 @@ public:
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(DAddr addr, size_t size);
 
-    /// The guest CPU reads [addr, addr + size) (pages its reads are tracked on): without
-    /// AsyncBufferDownloads, GPU writes there are still copied back at fences from now on.
-    void NoteCpuRead(DAddr addr, size_t size);
-
     /// Return true when a region is registered on the cache
     [[nodiscard]] bool IsRegionRegistered(DAddr addr, size_t size);
 
@@ -493,6 +506,12 @@ private:
 
     void DownloadBufferMemory(Buffer& buffer_id, DAddr device_addr, u64 size);
 
+    /// Writes planned bytes (PlanPendingFenceReads) from pending fence staging to guest memory
+    /// once the newest used fence's copy submission has completed. Returns false, having written
+    /// nothing, when a used fence's selections predate the current selection rule or its copy
+    /// tick is unknown: the caller then downloads the bytes itself.
+    bool ReadPendingFenceCopies(std::span<const PendingFenceRead> reads);
+
     /// Downloads the GPU-written data of several buffers with one wait for the GPU.
     void DownloadBuffersMemory(std::span<const BufferId> buffer_ids);
 
@@ -592,7 +611,11 @@ private:
     /// 8 MiB window) dropped it from 60 to about 42 frames a second. (A separate CPU-read range
     /// set used to duplicate the Preflushable pages here; it was never anything else.)
     void QueueDownload(DAddr addr, u64 size) {
-        if (QueueFenceDownloadRanges(AsyncBufferDownloads(), addr, size, memory_tracker,
+        const bool download_all = AsyncBufferDownloads();
+        download_selection_epochs.NoteSelection(
+            download_all,
+            uncommitted_gpu_modified_ranges.Empty() && committed_gpu_modified_ranges.empty());
+        if (QueueFenceDownloadRanges(download_all, addr, size, memory_tracker,
                                      uncommitted_gpu_modified_ranges)) {
             ArmReadTraps(addr, size);
         }
@@ -606,11 +629,17 @@ private:
     Common::OverlapRangeSet<DAddr> async_downloads;
     std::deque<std::optional<Async_Buffer>> async_buffers;
     std::deque<boost::container::small_vector<BufferCopy, 4>> pending_downloads;
+    /// Parallel to pending_downloads: the scheduler tick whose submission contains each fence's
+    /// copies (0 without tick tracking), and the selection epoch they were made under.
+    struct PendingDownloadOrigin {
+        u64 tick;
+        u64 selection_epoch;
+    };
+    std::deque<PendingDownloadOrigin> pending_download_origins;
+    DownloadSelectionEpochs download_selection_epochs;
     std::optional<Async_Buffer> current_buffer;
 
     std::deque<Async_Buffer> async_buffers_death_ring;
-    u64 fence_writeback_count = 0;
-    Common::ScratchBuffer<u8> fence_writeback_compare;
 
     size_t immediate_buffer_capacity = 0;
     Common::ScratchBuffer<u8> immediate_buffer_alloc;

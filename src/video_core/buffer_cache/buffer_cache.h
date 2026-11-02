@@ -9,6 +9,7 @@
 #include "video_core/buffer_cache/storage_buffer_size.h"
 #include "video_core/buffer_cache/storage_binding_sync.h"
 #include "video_core/buffer_cache/uniform_upload_cache.h"
+#include "video_core/buffer_cache/uniform_cache_history.h"
 
 #include <algorithm>
 #include <cstring>
@@ -128,14 +129,8 @@ void BufferCache<P>::TickFrame() {
                                  channel_state->uniform_cache_hits.end());
     const u32 shots = std::reduce(channel_state->uniform_cache_shots.begin(),
                                   channel_state->uniform_cache_shots.end());
-    std::copy_n(channel_state->uniform_cache_hits.begin(),
-                channel_state->uniform_cache_hits.size() - 1,
-                channel_state->uniform_cache_hits.begin() + 1);
-    std::copy_n(channel_state->uniform_cache_shots.begin(),
-                channel_state->uniform_cache_shots.size() - 1,
-                channel_state->uniform_cache_shots.begin() + 1);
-    channel_state->uniform_cache_hits[0] = 0;
-    channel_state->uniform_cache_shots[0] = 0;
+    AdvanceUniformCacheHistory(channel_state->uniform_cache_hits);
+    AdvanceUniformCacheHistory(channel_state->uniform_cache_shots);
 
     const bool skip_preferred = hits * 256 < shots * 251;
     channel_state->uniform_buffer_skip_cache_size = skip_preferred ? DEFAULT_SKIP_CACHE_SIZE : 0;
@@ -271,8 +266,8 @@ void BufferCache<P>::DownloadMemory(DAddr device_addr, u64 size) {
 
 template <class P>
 void BufferCache<P>::ClearDownload(DAddr device_addr, u64 size) {
-    DropFenceDownloads(device_addr, size, async_downloads, uncommitted_gpu_modified_ranges,
-                       committed_gpu_modified_ranges);
+    DropFenceDownloads(device_addr, size, pending_downloads, async_downloads,
+                       uncommitted_gpu_modified_ranges, committed_gpu_modified_ranges);
 }
 
 template <class P>
@@ -412,12 +407,7 @@ template <class P>
 void BufferCache<P>::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr,
                                                u32 size) {
     const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
-    const Binding binding{
-        .device_addr = *device_addr,
-        .size = size,
-        .buffer_id = BufferId{},
-    };
-    channel_state->uniform_buffers[stage][index] = binding;
+    channel_state->uniform_buffers[stage][index] = MakeGraphicsUniformBinding(device_addr, size);
 }
 
 template <class P>
@@ -463,15 +453,23 @@ void BufferCache<P>::BindHostGeometryBuffers(bool is_indexed) {
 template <class P>
 void BufferCache<P>::BindHostStageBuffers(size_t stage) {
     BindHostGraphicsUniformBuffers(stage);
-    BindHostGraphicsStorageBuffers(stage);
-    BindHostGraphicsTextureBuffers(stage);
+    if (channel_state->enabled_storage_buffers[stage] != 0) {
+        BindHostGraphicsStorageBuffers(stage);
+    }
+    if (channel_state->enabled_texture_buffers[stage] != 0) {
+        BindHostGraphicsTextureBuffers(stage);
+    }
 }
 
 template <class P>
 void BufferCache<P>::BindHostComputeBuffers() {
     BindHostComputeUniformBuffers();
-    BindHostComputeStorageBuffers();
-    BindHostComputeTextureBuffers();
+    if (channel_state->enabled_compute_storage_buffers != 0) {
+        BindHostComputeStorageBuffers();
+    }
+    if (channel_state->enabled_compute_texture_buffers != 0) {
+        BindHostComputeTextureBuffers();
+    }
     if (any_buffer_uploaded) {
         runtime.PostCopyBarrier();
         any_buffer_uploaded = false;
@@ -747,6 +745,16 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
         normalized_copies.push_back(second_copy);
     }
     runtime.PostCopyBarrier();
+    // Read after recording every copy: should recording have submitted in between, this later
+    // tick still completes after all of them.
+    u64 copy_tick = 0;
+    if constexpr (requires { runtime.CurrentTick(); }) {
+        copy_tick = runtime.CurrentTick();
+    }
+    pending_download_origins.push_back({
+        .tick = copy_tick,
+        .selection_epoch = download_selection_epochs.OldestSelection(),
+    });
     pending_downloads.emplace_back(std::move(normalized_copies));
     async_buffers.emplace_back(download_staging);
 }
@@ -778,25 +786,7 @@ void BufferCache<P>::PopAsyncBuffers() {
     }
     ReadbackDiagnostics::Scope diagnostic{ReadbackDiagnostics::Event::FenceDownloadWriteback,
                                           copied_bytes};
-    // Evidence for the eager-download policy: how much of what is written back guest memory
-    // already held. Sampled, and compared before writing (the bytes written do not change).
-    const bool compare = ReadbackDiagnostics::Enabled() && (fence_writeback_count++ & 63) == 0;
-    u64 compared_bytes = 0;
-    u64 unchanged_bytes = 0;
     const auto write = [&](DAddr address, const u8* source, u64 size) {
-        if (compare) {
-            fence_writeback_compare.resize_destructive(size);
-            device_memory.ReadBlockUnsafe(address, fence_writeback_compare.data(), size);
-            compared_bytes += size;
-            for (u64 offset = 0; offset < size;) {
-                const u64 chunk = (std::min<u64>)(size - offset, 64);
-                if (std::memcmp(fence_writeback_compare.data() + offset, source + offset,
-                                chunk) == 0) {
-                    unchanged_bytes += chunk;
-                }
-                offset += chunk;
-            }
-        }
         device_memory.WriteBlockUnsafe(address, source, size);
     };
     u8* base = async_buffer->mapped_span.data();
@@ -806,17 +796,14 @@ void BufferCache<P>::PopAsyncBuffers() {
         const u64 dst_offset = copy.dst_offset - base_offset;
         WriteBackFenceCopy(device_addr, copy.size, base + dst_offset, async_downloads,
                            uncommitted_gpu_modified_ranges, committed_gpu_modified_ranges,
-                           gpu_modified_ranges, write);
-    }
-    if (compare) {
-        ReadbackDiagnostics::Scope sampled{ReadbackDiagnostics::Event::FenceWritebackSampled,
-                                           compared_bytes};
-        ReadbackDiagnostics::Scope unchanged{ReadbackDiagnostics::Event::FenceWritebackUnchanged,
-                                             unchanged_bytes};
+                           gpu_modified_ranges, write,
+                           download_selection_epochs.IsCurrent(
+                               pending_download_origins.front().selection_epoch));
     }
     async_buffers_death_ring.emplace_back(*async_buffer);
     async_buffers.pop_front();
     pending_downloads.pop_front();
+    pending_download_origins.pop_front();
 }
 
 template <class P>
@@ -824,15 +811,6 @@ bool BufferCache<P>::IsRegionGpuModified(DAddr addr, size_t size) {
     // One lookup instead of visiting every range inside (~4% of the GPU thread for title 1's
     // inline uploads once GPU-written ranges are no longer cleared by downloads).
     return gpu_modified_ranges.Intersects(addr, size);
-}
-
-template <class P>
-void BufferCache<P>::NoteCpuRead([[maybe_unused]] DAddr addr, [[maybe_unused]] size_t size) {
-    // Nothing left to record. This used to add the page-aligned read to a CPU-read range set,
-    // only without AsyncBufferDownloads; its only caller (RasterizerVulkan::GetFlushArea) then
-    // calls GetFlushArea here under that same condition, which marks those same pages
-    // Preflushable. Neither was ever cleared, so every fence selection walked two copies of one
-    // set. QueueDownload selects the Preflushable pages.
 }
 
 template <class P>
@@ -1622,6 +1600,9 @@ void BufferCache<P>::UpdateDrawIndirect() {
 
 template <class P>
 void BufferCache<P>::UpdateUniformBuffers(size_t stage) {
+    if (channel_state->enabled_uniform_buffer_masks[stage] == 0) [[likely]] {
+        return;
+    }
     ForEachEnabledBit(channel_state->enabled_uniform_buffer_masks[stage], [&](u32 index) {
         if (maxwell3d->GetNativeMacroEngine().native_turing && Tegra::NativeRootTables::IsBank(index))
             return;
@@ -1641,6 +1622,9 @@ void BufferCache<P>::UpdateUniformBuffers(size_t stage) {
 
 template <class P>
 void BufferCache<P>::UpdateStorageBuffers(size_t stage) {
+    if (channel_state->enabled_storage_buffers[stage] == 0) [[likely]] {
+        return;
+    }
     ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
         // Resolve buffer
         Binding& binding = channel_state->storage_buffers[stage][index];
@@ -1653,6 +1637,9 @@ void BufferCache<P>::UpdateStorageBuffers(size_t stage) {
 
 template <class P>
 void BufferCache<P>::UpdateTextureBuffers(size_t stage) {
+    if (channel_state->enabled_texture_buffers[stage] == 0) [[likely]] {
+        return;
+    }
     ForEachEnabledBit(channel_state->enabled_texture_buffers[stage], [&](u32 index) {
         Binding& binding = channel_state->texture_buffers[stage][index];
         binding.buffer_id = FindBuffer(binding.device_addr, binding.size, false);
@@ -1743,11 +1730,11 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
 
 template <class P>
 BufferId BufferCache<P>::FindBuffer(DAddr device_addr, u32 size, bool sparse_compatible) {
-    if (device_addr == 0) {
+    const auto page = CheckedBufferPage(device_addr, CACHING_PAGEBITS, page_table.size());
+    if (!page) {
         return NULL_BUFFER_ID;
     }
-    const u64 page = device_addr >> CACHING_PAGEBITS;
-    const BufferId buffer_id = page_table[page];
+    const BufferId buffer_id = page_table[*page];
     if (buffer_id) {
         Buffer& buffer = slot_buffers[buffer_id];
         if (buffer.IsInBounds(device_addr, size)) {
@@ -2167,6 +2154,14 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
     boost::container::small_vector<BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
     u64 largest_copy = 0;
+    // Bytes a pending fence already copied, with no GPU write recorded since (see
+    // pending_fence_readback.h): planned before ClearDownload below cuts those copies.
+    boost::container::small_vector<PendingFenceRead, 4> fence_reads;
+    bool from_fence_copies = false;
+    if constexpr (!IS_OPENGL && USE_MEMORY_MAPS &&
+                  requires { runtime.Wait(u64{}); runtime.CurrentTick(); }) {
+        from_fence_copies = !pending_downloads.empty();
+    }
     memory_tracker.ForEachDownloadRangeAndClear(
         device_addr, size, [&](u64 device_addr_out, u64 range_size) {
             const DAddr buffer_addr = buffer.CpuAddr();
@@ -2183,6 +2178,11 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
                 constexpr u64 mask = ~(align - 1ULL);
                 total_size_bytes += (new_size + align - 1) & mask;
                 largest_copy = (std::max)(largest_copy, new_size);
+                if (from_fence_copies) {
+                    from_fence_copies = PlanPendingFenceReads(
+                        start, new_size, pending_downloads, uncommitted_gpu_modified_ranges,
+                        committed_gpu_modified_ranges, fence_reads);
+                }
             };
 
             gpu_modified_ranges.ForEachInRange(device_addr_out, range_size, add_download);
@@ -2191,6 +2191,15 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
         });
     if (total_size_bytes == 0) {
         return;
+    }
+
+    if constexpr (!IS_OPENGL && USE_MEMORY_MAPS &&
+                  requires { runtime.Wait(u64{}); runtime.CurrentTick(); }) {
+        if (from_fence_copies &&
+            ReadPendingFenceCopies(std::span<const PendingFenceRead>{fence_reads.data(),
+                                                                     fence_reads.size()})) {
+            return;
+        }
     }
 
     if constexpr (USE_MEMORY_MAPS) {
@@ -2218,6 +2227,59 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
             const DAddr copy_device_addr = buffer.CpuAddr() + copy.src_offset;
             device_memory.WriteBlockUnsafe(copy_device_addr, immediate_buffer.data(), copy.size);
         }
+    }
+}
+
+template <class P>
+bool BufferCache<P>::ReadPendingFenceCopies(std::span<const PendingFenceRead> reads) {
+    if constexpr (!IS_OPENGL && requires { runtime.Wait(u64{}); runtime.IsFree(u64{}); }) {
+        if (reads.empty() || pending_download_origins.size() != pending_downloads.size()) {
+            return false;
+        }
+        // async_buffers also holds an empty entry for each fence that copied nothing; the others
+        // are pending_downloads' staging buffers in order. Fences are only released under this
+        // cache's mutex, so all of them stay alive here.
+        boost::container::small_vector<const Async_Buffer*, 16> staged;
+        for (const auto& async_buffer : async_buffers) {
+            if (async_buffer.has_value()) {
+                staged.push_back(&*async_buffer);
+            }
+        }
+        if (staged.size() != pending_downloads.size()) {
+            return false;
+        }
+        u64 wait_tick = 0;
+        u64 read_bytes = 0;
+        for (const PendingFenceRead& read : reads) {
+            if (read.fence >= staged.size()) {
+                return false;
+            }
+            const PendingDownloadOrigin& origin = pending_download_origins[read.fence];
+            if (origin.tick == 0 ||
+                !download_selection_epochs.IsCurrent(origin.selection_epoch)) {
+                return false;
+            }
+            wait_tick = (std::max)(wait_tick, origin.tick);
+            read_bytes += read.size;
+        }
+        // The staged copies themselves must have executed, not merely the GPU writes they read.
+        // Their tick is at most the current one, which Scheduler::Finish would wait for (after
+        // submitting it); an older tick needs no submission and no wait for later work.
+        ReadbackDiagnostics::Scope diagnostic{
+            ReadbackDiagnostics::Event::PendingFenceReadback, read_bytes};
+        if (!runtime.IsFree(wait_tick)) {
+            runtime.Wait(wait_tick);
+        }
+        for (const PendingFenceRead& read : reads) {
+            const Async_Buffer& source = *staged[read.fence];
+            device_memory.WriteBlockUnsafe(
+                read.address, source.mapped_span.data() + (read.staging_offset - source.offset),
+                read.size);
+        }
+        return true;
+    } else {
+        (void)reads;
+        return false;
     }
 }
 

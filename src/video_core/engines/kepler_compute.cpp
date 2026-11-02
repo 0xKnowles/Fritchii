@@ -24,6 +24,7 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/native_qmd_write.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/engines/split_front_ownership.h"
 #include "video_core/memory_manager.h"
 #include "video_core/native_query_trace.h"
 #ifdef ARCHITECTURE_x86_64
@@ -64,8 +65,6 @@ KeplerCompute::KeplerCompute(MemoryManager& memory_manager_)
         }
     }
 }
-
-KeplerCompute::~KeplerCompute() = default;
 
 void KeplerCompute::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_) {
     rasterizer = rasterizer_;
@@ -776,9 +775,18 @@ struct KeplerCompute::FrontState {
     MacroEngine* macro{}; ///< Without a native context: the one macro engine
 };
 
+KeplerCompute::~KeplerCompute() {
+    // Channel teardown: SplitFrontOwnership must not hand a freed engine back.
+    if (front || front_macros) {
+        SplitFrontOwnership::Unregister(this);
+    }
+}
+
 KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
     if (!front) [[unlikely]] {
-        // Copy the back's state and take the macros over while it is idle.
+        // Copy the back's state and take the macros over while it is idle. After a split
+        // restart this is a fresh copy (ReturnSplitFrontOwnership dropped the old one), with
+        // the macro selection, bind pointer and partial call the unsplit path left.
         split.Drain();
         front = std::make_unique<FrontState>();
         front->registers = native_registers;
@@ -790,8 +798,69 @@ KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
         front->bind_pointer = native_bind_pointer;
         front->macro = native_macro;
         front_macros = true;
+        SplitFrontOwnership::Register(this);
     }
     return *front;
+}
+
+void KeplerCompute::TakeSplitFrontOwnership(VideoCommon::GpuSplit& split) {
+    Front(split);
+}
+
+void KeplerCompute::ReturnSplitFrontOwnership() {
+    SplitFrontOwnership::Unregister(this);
+    if (!front) {
+        front_macros = false;
+        return;
+    }
+    // The back is gone (drained first on a settings stop): native_registers hold every write
+    // the front sent (it skips only writes of the value its mirror, and so the back, holds).
+    // What only the front tracked while it owned the macros comes back: which macro engine
+    // this engine's code and bindings go to, the bind pointer and a partial macro call.
+    if (native_executing_macro || !native_parameters.empty()) [[unlikely]] {
+        LOG_ERROR(HW_GPU, "Split handback: compute engine already holds a macro ({} parameters)",
+                  native_parameters.size());
+    }
+    native_executing_macro = front->executing_macro;
+    native_parameters = std::move(front->parameters);
+    native_compute_uploaded = front->compute_uploaded;
+    native_bind_pointer = front->bind_pointer;
+    if (native_context) {
+        // As ProcessNativeMethod selects them for each method.
+        native_macro = native_compute_uploaded ? &native_context->compute_engine
+                                               : &native_context->engine;
+        native_macro_positions = native_compute_uploaded
+                                     ? std::span<u32>{native_context->compute_positions}
+                                     : std::span<u32>{native_context->positions};
+    } else {
+        native_macro = front->macro;
+    }
+    front.reset();
+    front_macros = false;
+}
+
+KeplerCompute::SplitHandoffState KeplerCompute::GetSplitHandoffState() const {
+    SplitHandoffState state{
+        .front_owned = front_macros,
+        .executing_macro = native_executing_macro,
+        .parameters = native_parameters.size(),
+        .compute_uploaded = native_compute_uploaded,
+        .bind_pointer = native_bind_pointer,
+    };
+    if (front) {
+        state.front_executing_macro = front->executing_macro;
+        state.front_parameters = front->parameters.size();
+        state.front_compute_uploaded = front->compute_uploaded;
+        state.front_bind_pointer = front->bind_pointer;
+    }
+    return state;
+}
+
+std::optional<u32> KeplerCompute::GetSplitFrontRegister(u32 method) const {
+    if (!front || method >= front->registers.size()) {
+        return std::nullopt;
+    }
+    return front->registers[method];
 }
 
 void KeplerCompute::FrontApply(FrontState& fs, u32 method, u32 argument) {

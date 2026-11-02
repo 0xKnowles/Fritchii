@@ -253,6 +253,27 @@ public:
                               const u32* base_start, u32 amount, u32 methods_pending,
                               const GPUVAddr* segment);
 
+    /// Split ownership transfer (split_front_ownership.h), as for Maxwell3D.
+    void TakeSplitFrontOwnership(VideoCommon::GpuSplit& split);
+    void ReturnSplitFrontOwnership() override;
+
+    /// Ownership, macro selection and partial macro state on either side, for tests and
+    /// diagnostics.
+    struct SplitHandoffState {
+        bool front_owned{};
+        std::optional<u32> executing_macro; ///< Own (unsplit/back) path
+        size_t parameters{};
+        bool compute_uploaded{};
+        u32 bind_pointer{};
+        std::optional<u32> front_executing_macro;
+        size_t front_parameters{};
+        bool front_compute_uploaded{};
+        u32 front_bind_pointer{};
+    };
+    [[nodiscard]] SplitHandoffState GetSplitHandoffState() const;
+    /// The front's mirror of a native register, while the front owns the engine.
+    [[nodiscard]] std::optional<u32> GetSplitFrontRegister(u32 method) const;
+
 private:
     struct FrontState;
     FrontState& Front(VideoCommon::GpuSplit& split);

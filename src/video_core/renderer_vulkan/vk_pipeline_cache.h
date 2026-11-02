@@ -117,7 +117,8 @@ public:
                            TextureCache& texture_cache, VideoCore::ShaderNotify& shader_notify_);
     ~PipelineCache();
 
-    [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline();
+    [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline(u32 native_draw_count = 0);
+    [[nodiscard]] bool WasAsyncDrawSkipped() const noexcept { return async_draw_skipped; }
 
     [[nodiscard]] ComputePipeline* CurrentComputePipeline();
 
@@ -127,7 +128,7 @@ public:
 private:
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineSlowPath();
 
-    [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) const noexcept;
+    [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) noexcept;
 
     /// Whether the current draw may be skipped while its pipeline is being built.
     [[nodiscard]] bool CanSkipDraw() const noexcept;
@@ -226,6 +227,9 @@ private:
 
     GraphicsPipelineCacheKey graphics_key{};
     GraphicsPipeline* current_pipeline{};
+    u32 native_draw_count{};
+    bool async_draw_skipped{};
+    u64 async_native_skips{};
 
     ::Common::unordered_map<ComputePipelineCacheKey, std::unique_ptr<ComputePipeline>> compute_cache;
     ::Common::unordered_map<ComputePipelineCacheKey, std::exception_ptr> rejected_tensor_pipelines;

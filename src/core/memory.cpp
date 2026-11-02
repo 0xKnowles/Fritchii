@@ -33,6 +33,7 @@
 #include "core/hle/kernel/k_process.h"
 #include "core/memory.h"
 #include "core/memory/read_traps.h"
+#include "core/memory/rasterizer_write.h"
 #include "core/memory/readback_cache.h"
 #include "core/memory/readback_diagnostics.h"
 #include "core/memory/core_readback_shadow.h"
@@ -1011,29 +1012,12 @@ struct Memory::Impl {
             }
         };
         system.Host1x().MemoryManager().ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
-            auto& current_area = rasterizer_write_areas[core];
-            PAddr subaddress = address >> YUZU_PAGEBITS;
-            // Performance note:
-            // It may not be a good idea to assume accesses are within the same subaddress (i.e same page)
-            // It is often the case the games like to access wildly different addresses. Hence why I propose
-            // we should let the compiler just do it's thing...
-            if (current_area.last_address != subaddress) {
-                // Short circuit the need to check for address/size
-                auto const do_collection = (address != 0 && size != 0)
-                    && system.GPU().OnCPUWrite(address, size);
-                if (do_collection) {
-                    current_area.last_address = subaddress;
-                } else {
-                    return;
-                }
-            }
-            gpu_dirty_managers[core].Collect(address, size);
+            RecordRasterizerWrite(
+                address, size,
+                [&](DAddr at, size_t length) { return system.GPU().OnCPUWrite(at, length); },
+                [&](DAddr at, size_t length) { gpu_dirty_managers[core].Collect(at, length); });
         });
     }
-
-    struct GPUDirtyState {
-        PAddr last_address;
-    };
 
     void InvalidateGPUMemory(u8* p, size_t size) {
         constexpr size_t sys_core = Core::Hardware::NUM_CPU_CORES - 1;
@@ -1066,7 +1050,6 @@ struct Memory::Impl {
     static inline std::atomic<u64> next_readback_owner{1};
     const u64 readback_owner{next_readback_owner.fetch_add(1, std::memory_order_relaxed)};
     std::mutex read_trap_mutex;
-    std::array<GPUDirtyState, Core::Hardware::NUM_CPU_CORES> rasterizer_write_areas{};
     std::array<Common::ScratchBuffer<u32>, Core::Hardware::NUM_CPU_CORES> scratch_buffers{};
     std::span<Core::GPUDirtyMemoryManager> gpu_dirty_managers;
     std::mutex sys_core_guard;

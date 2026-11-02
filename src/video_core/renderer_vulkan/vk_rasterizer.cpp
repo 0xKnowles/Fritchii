@@ -276,9 +276,17 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     };
     GraphicsPipeline* const pipeline{[&] {
         Profile::Scope scope{Profile::Zone::PipelineLookup};
-        return pipeline_cache.CurrentGraphicsPipeline();
+        const auto& draw = maxwell3d->draw_manager.draw_state;
+        return pipeline_cache.CurrentGraphicsPipeline(
+            is_indexed ? draw.index_buffer.count : draw.vertex_buffer.count);
     }()};
     if (!pipeline) {
+        if (pipeline_cache.WasAsyncDrawSkipped()) {
+            // Deliberate async raster omission, not a rejected shader. Marking this as
+            // native_execution_failed would strand the submission's semaphore completion.
+            submitted = true;
+            return;
+        }
         report_failure("no pipeline");
         return;
     }
@@ -1136,13 +1144,6 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
         .preemtive = true,
     };
     {
-        // Guest CPU reads of buffer memory decide which GPU-written buffer data is copied back.
-        std::scoped_lock lock{buffer_cache.mutex};
-        buffer_cache.NoteCpuRead(Common::AlignDown(addr, Core::DEVICE_PAGESIZE),
-                                 Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE) -
-                                     Common::AlignDown(addr, Core::DEVICE_PAGESIZE));
-    }
-    {
         std::scoped_lock lock{texture_cache.mutex};
         auto area = texture_cache.GetFlushArea(addr, size);
         if (area) {
@@ -1199,12 +1200,10 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
             buffer_cache.WriteMemory(addr, size);
         }
     }
-    {
-        for (const auto& [addr, size] : sequences) {
-            query_cache.InvalidateRegion(addr, size);
-            pipeline_cache.InvalidateRegion(addr, size);
-        }
+    for (const auto& [addr, size] : sequences) {
+        query_cache.InvalidateRegion(addr, size);
     }
+    pipeline_cache.InvalidateRegions(sequences);
 }
 
 bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {

@@ -466,21 +466,12 @@ bool DmaPusher::Step() {
                              dma_state.method, dma_state.method_count, channel_state.bind_id,
                              u64{header.addr}, u64{header.size}, header.raw, u64{header.is_push_buffer},
                              u64{header.allow_flush}, split_method_end, parked_methods.size());
-                    std::array<u32, 8> next_words{};
-                    std::array<u32, 4> prev_words{};
-                    memory_manager.ReadBlockUnsafe(header.addr, next_words.data(),
-                                             std::min<size_t>(header.size, 8) * sizeof(u32));
-                    memory_manager.ReadBlockUnsafe(split_method_end - sizeof(prev_words), prev_words.data(),
-                                             sizeof(prev_words));
-                    LOG_DEBUG(HW_GPU, "  previous entry ends {:08x}; next entry starts {:08x}",
-                              fmt::join(prev_words, " "), fmt::join(next_words, " "));
+                    // Do not reread guest command memory for diagnostics before
+                    // FlushGpuWrittenCommands has synchronized its queued writers.
                 }
                 if (park_split_methods) {
                     ResolveSplitMethod(header.addr);
                 }
-            }
-            if (dma_pushbuffer_subindex < command_list.submit_hashes.size()) {
-                CheckSubmitHash(header, command_list.submit_hashes[dma_pushbuffer_subindex]);
             }
         }
         // A resumed entry is read again: the words after the acquire may be new by now.
@@ -886,24 +877,6 @@ void DmaPusher::ReportUnboundSubchannel() {
     }
 }
 
-void DmaPusher::CheckSubmitHash(const CommandListHeader& header, u64 submit_hash) {
-    std::vector<u32> words(header.size);
-    memory_manager.ReadBlockUnsafe(header.addr, words.data(), words.size() * sizeof(u32));
-    static std::atomic<u64> checked{};
-    static std::atomic<u64> changed{};
-    ++checked;
-    if (HashPushbufferWords(words) != submit_hash) {
-        if (changed.fetch_add(1) < 16) {
-            LOG_WARNING(HW_GPU, "pushbuffer entry {:#x}+{:#x} changed between submit and execution",
-                        header.addr.Value(), header.size.Value());
-        }
-    }
-    if ((checked % 20000) == 0) {
-        LOG_WARNING(HW_GPU, "pushbuffer check: {} of {} entries changed after submit",
-                    changed.load(), checked.load());
-    }
-}
-
 void DmaPusher::RecordParsedEntry(const CommandListHeader& header,
                                   std::span<const CommandHeader> commands) {
     if (!g_record_parsed_entries) {
@@ -917,39 +890,16 @@ void DmaPusher::RecordParsedEntry(const CommandListHeader& header,
 }
 
 void DmaPusher::DumpCurrentEntry(const char* reason) {
-    // Entries whose memory changed after they were parsed (the CPU rewrote them meanwhile).
+    // Use only information captured at fetch. Rereading live guest memory here
+    // can race the back; a CPU-memory read can also enqueue an ordered GPU read
+    // and deadlock this very GPU thread while reporting the original error.
     for (size_t i = 0; i < (std::min)(parsed_entry_count, parsed_entries.size()); ++i) {
         const auto& entry = parsed_entries[(parsed_entry_count - 1 - i) % parsed_entries.size()];
-        std::vector<u32> words(entry.size);
-        memory_manager.ReadBlockUnsafe(entry.address, words.data(), words.size() * sizeof(u32));
-        u64 hash = 0xcbf29ce484222325ULL;
-        for (const u32 word : words) {
-            hash = (hash ^ word) * 0x100000001b3ULL;
-        }
-        LOG_WARNING(HW_GPU, "  parsed -{}: {:#x}+{:#x} {}", i, entry.address, entry.size,
-                    hash == entry.hash ? "unchanged" : "CHANGED since parsed");
+        LOG_WARNING(HW_GPU, "  parsed -{}: {:#x}+{:#x} fetched hash={:#x}",
+                    i, entry.address, entry.size, entry.hash);
     }
-    // EDEN_NX2_PB_DUMP=<file>: also write the whole command list (u64 address, u32 size and the
-    // current words of every entry, then the current entry index) for offline replay.
-    if (static const char* const path = std::getenv("EDEN_NX2_PB_DUMP");
-        path != nullptr && !dma_pushbuffer.empty()) {
-        if (std::FILE* file = std::fopen(path, "wb")) {
-            const auto& lists = dma_pushbuffer.front().command_lists;
-            const u64 current = dma_pushbuffer_subindex;
-            const u64 count = lists.size();
-            std::fwrite(&count, sizeof(count), 1, file);
-            std::fwrite(&current, sizeof(current), 1, file);
-            for (const CommandListHeader& header : lists) {
-                const u64 address = header.addr;
-                const u32 size = static_cast<u32>(header.size);
-                std::vector<u32> words(size);
-                memory_manager.ReadBlockUnsafe(address, words.data(), words.size() * sizeof(u32));
-                std::fwrite(&address, sizeof(address), 1, file);
-                std::fwrite(&size, sizeof(size), 1, file);
-                std::fwrite(words.data(), sizeof(u32), words.size(), file);
-            }
-            std::fclose(file);
-        }
+    if (std::getenv("EDEN_NX2_PB_DUMP") != nullptr) {
+        LOG_WARNING(HW_GPU, "Live pushbuffer reread disabled; use synchronized fetch capture instead");
     }
     LOG_WARNING(HW_GPU, "pushbuffer dump ({}): method={:#x} sub={} count={} non_inc={} get={:#x}",
                 reason, dma_state.method, dma_state.subchannel, dma_state.method_count,
@@ -963,36 +913,6 @@ void DmaPusher::DumpCurrentEntry(const char* reason) {
         const CommandListHeader& header = lists[i];
         LOG_WARNING(HW_GPU, "  entry {} of {}: addr={:#x} size={:#x}", i, lists.size(),
                     header.addr.Value(), header.size.Value());
-        const auto device = memory_manager.GpuToCpuAddress(header.addr);
-        const auto* gpu_pointer = memory_manager.GetPointer(header.addr);
-        const auto* cpu_pointer = system.ApplicationMemory().GetPointerSilent(header.addr.Value());
-        LOG_WARNING(HW_GPU, "    backing: address_space={} device={:#x} gpu_physical={:#x} "
-                    "same_numeric_cpu_physical={:#x} same_backing={}",
-                    memory_manager.GetID(), device.value_or(0),
-                    gpu_pointer ? system.DeviceMemory().GetRawPhysicalAddr(gpu_pointer) : 0,
-                    cpu_pointer ? system.DeviceMemory().GetRawPhysicalAddr(cpu_pointer) : 0,
-                    gpu_pointer != nullptr && gpu_pointer == cpu_pointer);
-        if (header.size != 0) {
-            const u32 gpu_before = memory_manager.Read<u32>(header.addr);
-            const u32 cpu_value = system.ApplicationMemory().Read32(header.addr.Value());
-            const u32 gpu_after = memory_manager.Read<u32>(header.addr);
-            LOG_WARNING(HW_GPU, "    first word before/after CPU read: gpu={:08x} cpu={:08x} gpu={:08x}",
-                        gpu_before, cpu_value, gpu_after);
-        }
-        for (u64 word = 0; word < std::min<u64>(header.size, 0x80); word += 8) {
-            std::string gpu_line;
-            std::string cpu_line;
-            for (u64 j = word; j < std::min<u64>(header.size, word + 8); ++j) {
-                const GPUVAddr address = header.addr + j * sizeof(u32);
-                const u32 gpu_value = memory_manager.Read<u32>(address);
-                const u32 cpu_value = system.ApplicationMemory().Read32(address);
-                gpu_line += fmt::format(" {:08x}", gpu_value);
-                cpu_line += gpu_value == cpu_value ? std::string(" ........")
-                                                   : fmt::format(" {:08x}", cpu_value);
-            }
-            LOG_WARNING(HW_GPU, "    +{:03x}:{}", word * 4, gpu_line);
-            LOG_WARNING(HW_GPU, "    cpu :{}", cpu_line);
-        }
     }
 }
 

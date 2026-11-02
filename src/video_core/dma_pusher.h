@@ -115,8 +115,6 @@ struct CommandList final {
 
     boost::container::small_vector<CommandListHeader, 512> command_lists;
     boost::container::small_vector<CommandHeader, 512> prefetch_command_list;
-    /// EDEN_NX2_PB_CHECK: hash of each entry's words when it was submitted.
-    std::vector<u64> submit_hashes;
     u64 capture_submit_id{};
     u64 capture_enqueue_id{};
     const char* capture_origin{"untracked"};
@@ -194,10 +192,8 @@ private:
                        std::size_t word_offset = 0) const noexcept;
 
 public:
-    /// Logs the GPFIFO entry being processed (and the one before it), read through the GPU MMU
-    /// and straight from guest memory, to find pushbuffer desyncs. Debug aid for Switch 2.
+    /// Logs fetched-entry hashes and command-list metadata without reading live guest memory.
     void DumpCurrentEntry(const char* reason);
-    void CheckSubmitHash(const CommandListHeader& header, u64 submit_hash);
     void RecordParsedEntry(const CommandListHeader& header, std::span<const CommandHeader> commands);
     /// Brings command list words the GPU wrote (still only in host buffers) to guest memory.
     /// `sync_wait`: the GP entry's SYNC bit, recorded as evidence only (it changes nothing).

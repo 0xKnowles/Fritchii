@@ -35,6 +35,7 @@
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
+#include "video_core/renderer_vulkan/native_async_draw.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
@@ -660,7 +661,9 @@ PipelineCache::~PipelineCache() {
     }
 }
 
-GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
+GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline(u32 draw_count) {
+    native_draw_count = draw_count;
+    async_draw_skipped = false;
     if (!RefreshStages(graphics_key.unique_hashes)) {
         current_pipeline = nullptr;
         return nullptr;
@@ -965,11 +968,41 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
     return BuiltPipeline(current_pipeline);
 }
 
-GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const noexcept {
+GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) noexcept {
     if (pipeline->IsBuilt()) {
         return pipeline;
     }
-    if (maxwell3d->GetNativeMacroEngine().native_turing || !use_asynchronous_shaders) {
+    if (!use_asynchronous_shaders) {
+        return pipeline;
+    }
+    if (maxwell3d->GetNativeMacroEngine().native_turing) {
+        // Diagnostic opt-in: dropping even color-only draws can leave persistent offscreen
+        // targets incomplete. Keep normal rendering exact until same-scene testing validates it.
+        static const bool native_async_experiment = [] {
+            const char* value = std::getenv("EDEN_NX2_EXPERIMENTAL_ASYNC_DRAWS");
+            return value && std::strcmp(value, "1") == 0;
+        }();
+        const auto& regs = maxwell3d->regs;
+        async_draw_skipped = CanSkipNativePipelineBuild({
+            .async_enabled = use_asynchronous_shaders && native_async_experiment,
+            .color_output = pipeline->HasColorOutput(),
+            .depth_enabled = regs.zeta_enable != 0,
+            .memory_side_effects = pipeline->HasAsyncSideEffects(),
+            .transform_feedback = regs.transform_feedback_enabled != 0,
+            .query_enabled = regs.zpass_pixel_count_enable != 0 ||
+                             std::bit_cast<u32>(regs.statistics_count) != 0,
+            .vertex_count = native_draw_count,
+        });
+        if (async_draw_skipped) {
+            ++async_native_skips;
+            if (std::has_single_bit(async_native_skips)) {
+                LOG_INFO(Render_Vulkan,
+                         "Native async shader: {} raster draws omitted while driver pipelines build; "
+                         "memory writers, queries and small passes remain synchronous",
+                         async_native_skips);
+            }
+            return nullptr;
+        }
         return pipeline;
     }
     return CanSkipDraw() ? nullptr : pipeline;

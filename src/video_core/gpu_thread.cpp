@@ -105,6 +105,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 // Suspended channels wait on semaphores the CPU releases: poll them meanwhile.
                 {
                     Profile::Scope scope{Profile::Zone::ResumePending};
+                    ReadbackDiagnostics::Scope timing{ReadbackDiagnostics::Event::FrontPendingPoll};
                     if (scheduler.ResumePending(system.GPU())) {
                         // A later channel may have released an earlier one in this pass.
                         // Keep polling briefly after real dispatch work instead of imposing
@@ -119,19 +120,36 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     Profile::Scope scope{Profile::Zone::PendingSleep};
                     if (std::chrono::steady_clock::now() - last_progress <
                         std::chrono::microseconds{500}) {
+                        ReadbackDiagnostics::Scope timing{
+                            ReadbackDiagnostics::Event::FrontPendingYield};
                         std::this_thread::yield();
-                    } else {
-                        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+                        continue;
                     }
-                    continue;
+                    // New submissions (including ordered CPU reads) can unblock
+                    // the suspended channel. Wake on their queue notification
+                    // instead of delaying them until a blind 1 ms sleep ends.
+                    // Keep the timeout: a CPU semaphore store need not enqueue
+                    // a command, so it still requires periodic polling.
+                    ReadbackDiagnostics::Scope timing{
+                        ReadbackDiagnostics::Event::FrontPendingWait};
+                    if (!state.queue.PopWaitFor(next, std::chrono::milliseconds{1}, stop_token)) {
+                        continue;
+                    }
                 }
             } else {
                 Profile::Scope scope{Profile::Zone::Idle};
-                state.queue.PopWait(next, stop_token);
+                // Only classify genuinely empty-queue waits as idle. A queued
+                // command can be popped without taking the consumer wait mutex.
+                if (!state.queue.TryPop(next)) {
+                    ReadbackDiagnostics::Scope timing{
+                        ReadbackDiagnostics::Event::FrontQueueWait};
+                    state.queue.PopWait(next, stop_token);
+                }
             }
             if (std::holds_alternative<std::monostate>(next.data)) {
                 continue;
             }
+            ReadbackDiagnostics::Scope dispatch_timing{ReadbackDiagnostics::Event::FrontDispatch};
             if (const auto* read = std::get_if<CpuReadCommand>(&next.data);
                 read && read->diagnostic) {
                 read->diagnostic->front_popped = ReadbackDependencyDiagnostics::Now();

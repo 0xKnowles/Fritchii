@@ -5,6 +5,16 @@
 
 #include "core/hle/service/nx2_present.h"
 
+TEST_CASE("Nx2 presentation respects title swap intervals and speed limit", "[nx2_video][present_timing]") {
+    CHECK(Service::Nx2PresentInterval(0x1003c, 100).count() == 16'666'666);
+    CHECK(Service::Nx2PresentInterval(0x2003c, 100).count() == 33'333'333);
+    CHECK(Service::Nx2PresentInterval(0x10078, 100).count() == 8'333'333);
+    CHECK(Service::Nx2PresentInterval(0x2003c, 200).count() == 16'666'666);
+    CHECK(Service::Nx2PresentInterval(0, 100).count() == 16'666'666);
+    CHECK(Service::Nx2PresentInterval(0xffffffff, 100).count() == 66'666'666);
+    CHECK(Service::Nx2PresentInterval(0x2003c, 0).count() == 0);
+}
+
 TEST_CASE("Nx2 presentation crops preserve the native allocation extent", "[nx2_video]") {
     const auto crop = Service::Nx2PresentCrop(0, 1279 | (719 << 16), 2, 3840, 2160);
     CHECK(crop.left == 0);

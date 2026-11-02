@@ -43,6 +43,11 @@ public:
         }
     }
 
+    /// GPU thread split (split_front_ownership.h): takes back the macro code and bindings,
+    /// partial macro call and register mirror the split's front ran this engine's macros with.
+    /// Called with nothing else executing this engine's methods (the split's back joined).
+    virtual void ReturnSplitFrontOwnership() {}
+
     std::bitset<(std::numeric_limits<u16>::max)()> execution_mask{};
     std::vector<std::pair<u32, u32>> method_sink{};
     GPUVAddr current_dma_segment;

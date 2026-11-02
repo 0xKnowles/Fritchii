@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <iostream>
 #include <span>
@@ -14,6 +15,7 @@
 #include <fmt/format.h>
 
 #include "video_core/renderer_vulkan/pipeline_helper.h"
+#include "video_core/renderer_vulkan/native_async_draw.h"
 
 #include "common/bit_field.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
@@ -273,6 +275,7 @@ GraphicsPipeline::GraphicsPipeline(
             continue;
         }
         stage_infos[stage] = *info;
+        async_side_effects |= HasAsyncDrawSideEffects(*info);
         enabled_uniform_buffer_masks[stage] = info->constant_buffer_mask;
         std::ranges::copy(info->constant_buffer_used_sizes, uniform_buffer_sizes[stage].begin());
         num_image_elements += Shader::NumDescriptors(info->texture_buffer_descriptors);
@@ -354,9 +357,9 @@ void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
 
 template <typename Spec>
 bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
-    boost::container::small_vector<VideoCommon::ImageViewInOut, 64> views;
+    boost::container::small_vector<VideoCommon::ImageViewInOut, 160> views;
     boost::container::small_vector<size_t, 64> excluded_views;
-    boost::container::small_vector<VideoCommon::SamplerId, 64> samplers;
+    boost::container::small_vector<VideoCommon::SamplerId, 96> samplers;
     views.reserve(num_image_elements);
     samplers.reserve(num_textures);
 
@@ -546,6 +549,10 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     // Only records proven unreachable for every use of this descriptor are excluded.
     for (const size_t index : excluded_views) views[index].id = VideoCommon::NULL_IMAGE_VIEW_ID;
     const auto bind_stage_info{[&](size_t stage) LAMBDA_FORCEINLINE {
+        buffer_cache.UnbindGraphicsTextureBuffers(stage);
+        if constexpr (!Spec::has_texture_buffers && !Spec::has_image_buffers) {
+            return;
+        }
         size_t index{};
         const auto add_buffer{[&](const auto& desc) {
             constexpr bool is_image = std::is_same_v<decltype(desc), const ImageBufferDescriptor&>;
@@ -568,8 +575,6 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 ++texture_buffer_it;
             }
         }};
-        buffer_cache.UnbindGraphicsTextureBuffers(stage);
-
         const Shader::Info& info{stage_infos[stage]};
         if constexpr (Spec::has_texture_buffers) {
             for (const auto& desc : info.texture_buffer_descriptors) {
@@ -714,8 +719,16 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     if (!is_built.load(std::memory_order::relaxed)) {
         // Wait for the pipeline to be built
         scheduler.Record([this](vk::CommandBuffer) {
+            const auto wait_begin = std::chrono::steady_clock::now();
             std::unique_lock lock{build_mutex};
             build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
+            const auto wait_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - wait_begin).count();
+            static u32 reported_waits{}; // scheduler thread only
+            if (wait_ms >= 1.0 && reported_waits < 32) {
+                ++reported_waits;
+                LOG_INFO(Render_Vulkan, "Graphics driver pipeline wait: {:.2f} ms", wait_ms);
+            }
         });
     }
     const bool is_rescaling{texture_cache.IsRescaling()};

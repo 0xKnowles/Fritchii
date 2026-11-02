@@ -15,6 +15,7 @@
 #include "video_core/command_fetch_sync_audit.h"
 #include "video_core/command_write_frontier.h"
 #include "video_core/split_completion.h"
+#include "video_core/split_publication.h"
 #include "video_core/engines/engine_interface.h"
 
 namespace Core {
@@ -128,6 +129,10 @@ public:
     void NoteCommandFetch(u64 bytes, bool historical_hit, bool flushed);
     /// Front-thread evidence counters for the GP-entry SYNC_WAIT contract (reporting only).
     CommandFetchSyncAudit& FetchSyncAudit();
+    /// Writer hints made across split sessions (front thread only, reporting).
+    [[nodiscard]] u64 PublicationHints() const {
+        return publication_hints;
+    }
 
 private:
     enum class Kind : u64 {
@@ -144,7 +149,7 @@ private:
     static constexpr size_t RingWords = size_t{1} << 20; // 8 MiB
     static constexpr size_t RingMask = RingWords - 1;
     static constexpr u32 MaxMultiWords = 8192;
-    static constexpr size_t PublishEvery = 256;
+    static constexpr size_t PublishEvery = SplitPublication::MaximumInterval;
 
     template <typename Func>
     static void CallThunk(const u64* payload) {
@@ -164,8 +169,29 @@ private:
     void Commit(size_t words, bool may_write = true) {
         write_position += words;
         command_writes.Commit(write_position, may_write);
-        if (write_position - published_local >= publish_every) {
+        // A possible command-memory writer is what the next command fetch waits for: let a
+        // spinning back start it now (split_publication.h). Order and contents are unchanged.
+        switch (SplitPublication::AfterCommit(write_position, published_local, publish_every,
+                                              may_write)) {
+        case SplitPublication::Action::Full:
             Publish();
+            break;
+        case SplitPublication::Action::Hint:
+            HintPublished();
+            break;
+        case SplitPublication::Action::None:
+            break;
+        }
+    }
+    /// Release-only publication of a committed writer; see split_publication.h for why a missed
+    /// hint cannot lose work. Never updates published_local: the next full Publish still runs
+    /// the wake handshake for this position.
+    void HintPublished() {
+        hinted_local = write_position;
+        ++publication_hints;
+        published.store(write_position, std::memory_order_release);
+        if (back_waiting.load(std::memory_order_relaxed)) [[unlikely]] {
+            Publish(); // Asleep (or about to be): a hint cannot wake it.
         }
     }
     void WaitForSpace(size_t words);
@@ -187,7 +213,9 @@ private:
 
     // Front side.
     u64 write_position{};
-    u64 published_local{};
+    u64 published_local{}; ///< Last full (seq_cst, wake-checked) publication
+    u64 hinted_local{};    ///< Last release-only writer hint
+    u64 publication_hints{};
     u64 consumed_cache{};
     CommandWriteFrontier command_writes;
     /// Words between publishes: small right after a drain, while the back has nothing to do.

@@ -50,8 +50,10 @@
 #include "core/hle/kernel/k_resource_limit.h"
 #include "core/hle/kernel/k_server_session.h"
 #include "core/hle/kernel/k_event.h"
+#include "core/hle/kernel/k_hardware_timer.h"
 #include "core/hle/kernel/k_readable_event.h"
 #include "core/hle/kernel/k_session.h"
+#include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/k_transfer_memory.h"
 #include "core/memory.h"
 #include "video_core/host1x/host1x.h"
@@ -1297,7 +1299,7 @@ private:
         const auto waited = std::chrono::steady_clock::now();
         Composite(w[5], ~w[22], w[24], w[6], w[7], w[8]);
         const auto composited = std::chrono::steady_clock::now();
-        PaceToVblank();
+        PaceToVblank(w[12]);
         const auto paced = std::chrono::steady_clock::now();
         // Where each frame's time goes on the present thread, averaged per 600 presents: the
         // game is blocked here while Eden's GPU thread catches up (fence) and composites.
@@ -1349,22 +1351,26 @@ private:
     u32 m_previous_fence_id{~0U}; // none yet (WaitForFrame ignores ids >= 192)
     u32 m_previous_fence_value{};
 
-    // The console flips one frame per 60 Hz vblank and keeps the rest queued, so a game can't
-    // present faster than that. Every slot is reported free here: hold each present until the
-    // next vblank instead (title 4 ran at up to 160 fps, its timing and audio with it).
+    // Pace by the title's swap interval; two 60 Hz vblanks mean a 30 FPS frame,
+    // not a forced 60 FPS frame that can run game logic and audio at double speed.
     std::chrono::steady_clock::time_point m_next_vblank{};
 
-    void PaceToVblank() {
+    void PaceToVblank(u32 timing) {
         if (!Settings::values.use_speed_limit.GetValue() || Settings::SpeedLimit() == 0) {
             return;
         }
-        const auto interval = std::chrono::nanoseconds{100'000'000'000LL / 60 / Settings::SpeedLimit()};
+        const auto interval = Nx2PresentInterval(timing, Settings::SpeedLimit());
         const auto now = std::chrono::steady_clock::now();
         if (now > m_next_vblank + interval) {
-            // Running slower than 60 fps: show at once and don't bank the lost time.
+            // Running slower than the requested interval: show immediately.
             m_next_vblank = now;
         } else if (now < m_next_vblank) {
-            std::this_thread::sleep_until(m_next_vblank);
+            // Upstream e7973da: yield this guest service thread, not its host
+            // core, so other guest threads (notably loaders) can run meanwhile.
+            const auto wait = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                m_next_vblank - now);
+            static_cast<void>(Kernel::GetCurrentThread(kernel).Sleep(
+                kernel, kernel.HardwareTimer().GetTick() + wait.count() + 2));
         }
         m_next_vblank += interval;
     }

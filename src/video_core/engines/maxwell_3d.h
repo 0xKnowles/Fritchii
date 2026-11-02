@@ -3184,6 +3184,26 @@ public:
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                               const u32* base_start, u32 amount, u32 methods_pending);
 
+    /// Split ownership transfer (split_front_ownership.h). The front takes the engine over on
+    /// its first FrontCallMethod after the split starts (drained, with a fresh register mirror);
+    /// GpuSplit::Stop hands it back through SplitFrontOwnership::ReturnAll.
+    void TakeSplitFrontOwnership(Core::System& system, VideoCommon::GpuSplit& split);
+    void ReturnSplitFrontOwnership() override;
+
+    /// Ownership and partial macro state on either side, for tests and diagnostics.
+    struct SplitHandoffState {
+        bool front_owned{};
+        u32 executing_macro{};      ///< Own (unsplit/back) path
+        size_t parameters{};        ///< Own path: parameters collected so far
+        size_t segment_words{};     ///< Own path: words covered by macro_segments
+        u32 front_executing_macro{};
+        size_t front_parameters{};
+    };
+    [[nodiscard]] SplitHandoffState GetSplitHandoffState() const;
+    /// The front's mirror of a register, while the front owns the engine.
+    [[nodiscard]] std::optional<u32> GetSplitFrontRegister(u32 method) const;
+    [[nodiscard]] std::optional<u32> GetSplitFrontShadow(u32 method) const;
+
     bool ShouldExecute() const {
         return execute_on;
     }
@@ -3211,7 +3231,8 @@ public:
         size_t base = 0;
         for (const auto& [addr, count] : macro_segments) {
             if (index < base + count) {
-                return addr + (index - base) * sizeof(u32);
+                // Address 0: parameters without a known source (collected by the split's front).
+                return addr != 0 ? addr + (index - base) * sizeof(u32) : 0;
             }
             base += count;
         }

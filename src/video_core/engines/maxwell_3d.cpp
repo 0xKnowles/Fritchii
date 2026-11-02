@@ -17,7 +17,7 @@
 #include "core/core_timing.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
-#include "video_core/engines/maxwell_3d.h"
+#include "video_core/engines/split_front_ownership.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
@@ -49,8 +49,6 @@ Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
     for (size_t i = 0; i < execution_mask.size(); i++)
         execution_mask[i] = IsMethodExecutable(u32(i));
 }
-
-Maxwell3D::~Maxwell3D() = default;
 
 void Maxwell3D::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_) {
     rasterizer = rasterizer_;
@@ -891,24 +889,108 @@ bool FrontSkipSame() {
 
 } // Anonymous namespace
 
+Maxwell3D::~Maxwell3D() {
+    // Channel teardown: SplitFrontOwnership must not hand a freed engine back.
+    if (front || front_macros) {
+        SplitFrontOwnership::Unregister(this);
+    }
+}
+
 Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSplit& split) {
     if (!front) [[unlikely]] {
-        // Copy the back's state and take the macros over while it is idle (state writes it
-        // still holds in its method sink first).
-        split.Drain();
-        ConsumeSink(system);
+        // Copy the back's state and take the macros over while it is idle. After a split
+        // restart this is a fresh copy: ReturnSplitFrontOwnership dropped the previous mirror,
+        // so writes made while the split was stopped are in it (and same-value skips compare
+        // against them). Consuming held state writes can issue a deferred draw, whose
+        // effects must precede a macro DMA read, not merely appear done in a mirror.
+        // Execute that work on its owning back thread before taking the snapshot.
+        if (split.Active()) {
+            split.Defer([this, system_ptr = &system] { ConsumeSink(*system_ptr); });
+            split.Drain();
+        } else {
+            ConsumeSink(system);
+        }
         front = std::make_unique<FrontState>();
         std::memcpy(front->regs.data(), regs.reg_array.data(), sizeof(front->regs));
         std::memcpy(front->shadow.data(), shadow_state.reg_array.data(), sizeof(front->shadow));
         front->control = shadow_state.shadow_ram_control;
         front->skip_same = SkipSameValueWrites() && FrontSkipSame();
+        // A macro whose first parameters arrived unsplit continues on the front. Its parameter
+        // sources (macro_segments) are only re-read in accurate GPU mode, which the split
+        // never runs in.
         front->executing_macro = executing_macro;
         front->parameters = std::move(macro_params);
         macro_params.clear();
+        macro_segments.clear();
+        current_macro_dirty = false;
         executing_macro = 0;
         front_macros = true;
+        SplitFrontOwnership::Register(this);
     }
     return *front;
+}
+
+void Maxwell3D::TakeSplitFrontOwnership(Core::System& system, VideoCommon::GpuSplit& split) {
+    Front(system, split);
+}
+
+void Maxwell3D::ReturnSplitFrontOwnership() {
+    SplitFrontOwnership::Unregister(this);
+    if (!front) {
+        front_macros = false;
+        return;
+    }
+    // The split's back thread is gone (and was drained when the split stopped for a settings
+    // change): regs and shadow_state are what every sent write made of them, so the mirror is
+    // dropped rather than copied back. The macro code and bindings live in the (shared) macro
+    // engine the front loaded them into; from now on this engine's own path loads and binds.
+    if (executing_macro != 0 || !macro_params.empty()) [[unlikely]] {
+        // Cannot happen: the front took the partial call and the back only receives complete
+        // macro writes. Keep the front's call, which is the one the method stream continues.
+        LOG_ERROR(HW_GPU, "Split handback: engine already holds macro {:#x} ({} parameters)",
+                  executing_macro, macro_params.size());
+    }
+    // A macro call split across GP entries continues with its next parameters unsplit.
+    executing_macro = front->executing_macro;
+    macro_params = std::move(front->parameters);
+    macro_segments.clear();
+    if (!macro_params.empty()) {
+        // Keep RefreshParametersImpl's indices aligned: these words have no known source.
+        macro_segments.emplace_back(GPUVAddr{0}, macro_params.size());
+    }
+    current_macro_dirty = false;
+    front.reset();
+    front_macros = false;
+}
+
+Maxwell3D::SplitHandoffState Maxwell3D::GetSplitHandoffState() const {
+    SplitHandoffState state{
+        .front_owned = front_macros,
+        .executing_macro = executing_macro,
+        .parameters = macro_params.size(),
+    };
+    for (const auto& segment : macro_segments) {
+        state.segment_words += segment.second;
+    }
+    if (front) {
+        state.front_executing_macro = front->executing_macro;
+        state.front_parameters = front->parameters.size();
+    }
+    return state;
+}
+
+std::optional<u32> Maxwell3D::GetSplitFrontRegister(u32 method) const {
+    if (!front || method >= front->regs.size()) {
+        return std::nullopt;
+    }
+    return front->regs[method];
+}
+
+std::optional<u32> Maxwell3D::GetSplitFrontShadow(u32 method) const {
+    if (!front || method >= front->shadow.size()) {
+        return std::nullopt;
+    }
+    return front->shadow[method];
 }
 
 void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,

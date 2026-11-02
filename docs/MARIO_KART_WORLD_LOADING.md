@@ -332,3 +332,258 @@ Executable: `build-fe-shaders/emulator-nx2-4285e58d/bin-mkw-sync-readback/eglant
 SHA256: `1E97D3B9E437AD42C40AA7A832CA449CBC4B6B30D95901869B89AF72CF645F61`.
 The executable's gameplay/FPS benefit is not yet measured; previous candidates
 are retained for a same-scene comparison.
+
+## Three-way audit follow-up: collector feedback and fence correctness
+
+The user reported no sustained FPS improvement and new periodic stutter with
+`bin-mkw-sync-readback`. The stopped run is preserved in
+`build-fe-shaders/mkw-sync-readback-stutter-baseline.log`. Three Opus 5.5 High
+audits inspected synchronization, readback and texture residency independently.
+No game was launched for the audits or combined build.
+
+At 161 seconds, the log records 9026 MiB heap usage against an 8862 MiB budget,
+heavy collector churn, 1954 MiB of texture uploads in the reporting window and a
+1.19-second worst frame. This correlates with the stutter but does not isolate
+every stall or establish a same-scene performance comparison.
+
+The earlier adjustment subtracting VMA free block space from both usage and
+budget is inappropriate as a feedback controller: freeing an image into a still
+allocated block reduces both the measured usage and the next eviction target.
+The collector can chase its own holes indefinitely. The combined candidate uses
+the driver budget for the target, with a bounded margin, and allocation-adjusted
+usage for progress. A fragmented-heap model checks convergence. This intentionally
+reverses that part of the earlier accounting patch. Driver residency pressure can
+still exceed budget when blocks are fragmented; block-aware compaction remains
+unimplemented, so this is not a guarantee against driver paging.
+
+Downloaded collector victims are batched (up to 64 MiB on native-tiling titles,
+oversized images singly). All copies complete before CPU writeback and eviction;
+no required download is discarded. Legacy paths retain one wait per image.
+
+The buffer audit removed duplicate CPU-read tracking (the same pages are already
+marked Preflushable) and its redundant Vulkan lock. Pending copies are now cut
+per fence when newer CPU/inline data invalidates their bytes. Merely deleting a
+shared range count allowed an old fence to consume a newer fence's count and
+write stale data. Tests cover partial splits, multiple fences and random byte
+models. Move assignment now returns its reference and moved-from range sets are
+explicitly emptied. Retired staging is made reusable at the next commit instead
+of waiting for a frame boundary. CPU read-history expiry remains unsafe without
+invalidating the per-core cached read areas; it is not enabled.
+
+Semaphore polling now waits for queued memory writers rather than an inert
+register-only tail. Command-fetch first-write protection is retained. Backend
+idle time, command SYNC flags and newly observed GPU-written-page counts are
+reported to distinguish serialization from backend saturation. Main integration
+removed proposed speculative command-content and guest-writeback comparisons:
+those added reads can race with writers and add copying overhead. No missing
+content samples should be interpreted as evidence that skipping waits is safe.
+
+HEAD changed externally to d7ce3d8c08 during the audits, capturing intermediate
+edits. The combined build uses the final working tree, including the later
+per-fence invalidation fix, not that commit alone. No commit or push was made by
+this integration. Remaining known concerns include native storage windows marked
+written at coarse granularity, frequent synchronous CPU readbacks, and subsequent
+CPU writes within a per-core cached page that bypass the first-write hook.
+
+Integration caught one more issue in the new random readback model: when a
+completed interval overlapped any newly queued write, the entire interval stayed
+GPU-dirty. Bytes outside the later selection could stay dirty indefinitely.
+Writeback now subtracts only the completed bytes not covered by queued writes,
+preserving the exact rewritten portions. The first combined suite failed this
+check (444/445 passed); its failure is retained in `mkw-audit-combined-build.log`.
+The corrected candidate is verified separately in `mkw-audit-combined-retest.log`.
+
+Final validation: 445 cases / 18,872,676 assertions passed. Focused readback,
+collector, sync, completion, buffer-readback, memory-budget and batching tests
+passed three repeated runs: 36 cases / 1,134,690 assertions each. No gameplay
+benchmark was run. Candidate:
+`build-fe-shaders/emulator-nx2-4285e58d/bin-mkw-audit-combined/eglantine.exe`.
+SHA256: `B4FA75346C1E3F0A286E395FA5D864A020CCF48498543A6F3BC367FC3BD3DBC4`.
+
+### Suspended-channel command wakeup (2026-11-02)
+
+The pending-channel loop previously used an unconditional 1 ms sleep after
+its initial 500 us yield period. A newly queued submission or ordered CPU read
+could not interrupt that sleep, even though the queue already notifies its
+consumer. The loop now uses a stoppable, timed queue pop with the same 1 ms
+timeout. Commands wake it early; CPU semaphore stores that enqueue no command
+still receive periodic polling. FIFO order, semaphore checks, command-fetch
+writer drains and buffer-download synchronization are unchanged. No toggle
+or user setting is required.
+
+The queue uses its existing condition-variable mutex and acquire/release
+predicate, including a recheck for publication between TryPop and the timed
+wait. Cancellation does not consume a queued item. Six new tests cover
+prequeued FIFO work, timeout, producer wakeup, cancellation, capacity release
+and move-only values. They passed 30 repeated runs (36 assertions each).
+The full Release build passed 451 cases / 18,917,005 assertions, recorded in
+`build-fe-shaders/mkw-queue-wakeup-build-retry.log`. An earlier wrapper attempt
+stopped before compilation because vswhere was missing from PATH; the retry
+added the installed Visual Studio Installer directory to that process's PATH.
+
+Candidate: `build-fe-shaders/emulator-nx2-4285e58d/bin-mkw-queue-wakeup/eglantine.exe`.
+SHA256: `E403E31E17DCBD5B0582E0150C5664DF27C6FFD9C545BA1D5A55B8AD26B8FB16`.
+The prior executable remains intact. Gameplay/FPS effect is unmeasured. This
+removes an avoidable scheduling delay, not a proven explanation of all the
+low FPS; a same-scene run is still needed. No game was launched for validation.
+
+### Split publication, ownership and readback integration (2026-11-02)
+
+Possible command-memory writers now publish a release-only ring-position hint
+when committed below the normal publication threshold. A running back thread
+can begin them before the next command fetch drains them. Hints do not advance
+the full-publication watermark or replace its wake handshake; an observed
+sleeping back gets a full publication immediately. Fetches still drain before
+checking GPU-written history, including first writes and non-SYNC entries.
+The new publication counters report writer hints, waiting drains, unpublished
+target words and sleeping-back observations. Reduced wait time/FPS is unmeasured.
+
+Split shutdown now returns macro ownership to every registered live engine after
+joining the back thread. Partial calls and compute macro selection return to the
+unsplit path; restart creates fresh register mirrors. Maxwell takeover consumes
+held writes on the owning back thread before copying registers, because those
+writes can trigger a deferred draw. This addresses a source-level lifecycle bug,
+not a proven explanation for steady low FPS before switching modes.
+
+Critical readback and front-thread timings are now collected on every call,
+with peak durations and long-wait counts. Front queue waits, pending-channel
+polls/yields/timed waits and dispatch are separate events. Durations are inclusive:
+dispatch and poll can include Finish, and buffer Finish includes device Finish;
+do not sum nested totals. Other hot cache operations remain sampled. This uses
+thread-local counters and adds no speculative guest-memory reads.
+
+The integrated split source, Maxwell takeover, GPU thread and new test sources
+pass Clang syntax checks. The publication tests also compiled and ran against
+the project's real Catch2 libraries: five runs, each 3 cases / 54 assertions,
+including an exhaustive 390,625-sequence model and a threaded ring model. These
+models do not instantiate the real GpuSplit or verify gameplay. The subsequent
+combined project build and engine-handoff tests passed as recorded below.
+
+The readback integration now reuses pending Vulkan fence staging only when every
+requested dirty byte is covered by its newest copy, no queued GPU-write selection
+overlaps it, and the copy's download-selection epoch is current. It waits for the
+copy submission's timeline tick, not an earlier writer tick. Partial coverage,
+unknown ticks, rule changes and other uncertainty retain the existing fresh-copy
+plus Finish path. OpenGL and immediate-download behavior are unchanged.
+`pending_fence_readback` reports exact hit counts, bytes and inclusive wait/copy
+time; no benefit is assumed until MKW actually hits this path.
+
+Parent review also fixed the older rule-change retirement defect exposed by the
+random model. An old-rule fence still releases its snapshot in order, but cannot
+clear GPU-dirty bytes: a later write may have been omitted by the new selection
+rule. Its pending-copy count is retired normally. A later current-rule copy or
+fresh synchronous download can clear the dirty state. The random model now
+requires final guest/GPU equality for all 300 seeds, including those with rule
+changes, rather than excluding those seeds. A directed regression covers old-
+and current-rule release behavior.
+
+Combined Clang Release validation: **471 cases / 18,956,769 assertions passed**
+(`build-fe-shaders/mkw-sync-integrated-build.log`, BUILD READY). Five focused
+runs each passed **57 cases / 1,300,234 assertions**, covering handoff, publication,
+pending readbacks, timing, queue waits, command frontiers, NX2 sync, buffer
+readbacks and fence merging (`mkw-sync-integrated-focused-tests.log`). Both
+Vulkan and OpenGL buffer-cache production instantiations compiled.
+
+Candidate:
+`build-fe-shaders/emulator-nx2-4285e58d/bin-mkw-sync-integrated/eglantine.exe`
+(61,904,384 bytes).
+SHA256: `496F5CD9F25E81FAB540228FC4B099E3192D2CA659352B2B7A675BE43FE5188A`.
+The previous queue-wakeup executable remains unchanged (its recorded hash was
+rechecked). No game was launched, no settings changed, and no gameplay/FPS gain
+is claimed. Test the same steady race with this exact binary, without changing
+accuracy mid-measurement; the new exact wait and reuse counters distinguish
+remaining queue/semaphore stalls from synchronous copy waits.
+
+### Selected correctness fixes 1–4 (2026-11-02)
+
+The user selected these four fixes; additional upstream findings are not included.
+
+1. `Memory::HandleRasterizerWrite` no longer caches permission to collect all
+   later writes to the same page. Each nonempty device-address write invokes
+   `OnCPUWrite` before collection, cutting that write's bytes from pending fence
+   snapshots. The model reproduces the old bypass overwriting a second write on
+   the same page, and checks the production helper preserves it. This adds cache
+   protection checks/locking, not a full GPU wait; runtime cost is unmeasured.
+   It does not establish race freedom for every guest/host memory interaction.
+2. Pushbuffer diagnostics no longer reread live command or CPU memory before
+   synchronization or while reporting an error. They retain fetched hashes and
+   entry metadata. The submit-time check incorrectly used GPU virtual addresses
+   as CPU addresses and was removed. The old `EDEN_NX2_PB_DUMP` live-reread format
+   is disabled with a warning; existing synchronized fetch capture is the safe
+   replacement. Source guard confirmed no `ReadBlockUnsafe`, `ApplicationMemory`
+   or `Read<u32>` diagnostic calls remain in dma_pusher.cpp. Normal fetch ordering
+   and GPU-written command readbacks are unchanged.
+3. SPSC queue slots now contain a live object only while occupied. Pop destroys
+   the moved-from object before publishing the free slot; queue teardown destroys
+   remaining entries. No extra per-slot flag is needed. Tests use non-default-
+   constructible objects whose moves retain source resources, repeated wraps,
+   queue teardown and a threaded 10,000-item FIFO sequence.
+4. Uniform-buffer hit/shot history shifts use backward copying for rightward
+   overlap. Tests cover distinct values, successive shifts, expiry and length one.
+
+Clang Release: **476 cases / 18,987,920 assertions passed**, BUILD READY in
+`build-fe-shaders/mkw-correctness-four-build.log`. Ten focused runs each passed
+**34 cases / 1,202,740 assertions** in `mkw-correctness-four-focused-tests.log`.
+Candidate: `build-fe-shaders/emulator-nx2-4285e58d/bin-mkw-correctness-four/eglantine.exe`
+(61,897,728 bytes).
+SHA256: `1072517A23A4ED7868A49898E82012D96F89A067897D4E7A1459C494F81AD79E`.
+The preceding sync-integrated executable hash is unchanged. No game/settings
+changes or gameplay benchmarks were performed. Tests do not certify that every
+remaining defect is medium severity or lower.
+
+### Authorized upstream guards and pacing (2026-11-02)
+
+After fixes 1–4, the user authorized direct upstream fixes. Integrated the
+FindBuffer starting-page bounds guard (a407703), failed uniform-translation null
+binding and empty-stage fast paths (46b2577), title swap interval decoding
+(f8d3860), and guest-kernel present sleep (e7973da). No forced-swap toggle was
+introduced. Existing root-table, multi-range, command-memory readback and first-
+writer protection behavior remains. Details and excluded candidates are in
+`MKW_UPSTREAM_AUDIT_2026-11-02.md`.
+
+Final combined Clang Release build: **479 cases / 19,045,652 assertions passed**,
+BUILD READY in `build-fe-shaders/mkw-upstream-guards-build.log`. Five focused
+runs each passed **37 cases / 1,202,767 assertions**, including both new address
+guards, native present timing and the selected fixes, in
+`mkw-upstream-guards-focused-tests.log`. The kernel-sleep integration compiles;
+unit tests cover timing arithmetic, not live guest scheduling or rendering.
+
+Latest candidate:
+`build-fe-shaders/emulator-nx2-4285e58d/bin-mkw-upstream-guards/eglantine.exe`
+(61,900,288 bytes).
+SHA256: `9F385FE6FB5A612BD243C1D8E63F4F21292B77F582EDE4706F3A6EA0ED7A6D95`.
+Prior builds remain intact; sync-integrated hash rechecked unchanged. No game
+was launched or settings changed. FPS improvement and gameplay correctness
+remain unverified. Upstream removal of command readbacks was deliberately not
+ported because its original fix addressed missing MKW course geometry.
+
+### Exact upstream experimental build and PR cache fixes (2026-11-02)
+
+Validated the user's official build as c0cb3325e2 **nx2-experimental**, not the
+nx2 revision in the previous comparison. Integrated descriptor geometric growth
+and flat binding lookup (#277/#256), lazy descriptor invalidation from that exact
+experimental source, gathered-buffer owner retirement (#276), batched shader
+invalidation (#237, without bypassing invalidations), and empty storage/texture
+binding fast guards from #257. Existing correctness changes remain. See
+`MKW_UPSTREAM_AUDIT_2026-11-02.md` for immutable PR heads and excluded patches.
+
+Clang Release build exited 0: **483 cases / 19,048,485 assertions passed**.
+Five focused runs each passed **33 cases / 285,333 assertions**. Four new actual
+descriptor-bookkeeping tests cover growth, remaps, lazy invalidations and a
+50,000-operation eager-reference comparison. Vulkan/OpenGL production code
+compiled; no GPU lifetime integration test or live FPS test was performed.
+
+Candidate: `build-fe-shaders/emulator-nx2-4285e58d/bin-mkw-upstream-pr-cache/eglantine.exe`
+(61,918,720 bytes).
+SHA256: `F25DEF67E1ADE586C24A7C25F0E793BD64A327E11030684A4AE00EC5FFEF6DCD`.
+Logs: `mkw-upstream-pr-cache-build.log`, `mkw-upstream-pr-cache-focused-tests.log`.
+Previous upstream-guards executable was preserved and its hash verified.
+
+User authorized live testing and unstable experiments. Both computer-use transports
+were unavailable, including after retries. No game/settings intervention occurred;
+the official process exited on its own during compilation. The independent
+`Run-MKW-upstream-pr-cache.ps1 -UnsafePreemptiveReads` launcher selects an existing
+unsafe CPU-read diagnostic only for its child. It refuses concurrent emulator
+instances and restores the parent environment. Do not save progress in that
+experiment. It is not enabled in the normal executable and has not been run here.
+The reported upstream 30+ FPS and the FPS effect of this candidate remain unverified.

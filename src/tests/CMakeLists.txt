@@ -9,6 +9,8 @@ add_executable(tests
     common/cityhash.cpp
     common/container_hash.cpp
     common/event.cpp
+    common/queue_timed_wait.cpp
+    common/queue_lifetime.cpp
     common/fibers.cpp
     common/host_memory.cpp
     common/host_memory_fallback.cpp
@@ -24,6 +26,7 @@ add_executable(tests
     core/address_space.cpp
     core/page_heap.cpp
     core/read_traps.cpp
+    core/rasterizer_write.cpp
     core/nx2_readback_cache.cpp
     core/nx2_core_readback_capacity.cpp
     core/nx2_display.cpp
@@ -32,6 +35,8 @@ add_executable(tests
     core/ncz_decompressor.cpp
     core/internal_network/network.cpp
     video_core/memory_tracker.cpp
+    video_core/descriptor_table.cpp
+    video_core/native_async_draw.cpp
     video_core/memory_budget.cpp
     video_core/astc_recompression_override.cpp
     video_core/nx2_video_configuration.cpp
@@ -57,12 +62,19 @@ add_executable(tests
     video_core/download_batch.cpp
     video_core/virtual_range_cache.cpp
     video_core/uniform_upload_cache.cpp
+    video_core/uniform_cache_history.cpp
+    video_core/buffer_address_guards.cpp
     video_core/storage_binding_sync.cpp
     video_core/command_write_frontier.cpp
     video_core/split_completion.cpp
+    video_core/split_front_handoff.cpp
+    video_core/split_publication_order.cpp
+    video_core/readback_timing.cpp
+    video_core/pending_fence_readback.cpp
     video_core/fence_download_merge.cpp
     video_core/texture_audit_collector.cpp
     video_core/sync_audit_command_fetch.cpp
+    video_core/readback_audit.cpp
     video_core/native_storage_mappings.cpp
     video_core/native_qmd_write.cpp
     video_core/readback_coverage.cpp

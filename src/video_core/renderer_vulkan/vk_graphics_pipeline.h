@@ -130,6 +130,9 @@ public:
         return is_built.load(std::memory_order::relaxed);
     }
 
+    [[nodiscard]] bool HasAsyncSideEffects() const noexcept { return async_side_effects; }
+    [[nodiscard]] bool HasColorOutput() const noexcept { return fragment_has_color0_output; }
+
     template <typename Spec>
     static auto MakeConfigureSpecFunc() {
         return [](GraphicsPipeline* pl, bool is_indexed) { return pl->ConfigureImpl<Spec>(is_indexed); };
@@ -170,6 +173,7 @@ private:
     std::shared_ptr<const GraphicsShaderModules> spv_modules;
 
     std::array<Shader::Info, NUM_STAGES> stage_infos;
+    bool async_side_effects{};
     std::array<u32, 5> enabled_uniform_buffer_masks{};
     VideoCommon::UniformBufferSizes uniform_buffer_sizes{};
     u32 num_descriptor_entries{};
