@@ -741,6 +741,21 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         size_t built{};
         bool has_loaded{};
         std::unique_ptr<PipelineStatistics> statistics;
+        // Keep one scratch arena per loader worker, not per pipeline. Own them here,
+        // not in thread_local storage: release their high-water allocations after
+        // loading, instead of retaining them for the entire gameplay session.
+        std::vector<std::pair<std::thread::id, std::unique_ptr<ShaderPools>>> shader_pools;
+
+        ShaderPools& Pools() {
+            std::scoped_lock lock{mutex};
+            const auto id = std::this_thread::get_id();
+            for (auto& [owner, pools] : shader_pools) {
+                if (owner == id) {
+                    return *pools;
+                }
+            }
+            return *shader_pools.emplace_back(id, std::make_unique<ShaderPools>()).second;
+        }
     } state;
 
     if (device.IsKhrPipelineExecutablePropertiesEnabled()) {
@@ -751,7 +766,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
 
         workers.QueueWork([this, key, env_ = std::move(env), &state, &callback]() mutable {
-            ShaderPools pools;
+            ShaderPools& pools = state.Pools();
+            pools.ReleaseContents();
             auto pipeline{CreateComputePipeline(pools, key, env_, state.statistics.get(), false)};
             std::scoped_lock lock{state.mutex};
             if (pipeline) {
@@ -797,7 +813,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         }
 
         workers.QueueWork([this, key, envs_ = std::move(envs), &state, &callback]() mutable {
-            ShaderPools pools;
+            ShaderPools& pools = state.Pools();
+            pools.ReleaseContents();
             boost::container::static_vector<Shader::Environment*, 5> env_ptrs;
             for (auto& env : envs_) {
                 env_ptrs.push_back(&env);
@@ -827,6 +844,11 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     lock.unlock();
 
     workers.WaitForRequests(stop_loading);
+
+    LOG_INFO(Render_Vulkan,
+             "Shader translation cache totals: {} existing hits, {} coalesced concurrent misses, "
+             "{} translated sets",
+             reused_translations.load(), coalesced_translations.load(), translated_sets.load());
 
     if (use_vulkan_pipeline_cache) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
@@ -992,16 +1014,30 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
     const ShaderTranslationKey translation_key{MakeShaderTranslationKey(key, device)};
     std::shared_ptr<const ReusableShaders> shaders{FindReusableShaders(translation_key, envs, hash)};
+    if (shaders) {
+        reused_translations.fetch_add(1, std::memory_order_relaxed);
+    }
     if (!shaders && !allow_translation) {
         return nullptr;
     }
     if (!shaders) {
-        shaders = BuildGraphicsShaders(pools, translation_key, envs, hash);
-        if (!shaders) {
-            return nullptr;
-        }
+        std::unique_lock<std::mutex> build_lock;
         if (use_shader_reuse) {
-            shader_reuse.Add(translation_key, shaders);
+            build_lock = shader_reuse.LockBuild(translation_key);
+            shaders = FindReusableShaders(translation_key, envs, hash);
+            if (shaders) {
+                coalesced_translations.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (!shaders) {
+            translated_sets.fetch_add(1, std::memory_order_relaxed);
+            shaders = BuildGraphicsShaders(pools, translation_key, envs, hash);
+            if (!shaders) {
+                return nullptr;
+            }
+            if (use_shader_reuse) {
+                shader_reuse.Add(translation_key, shaders);
+            }
         }
     }
     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
@@ -1246,7 +1282,7 @@ private:
         LOG_INFO(Render_Vulkan,
                  "Graphics pipelines translated on workers in the last 10 s: {} queued ({} KiB "
                  "of state copied), {} adopted ({:.1f} ms on workers), {} built on the GPU "
-                 "thread (texture pool not contiguous); GPU thread: {:.1f} ms preparing, {:.1f} "
+                 "thread (texture snapshot unavailable); GPU thread: {:.1f} ms preparing, {:.1f} "
                  "ms waiting",
                  queued, copied_bytes / 1024, adopted, ms(build_time),
                  not_detached, ms(preparation_time), ms(wait_time));

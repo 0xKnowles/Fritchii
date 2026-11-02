@@ -221,10 +221,10 @@ ShaderReuseCache::Lookup ShaderReuseCache::Find(const ShaderTranslationKey& key,
     {
         std::scoped_lock lock{mutex};
         const auto it{entries.find(key)};
-        if (it == entries.end()) {
+        if (it == entries.end() || !it->second || it->second->variants.empty()) {
             return {};
         }
-        variants = it->second;
+        variants = it->second->variants;
     }
     // Checked without the lock: asking a live environment reads guest memory.
     for (const std::shared_ptr<const ReusableShaders>& shaders : variants) {
@@ -237,13 +237,32 @@ ShaderReuseCache::Lookup ShaderReuseCache::Find(const ShaderTranslationKey& key,
 
 bool ShaderReuseCache::Contains(const ShaderTranslationKey& key) const {
     std::scoped_lock lock{mutex};
-    return entries.contains(key);
+    const auto it = entries.find(key);
+    return it != entries.end() && it->second && !it->second->variants.empty();
+}
+
+std::unique_lock<std::mutex> ShaderReuseCache::LockBuild(const ShaderTranslationKey& key) {
+    std::mutex* build_mutex;
+    {
+        std::scoped_lock lock{mutex};
+        auto& entry = entries[key];
+        if (!entry) {
+            entry = std::make_unique<Entry>();
+        }
+        build_mutex = &entry->build_mutex;
+    }
+    // Waiting under the map lock would block unrelated keys and prevent the builder's Add.
+    return std::unique_lock{*build_mutex};
 }
 
 void ShaderReuseCache::Add(const ShaderTranslationKey& key,
                            std::shared_ptr<const ReusableShaders> shaders) {
     std::scoped_lock lock{mutex};
-    Variants& variants{entries[key]};
+    auto& entry = entries[key];
+    if (!entry) {
+        entry = std::make_unique<Entry>();
+    }
+    Variants& variants{entry->variants};
     if (variants.size() >= MaxVariants) {
         return;
     }

@@ -11,6 +11,7 @@
 #include "video_core/buffer_cache/uniform_upload_cache.h"
 
 #include <algorithm>
+#include <cstring>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
@@ -23,6 +24,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/readback_diagnostics.h"
 #include "video_core/cache_tracking_diagnostics.h"
 #include "video_core/texture_cache/util.h"
 
@@ -157,6 +159,15 @@ void BufferCache<P>::TickFrame() {
     ++frame_tick;
     delayed_destruction_ring.Tick();
 
+    ReleaseRetiredDownloadStaging();
+}
+
+template <class P>
+void BufferCache<P>::ReleaseRetiredDownloadStaging() {
+    // PopAsyncBuffers ran after the fence's GPU copy completed and has finished reading the
+    // staging memory. Native titles commit a download at more than a thousand fences a second;
+    // holding every staging buffer of a frame until TickFrame kept about a frame's worth of
+    // them (tens of MiB of host-visible memory) unusable and grew the pool to match.
     for (auto& buffer : async_buffers_death_ring) {
         runtime.FreeDeferredStagingBuffer(buffer);
     }
@@ -209,6 +220,12 @@ bool BufferCache<P>::OnCPUWrite(DAddr device_addr, u64 size) {
         return false;
     }
     if (memory_tracker.IsRegionGpuModified(device_addr, size)) {
+        // The write reaches the GPU buffer later, as these bytes only (CachedWriteMemory), so
+        // GPU-written bytes elsewhere on the page survive. Until then guest memory holds the
+        // newest contents of these bytes: a fence copy of the older GPU buffer contents must not
+        // be written back over them when its fence is released (with fast GPU fences the guest
+        // has already seen that fence signalled and may be writing after it on purpose).
+        ClearDownload(device_addr, size);
         return true;
     }
     WriteMemory(device_addr, size);
@@ -230,6 +247,16 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
     };
     area->preemtive = !IsRegionGpuModified(device_addr_start_aligned,
                                            device_addr_end_aligned - device_addr_start_aligned);
+    if (ReadbackDiagnostics::Enabled()) {
+        // These pages stay eager for good: report how fast that set grows.
+        u64 already_eager = 0;
+        memory_tracker.ForEachPreflushableRange(
+            device_addr_start_aligned, device_addr_end_aligned - device_addr_start_aligned,
+            [&](DAddr, u64 length) { already_eager += length; });
+        ReadbackDiagnostics::Scope diagnostic{
+            ReadbackDiagnostics::Event::EagerPagesAdded,
+            device_addr_end_aligned - device_addr_start_aligned - already_eager};
+    }
     memory_tracker.MarkRegionAsPreflushable(device_addr_start_aligned,
                                             device_addr_end_aligned - device_addr_start_aligned);
     return area;
@@ -244,11 +271,8 @@ void BufferCache<P>::DownloadMemory(DAddr device_addr, u64 size) {
 
 template <class P>
 void BufferCache<P>::ClearDownload(DAddr device_addr, u64 size) {
-    async_downloads.DeleteAll(device_addr, size);
-    uncommitted_gpu_modified_ranges.Subtract(device_addr, size);
-    for (auto& interval_set : committed_gpu_modified_ranges) {
-        interval_set.Subtract(device_addr, size);
-    }
+    DropFenceDownloads(device_addr, size, async_downloads, uncommitted_gpu_modified_ranges,
+                       committed_gpu_modified_ranges);
 }
 
 template <class P>
@@ -647,6 +671,8 @@ bool BufferCache<P>::ShouldWaitAsyncFlushes() const noexcept {
 
 template <class P>
 void BufferCache<P>::CommitAsyncFlushesHigh() {
+    ReadbackDiagnostics::Scope diagnostic{ReadbackDiagnostics::Event::FenceDownloadCommit};
+    ReleaseRetiredDownloadStaging();
     AccumulateFlushes();
 
     if (committed_gpu_modified_ranges.empty()) {
@@ -654,54 +680,38 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
         return;
     }
 
-    auto it = committed_gpu_modified_ranges.begin();
-    while (it != committed_gpu_modified_ranges.end()) {
-        auto& current_intervals = *it;
-        auto next_it = std::next(it);
-        while (next_it != committed_gpu_modified_ranges.end()) {
-            next_it->ForEach([&current_intervals](DAddr start, DAddr end) {
-                current_intervals.Subtract(start, end - start);
-            });
-            next_it++;
-        }
-        it++;
-    }
+    const auto selected_ranges = MergeFenceDownloadRanges(committed_gpu_modified_ranges);
 
     boost::container::small_vector<std::pair<BufferCopy, BufferId>, 16> downloads;
     u64 total_size_bytes = 0;
-    u64 largest_copy = 0;
-    for (const Common::RangeSet<DAddr>& range_set : committed_gpu_modified_ranges) {
-        range_set.ForEach([&](DAddr interval_lower, DAddr interval_upper) {
-            const std::size_t size = interval_upper - interval_lower;
-            const DAddr device_addr = interval_lower;
-            ForEachBufferInRange(device_addr, size, [&](BufferId buffer_id, Buffer& buffer) {
-                const DAddr buffer_start = buffer.CpuAddr();
-                const DAddr buffer_end = buffer_start + buffer.SizeBytes();
-                const DAddr new_start = (std::max)(buffer_start, device_addr);
-                const DAddr new_end = (std::min)(buffer_end, device_addr + size);
-                ForEachFenceDownloadRange(
-                    new_start, new_end - new_start, memory_tracker, gpu_modified_ranges,
-                    [&](DAddr start, DAddr end) {
-                        const u64 new_offset = start - buffer_start;
-                        const u64 new_size = end - start;
-                        downloads.push_back({
-                            BufferCopy{
-                                .src_offset = new_offset,
-                                .dst_offset = total_size_bytes,
-                                .size = new_size,
-                            },
-                            buffer_id,
-                        });
-                        // Align the staging offset, not the bytes copied from the guest range.
-                        constexpr u64 align = 64ULL;
-                        constexpr u64 mask = ~(align - 1ULL);
-                        total_size_bytes += (new_size + align - 1) & mask;
-                        largest_copy = (std::max)(largest_copy, new_size);
+    selected_ranges.ForEach([&](DAddr interval_lower, DAddr interval_upper) {
+        const std::size_t size = interval_upper - interval_lower;
+        const DAddr device_addr = interval_lower;
+        ForEachBufferInRange(device_addr, size, [&](BufferId buffer_id, Buffer& buffer) {
+            const DAddr buffer_start = buffer.CpuAddr();
+            const DAddr buffer_end = buffer_start + buffer.SizeBytes();
+            const DAddr new_start = (std::max)(buffer_start, device_addr);
+            const DAddr new_end = (std::min)(buffer_end, device_addr + size);
+            ForEachFenceDownloadRange(
+                new_start, new_end - new_start, memory_tracker, gpu_modified_ranges,
+                [&](DAddr start, DAddr end) {
+                    const u64 new_offset = start - buffer_start;
+                    const u64 new_size = end - start;
+                    downloads.push_back({
+                        BufferCopy{
+                            .src_offset = new_offset,
+                            .dst_offset = total_size_bytes,
+                            .size = new_size,
+                        },
+                        buffer_id,
                     });
-            });
+                    // Align the staging offset, not the bytes copied from the guest range.
+                    constexpr u64 align = 64ULL;
+                    constexpr u64 mask = ~(align - 1ULL);
+                    total_size_bytes += (new_size + align - 1) & mask;
+                });
         });
-    }
-    committed_gpu_modified_ranges.clear();
+    });
     if (downloads.empty()) {
         async_buffers.emplace_back(std::optional<Async_Buffer>{});
         return;
@@ -762,25 +772,47 @@ void BufferCache<P>::PopAsyncBuffers() {
     }
     auto& downloads = pending_downloads.front();
     auto& async_buffer = async_buffers.front();
+    u64 copied_bytes = 0;
+    for (const auto& copy : downloads) {
+        copied_bytes += copy.size;
+    }
+    ReadbackDiagnostics::Scope diagnostic{ReadbackDiagnostics::Event::FenceDownloadWriteback,
+                                          copied_bytes};
+    // Evidence for the eager-download policy: how much of what is written back guest memory
+    // already held. Sampled, and compared before writing (the bytes written do not change).
+    const bool compare = ReadbackDiagnostics::Enabled() && (fence_writeback_count++ & 63) == 0;
+    u64 compared_bytes = 0;
+    u64 unchanged_bytes = 0;
+    const auto write = [&](DAddr address, const u8* source, u64 size) {
+        if (compare) {
+            fence_writeback_compare.resize_destructive(size);
+            device_memory.ReadBlockUnsafe(address, fence_writeback_compare.data(), size);
+            compared_bytes += size;
+            for (u64 offset = 0; offset < size;) {
+                const u64 chunk = (std::min<u64>)(size - offset, 64);
+                if (std::memcmp(fence_writeback_compare.data() + offset, source + offset,
+                                chunk) == 0) {
+                    unchanged_bytes += chunk;
+                }
+                offset += chunk;
+            }
+        }
+        device_memory.WriteBlockUnsafe(address, source, size);
+    };
     u8* base = async_buffer->mapped_span.data();
     const size_t base_offset = async_buffer->offset;
     for (const auto& copy : downloads) {
         const DAddr device_addr = static_cast<DAddr>(copy.src_offset);
         const u64 dst_offset = copy.dst_offset - base_offset;
-        const u8* read_mapped_memory = base + dst_offset;
-        async_downloads.ForEachInRange(device_addr, copy.size, [&](DAddr start, DAddr end, s32) {
-            device_memory.WriteBlockUnsafe(start, &read_mapped_memory[start - device_addr],
-                                           end - start);
-        });
-        async_downloads.Subtract(device_addr, copy.size, [&](DAddr start, DAddr end) {
-            if (uncommitted_gpu_modified_ranges.Intersects(start, end - start) ||
-                std::ranges::any_of(committed_gpu_modified_ranges, [&](const auto& ranges) {
-                    return ranges.Intersects(start, end - start);
-                })) {
-                return;
-            }
-            gpu_modified_ranges.Subtract(start, end - start);
-        });
+        WriteBackFenceCopy(device_addr, copy.size, base + dst_offset, async_downloads,
+                           uncommitted_gpu_modified_ranges, committed_gpu_modified_ranges,
+                           gpu_modified_ranges, write);
+    }
+    if (compare) {
+        ReadbackDiagnostics::Scope sampled{ReadbackDiagnostics::Event::FenceWritebackSampled,
+                                           compared_bytes};
+        ReadbackDiagnostics::Scope unchanged{ReadbackDiagnostics::Event::FenceWritebackUnchanged,
+                                             unchanged_bytes};
     }
     async_buffers_death_ring.emplace_back(*async_buffer);
     async_buffers.pop_front();
@@ -795,23 +827,12 @@ bool BufferCache<P>::IsRegionGpuModified(DAddr addr, size_t size) {
 }
 
 template <class P>
-void BufferCache<P>::NoteCpuRead(DAddr addr, size_t size) {
-    if (AsyncBufferDownloads()) {
-        return;
-    }
-    size_t covered = 0;
-    cpu_read_ranges.ForEachInRange(addr, size,
-                                   [&](DAddr start, DAddr end) { covered += end - start; });
-    if (covered >= size) {
-        return;
-    }
-    cpu_read_ranges.Add(addr, size);
-    if (Nx2Profile::Enabled()) {
-        static u64 noted{};
-        if ((++noted & 255) == 1) {
-            LOG_INFO(HW_GPU, "CPU-read buffer pages noted: {} (latest {:#x})", noted, addr);
-        }
-    }
+void BufferCache<P>::NoteCpuRead([[maybe_unused]] DAddr addr, [[maybe_unused]] size_t size) {
+    // Nothing left to record. This used to add the page-aligned read to a CPU-read range set,
+    // only without AsyncBufferDownloads; its only caller (RasterizerVulkan::GetFlushArea) then
+    // calls GetFlushArea here under that same condition, which marks those same pages
+    // Preflushable. Neither was ever cleared, so every fence selection walked two copies of one
+    // set. QueueDownload selects the Preflushable pages.
 }
 
 template <class P>

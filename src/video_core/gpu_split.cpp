@@ -44,12 +44,48 @@ void Pause() {
 [[maybe_unused]] std::atomic<u32> g_back_thread_id{};
 std::atomic<bool> g_back_busy{};
 
+// Back-thread totals since process start (monotonic; the front reports per-window deltas).
+// Idle covers both spinning and sleeping with nothing published. If idle stays near zero while
+// the front waits in drains, the back's own work limits throughput and fewer drains would not
+// help; a large idle share means the two halves are alternating instead of overlapping.
+struct BackActivity {
+    std::atomic<u64> idle_ns{};
+    std::atomic<u64> sleeps{};
+    std::atomic<u64> batches{};
+};
+BackActivity g_back_activity;
+
+/// Only the back thread writes these: avoid a locked read-modify-write per batch.
+void AddBackActivity(std::atomic<u64>& counter, u64 amount) {
+    counter.store(counter.load(std::memory_order_relaxed) + amount, std::memory_order_relaxed);
+}
+
+struct BackActivitySnapshot {
+    u64 idle_ns{};
+    u64 sleeps{};
+    u64 batches{};
+
+    static BackActivitySnapshot Take() {
+        return {g_back_activity.idle_ns.load(std::memory_order_relaxed),
+                g_back_activity.sleeps.load(std::memory_order_relaxed),
+                g_back_activity.batches.load(std::memory_order_relaxed)};
+    }
+};
+
 struct DrainProfileData {
     SplitDrainMetrics metrics;
+    CommandFetchSyncAudit audit;
+    BackActivitySnapshot back_start;
     u64 window_start{};
     u32 events{};
 };
 thread_local DrainProfileData drain_profile;
+
+void StartDrainProfileWindow(DrainProfileData& data, u64 now) {
+    data = {};
+    data.window_start = now;
+    data.back_start = BackActivitySnapshot::Take();
+}
 
 void ReportDrainProfile() {
     auto& data = drain_profile;
@@ -58,8 +94,7 @@ void ReportDrainProfile() {
     }
     const u64 now = Nx2Profile::Now();
     if (data.window_start == 0) {
-        data.window_start = now;
-        data.metrics = {};
+        StartDrainProfileWindow(data, now);
         return;
     }
     const u64 window = now - data.window_start;
@@ -87,14 +122,32 @@ void ReportDrainProfile() {
              static_cast<double>(metrics.historical_hits) * 1e9 / window,
              static_cast<double>(metrics.dirty_flushes) * 1e9 / window,
              static_cast<double>(metrics.flushed_bytes) * 1e9 / 1024.0 / window);
-    data = {};
-    data.window_start = now;
+    const auto back = BackActivitySnapshot::Take();
+    const auto& audit = data.audit;
+    const auto per_second = [window](u64 count) {
+        return static_cast<double>(count) * 1e9 / static_cast<double>(window);
+    };
+    // Evidence only: every fetch below was still synchronized (command_fetch_sync_audit.h).
+    LOG_INFO(HW_GPU,
+             "GPU split overlap: back idle {:.1f} ms/s ({:.0f} sleeps/s, {:.0f} batches/s) | "
+             "command fetch SYNC_WAIT {:.0f}/s of {:.0f}/s, known GPU-written before sync "
+             "{:.0f}/s | unsynchronized candidates {:.0f}/s, {:.0f} waited/s for {:.1f} ms/s, "
+             "first GPU writes seen during their sync {} (command contents not sampled)",
+             static_cast<double>(back.idle_ns - data.back_start.idle_ns) * 1000.0 / window,
+             per_second(back.sleeps - data.back_start.sleeps),
+             per_second(back.batches - data.back_start.batches), per_second(audit.sync_fetches),
+             per_second(audit.fetches), per_second(audit.known_before),
+             per_second(audit.candidates), per_second(audit.candidate_waits),
+             static_cast<double>(audit.candidate_wait_ns) * 1000.0 / window,
+             audit.first_write_hits);
+    StartDrainProfileWindow(data, now);
 }
 
 class DrainProfileScope {
 public:
     DrainProfileScope(SplitDrainReason reason_, u64 queued_words_)
-        : reason{reason_}, queued_words{queued_words_}, enabled{Nx2Profile::Enabled()} {
+        : reason{reason_}, queued_words{queued_words_},
+          enabled{Tegra::g_nx2_ampere.load(std::memory_order_relaxed) || Nx2Profile::Enabled()} {
         if (enabled && queued_words != 0) start = Nx2Profile::Now();
     }
     ~DrainProfileScope() {
@@ -208,6 +261,7 @@ void GpuSplit::Stop() {
     published_local = 0;
     consumed_cache = 0;
     command_writes.Reset();
+    completion.Reset();
     publish_every = PublishEvery;
     front_engine = nullptr;
     back_engine = nullptr;
@@ -269,10 +323,14 @@ void GpuSplit::Drain(SplitDrainReason reason) {
 }
 
 void GpuSplit::DrainCommandReads() {
+    DrainMemoryWriters(SplitDrainReason::CommandFetch);
+}
+
+void GpuSplit::DrainMemoryWriters(SplitDrainReason reason) {
     if (command_writes.Target() < write_position) {
         Nx2Profile::Add(Nx2Profile::Counter::CommandStateTails, 1);
     }
-    DrainTo(command_writes.Target(), SplitDrainReason::CommandFetch);
+    DrainTo(command_writes.Target(), reason);
     // Do not starve state-only runs when the reader never needs a full drain.
     Publish();
 }
@@ -283,6 +341,10 @@ void GpuSplit::DrainTo(u64 target, SplitDrainReason reason) {
     if (consumed_cache >= target) {
         return;
     }
+    // A frontier can be in the middle of an already published batch. Ask the
+    // back to acknowledge it without waiting for the unrelated tail or 4096
+    // more words. Publish remains the release of the ring's actual contents.
+    completion.Request(target);
     Publish();
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
     for (u32 spins = 0;; ++spins) {
@@ -299,8 +361,12 @@ void GpuSplit::DrainTo(u64 target, SplitDrainReason reason) {
     }
 }
 
+CommandFetchSyncAudit& GpuSplit::FetchSyncAudit() {
+    return drain_profile.audit;
+}
+
 void GpuSplit::NoteCommandFetch(u64 bytes, bool historical_hit, bool flushed) {
-    if (!Nx2Profile::Enabled()) return;
+    if (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) && !Nx2Profile::Enabled()) return;
     drain_profile.metrics.RecordCommandFetch(bytes, historical_hit, flushed);
     ReportDrainProfile();
 }
@@ -314,7 +380,8 @@ void GpuSplit::SwitchEngine(Tegra::Engines::EngineInterface* engine) {
 }
 
 void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
-                           u32 amount, u32 methods_pending, const GPUVAddr* segment) {
+                           u32 amount, u32 methods_pending, const GPUVAddr* segment,
+                           bool may_write) {
     SelectEngine(engine);
     // Long runs (constant buffer and inline uploads) go in pieces, as when a method's data
     // continues in the next GPFIFO entry.
@@ -331,7 +398,7 @@ void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, 
         }
         entry[size - 1] = 0;
         std::memcpy(entry + head, words, size_t{piece} * sizeof(u32));
-        Commit(size);
+        Commit(size, may_write);
         words += piece;
         amount -= piece;
         methods_pending -= piece;
@@ -412,6 +479,10 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         u64 available = published.load(std::memory_order_acquire);
         if (available == read_position) {
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
+            const u64 idle_start = Nx2Profile::Now();
+            const auto note_idle = [idle_start] {
+                AddBackActivity(g_back_activity.idle_ns, Nx2Profile::Now() - idle_start);
+            };
             // The front usually sends more within microseconds: spin briefly before sleeping.
             for (u32 spins = 0; spins < 8192 && available == read_position; ++spins) {
                 Pause();
@@ -424,12 +495,16 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 const u32 seen = wake.load(std::memory_order_seq_cst);
                 available = published.load(std::memory_order_seq_cst);
                 if (available == read_position && !stop_token.stop_requested()) {
+                    AddBackActivity(g_back_activity.sleeps, 1);
                     wake.wait(seen, std::memory_order_seq_cst);
                 }
                 back_waiting.store(false, std::memory_order_relaxed);
+                note_idle();
                 continue;
             }
+            note_idle();
         }
+        AddBackActivity(g_back_activity.batches, 1);
         u64 last_store = read_position;
         g_back_busy.store(true, std::memory_order_relaxed);
         while (read_position != available) {
@@ -437,7 +512,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             const size_t size = Execute(&ring[index]);
             read_position += size != 0 ? size : RingWords - index;
             // Hand ring space back now and then while working through a long batch.
-            if (read_position - last_store >= 4096 && read_position != available) {
+            if (read_position != available && completion.ShouldPublish(read_position, last_store)) {
                 consumed.store(read_position, std::memory_order_release);
                 last_store = read_position;
             }

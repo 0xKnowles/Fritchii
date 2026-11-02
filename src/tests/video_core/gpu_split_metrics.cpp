@@ -37,3 +37,29 @@ TEST_CASE("Command fetch attribution distinguishes historical pages from actual 
     REQUIRE(metrics.command_fetches == 0);
     REQUIRE(metrics.flushed_bytes == 0);
 }
+
+TEST_CASE("MME DMA timings are sampled while read counts remain exact",
+          "[video_core][gpu_split_metrics]") {
+    VideoCommon::NativeDmaReadMetrics metrics;
+    for (u32 read = 0; read < 130; ++read) {
+        const bool sampled = metrics.BeginRead(read);
+        REQUIRE(sampled == (read == 0 || read == 64 || read == 128));
+        if (read % 2 == 0) ++metrics.flushes;
+        if (sampled) metrics.RecordSample(10, 20, 30, 40);
+    }
+    REQUIRE(metrics.calls == 130);
+    REQUIRE(metrics.words == 129 * 130 / 2);
+    REQUIRE(metrics.flushes == 65);
+    REQUIRE(metrics.samples == 3);
+    REQUIRE(metrics.drain_ns == 30);
+    REQUIRE(metrics.dirty_check_ns == 60);
+    REQUIRE(metrics.flush_ns == 90);
+    REQUIRE(metrics.read_ns == 120);
+    metrics = {};
+    REQUIRE(metrics.BeginRead(4));
+    REQUIRE(metrics.calls == 1);
+    REQUIRE(metrics.words == 4);
+    REQUIRE(metrics.samples == 0);
+    REQUIRE(metrics.flushes == 0);
+    REQUIRE(metrics.drain_ns == 0);
+}

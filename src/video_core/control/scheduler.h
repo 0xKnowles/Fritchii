@@ -25,8 +25,8 @@ class Scheduler {
 public:
     void Push(GPU& gpu, s32 channel, CommandList&& entries);
 
-    /// Runs channels whose pending semaphore acquire is now met.
-    void ResumePending(GPU& gpu);
+    /// Runs one pass of ready channels; true if a channel was dispatched.
+    bool ResumePending(GPU& gpu);
     [[nodiscard]] bool HasPendingChannels() const {
         return !pending_channels.empty();
     }

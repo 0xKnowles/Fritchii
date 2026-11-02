@@ -59,28 +59,30 @@ void DrainBack() {
     VideoCommon::GpuSplit::Get().Drain();
 }
 
-} // Anonymous namespace
-
-bool Puller::PendingAcquire::Matches(u32 current) const {
-    switch (static_cast<GpuSemaphoreOperation>(operation)) {
-    case GpuSemaphoreOperation::AcquireEqual:
-        return current == value;
-    case GpuSemaphoreOperation::AcquireGequal:
-        return current >= value;
-    case GpuSemaphoreOperation::AcquireMask:
-        return (current & value) != 0;
-    default:
-        return true;
+// Polling a suspended acquire reads guest memory and asks the buffer and query caches about
+// one word: no engine register or method sink is touched. Only queued entries that may write
+// memory or use those caches (releases, reports, uploads, copies, draws, dispatches and every
+// deferred callback) have to finish first; register-only entries may keep running on the back.
+void DrainBackMemoryWriters() {
+    if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+        split.DrainMemoryWriters();
     }
 }
 
+} // Anonymous namespace
+
+bool Puller::PendingAcquire::Matches(u32 current) const {
+    return SemaphoreMatches(operation, current, value);
+}
+
 bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
-    if (!pending_acquire) {
+    if (!pending_acquire || pending_acquire->satisfied) {
         return true;
     }
     // The release may still be queued for the split GPU thread's back half (and the caches
-    // ReadSemaphoreWord asks are its state).
-    DrainBack();
+    // ReadSemaphoreWord asks are its state). The scheduler polls this repeatedly while any
+    // channel is suspended; a full drain here serialized every other channel's submissions.
+    DrainBackMemoryWriters();
     const u32 current = ReadSemaphoreWord(dma_pusher, pending_acquire->address);
     if (Nx2SemaphoreWaiters::Get().Latched(this)) {
         if (static std::atomic<u32> rescued{};
@@ -89,9 +91,11 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
                      dma_pusher.channel_state.bind_id, pending_acquire->address,
                      pending_acquire->value, current);
         }
+        pending_acquire->satisfied = true;
         return true;
     }
     if (pending_acquire->Matches(current)) {
+        pending_acquire->satisfied = true;
         return true;
     }
     // A release the GPU already processed may only wait for the host GPU to write it (accurate
@@ -99,6 +103,7 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(pending_acquire->address)) {
         if (const auto pending = dma_pusher.rasterizer->PendingSemaphoreRelease(*device);
             pending && pending_acquire->Matches(*pending)) {
+            pending_acquire->satisfied = true;
             return true;
         }
     }
@@ -244,24 +249,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             LOG_ERROR(HW_GPU, "Invalid semaphore operation {}", static_cast<u32>(op));
             return;
         }
-        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
-        DrainBack();
-        if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
-            return;
-        }
-        // Registered before the fences run, so a release among them that meets the value counts
-        // even if a later one overwrites it.
-        auto& waiters = Nx2SemaphoreWaiters::Get();
-        if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address)) {
-            waiters.Add(this, *device, acquire.value, acquire.operation);
-        }
-        dma_pusher.rasterizer->ReleaseFences();
-        if (!waiters.Latched(this) && !acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
-            pending_acquire = acquire;
-            VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
-        } else {
-            waiters.Remove(this);
-        }
+        BeginAcquire(dma_pusher, acquire);
     } else {
         DrainBack();
         do {
@@ -311,6 +299,27 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
     }
 }
 
+void Puller::BeginAcquire(DmaPusher& dma_pusher, PendingAcquire acquire) {
+    VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
+    DrainBack();
+    if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
+        return;
+    }
+    // Register before releasing fences: an intermediate matching release must not be lost
+    // when another release overwrites the semaphore before the next scheduler poll.
+    auto& waiters = Nx2SemaphoreWaiters::Get();
+    if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address)) {
+        waiters.Add(this, *device, acquire.value, acquire.operation);
+    }
+    dma_pusher.rasterizer->ReleaseFences();
+    if (!waiters.Latched(this) && !acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
+        pending_acquire = acquire;
+        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
+    } else {
+        waiters.Remove(this);
+    }
+}
+
 void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
     const GPUVAddr sequence_address{regs.semaphore_address.SemaphoreAddress()};
     const u32 payload = regs.semaphore_release;
@@ -342,6 +351,16 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
                              (regs.reg_array[0x17] & ~3U);
     const u32 payload = regs.reg_array[0x19];
     const u32 operation = argument & 7;
+    if (const auto acquire = DecodeSemaphoreAcquire32(argument)) {
+        BeginAcquire(dma_pusher, {
+            .address = address,
+            .value = payload,
+            .operation = static_cast<u32>(*acquire),
+            .since = std::chrono::steady_clock::now(),
+            .reported = false,
+        });
+        return;
+    }
     if (operation == 1) { // RELEASE
         OnBack([rasterizer = dma_pusher.rasterizer, address, payload] {
             rasterizer->Query(address, VideoCommon::QueryType::Payload,

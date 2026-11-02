@@ -7,6 +7,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <numeric>
 #include <cstdlib>
 #include <limits>
@@ -28,6 +29,8 @@
 #include "video_core/texture_cache/conversion.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/physical_alias.h"
+#include "video_core/texture_cache/collector_thresholds.h"
+#include "video_core/texture_cache/download_batch.h"
 #include "video_core/texture_cache/samples_helper.h"
 #include "video_core/texture_cache/sparse_image.h"
 #include "video_core/texture_cache/texture_cache_base.h"
@@ -148,7 +151,26 @@ void TextureCache<P>::RunGarbageCollector() {
         ticks_to_destroy = (std::max)(ticks_to_destroy, min_age);
         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);
     };
-    const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode](ImageId image_id) {
+    const auto Evict = [this](ImageId image_id) {
+        auto& image = slot_images[image_id];
+        if (True(image.flags & ImageFlagBits::Tracked)) {
+            UntrackImage(image, image_id);
+        }
+        ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
+        const bool immediate_delete = image.scale_tick > frame_tick + 5;
+        UnregisterImage(image_id);
+        DeleteImage(image_id, immediate_delete);
+    };
+    // Victims whose GPU contents must reach guest memory before eviction. The walk only selects
+    // them; they are downloaded together afterwards with one GPU wait per batch, instead of a
+    // full runtime.Finish() per image, then evicted in selection order. Their bytes count as
+    // freed for the walk's mode changes, exactly as the immediate eviction counted them.
+    std::vector<ImageId> download_victims;
+    u64 deferred_bytes = 0;
+    const auto ProjectedUsage = [&] {
+        return total_used_memory - (std::min)(total_used_memory, deferred_bytes);
+    };
+    const auto Cleanup = [&](ImageId image_id) {
         if (num_iterations == 0) {
             return true;
         }
@@ -162,33 +184,72 @@ void TextureCache<P>::RunGarbageCollector() {
             return false;
         }
         if (must_download) {
-            auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
-            const auto copies = FullDownloadCopies(image.info);
-            image.DownloadMemory(map, copies);
-            runtime.Finish();
-            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
-            ++gc_download_deletes;
+            download_victims.push_back(image_id);
+            deferred_bytes += ImageMemoryBytes(image);
+            if (image.HasScaled()) {
+                deferred_bytes += GetScaledImageSizeBytes(image);
+            }
+        } else {
+            Evict(image_id);
         }
-        if (True(image.flags & ImageFlagBits::Tracked)) {
-            UntrackImage(image, image_id);
-        }
-        ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
-        UnregisterImage(image_id);
-        DeleteImage(image_id, image.scale_tick > frame_tick + 5);
-        if (aggressive_mode && total_used_memory < critical_memory) {
+        const u64 used = ProjectedUsage();
+        if (aggressive_mode && used < critical_memory) {
             num_iterations >>= 2;
             aggressive_mode = false;
-        } else if (high_priority_mode && total_used_memory < expected_memory) {
+        } else if (high_priority_mode && used < expected_memory) {
             num_iterations >>= 1;
             high_priority_mode = false;
         }
         return false;
     };
+    const auto FlushDownloadVictims = [&] {
+        if (download_victims.empty()) {
+            return; // gpu_memory may be unset when no channel is bound.
+        }
+        // Same per-batch staging/offset handling as DownloadMemory's native batches; other
+        // backends keep one image per wait, as before.
+        const u64 budget = gpu_memory->UsesNativeTiling() ? u64{64_MiB} : u64{0};
+        decltype(runtime.DownloadStagingBuffer(size_t{}))* map = nullptr;
+        decltype(map->offset) base_offset{};
+        DownloadAndEvict(
+            download_victims.size(), budget,
+            [&](size_t i) { return slot_images[download_victims[i]].unswizzled_size_bytes; },
+            [&](u64 bytes, auto&& run) {
+                // A local, not a copy: the OpenGL map's destructor fences its staging buffer.
+                auto staging = runtime.DownloadStagingBuffer(static_cast<size_t>(bytes));
+                map = &staging;
+                base_offset = staging.offset;
+                run();
+                map = nullptr;
+            },
+            [&](size_t i, u64 offset) {
+                Image& image = slot_images[download_victims[i]];
+                map->offset = base_offset + static_cast<decltype(base_offset)>(offset);
+                image.DownloadMemory(*map, FullDownloadCopies(image.info));
+            },
+            [&] { runtime.Finish(); },
+            [&](size_t i, u64 offset) {
+                Image& image = slot_images[download_victims[i]];
+                SwizzleImage(*gpu_memory, image.gpu_addr, image.info,
+                             FullDownloadCopies(image.info),
+                             map->mapped_span.subspan(static_cast<size_t>(offset),
+                                                      image.unswizzled_size_bytes),
+                             swizzle_data_buffer);
+            },
+            [&](size_t i) {
+                ++gc_download_deletes;
+                Evict(download_victims[i]);
+            });
+        download_victims.clear();
+        deferred_bytes = 0;
+    };
     Configure(false);
     lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, Cleanup);
+    FlushDownloadVictims();
     if (total_used_memory >= critical_memory) {
         Configure(true);
         lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, Cleanup);
+        FlushDownloadVictims();
     }
 }
 
@@ -243,9 +304,9 @@ void TextureCache<P>::TickFrame() {
                 const u64 budget = runtime.GetDeviceMemoryBudget();
                 if (budget != 0) {
                     const u64 old_critical = critical_memory;
-                    const u64 margin = (std::min)(budget / 8, 1_GiB);
-                    critical_memory = budget - margin;
-                    expected_memory = budget - 2 * margin;
+                    const CollectorThresholds thresholds = BudgetCollectorThresholds(budget);
+                    critical_memory = thresholds.critical;
+                    expected_memory = thresholds.expected;
                     // Log the first values and real changes (the budget moves by a few MiB all
                     // the time).
                     const u64 change = critical_memory > old_critical
@@ -258,7 +319,10 @@ void TextureCache<P>::TickFrame() {
     }
     // If we can obtain the memory info, use it instead of the estimate.
     if (runtime.CanReportMemoryUsage()) {
-        total_used_memory = runtime.GetDeviceMemoryUsage();
+        // Driver usage still includes images already evicted into the destruction ring.
+        // Do not select another set of victims for those same bytes every frame while
+        // waiting for their safe destruction. Only exact owned allocation sizes get credit.
+        total_used_memory = retired_image_memory.RemainingUsage(runtime.GetDeviceMemoryUsage());
     }
     // Every 600 frames: device memory in use against the collector's thresholds, and what the
     // images themselves account for (VRAM pressure makes the collector thrash).
@@ -276,9 +340,9 @@ void TextureCache<P>::TickFrame() {
             format.first += bytes;
             ++format.second;
         }
-        LOG_INFO(HW_GPU, "Texture cache: device memory {} MiB (expected {} MiB, critical {} MiB), {} images {} MiB",
+        LOG_INFO(HW_GPU, "Texture cache: device memory {} MiB (expected {} MiB, critical {} MiB), {} images {} MiB, pending retirement {} MiB",
                  total_used_memory >> 20, expected_memory >> 20, critical_memory >> 20, images,
-                 image_bytes >> 20);
+                 image_bytes >> 20, retired_image_memory.PendingBytes() >> 20);
         std::partial_sort(largest.begin(), largest.begin() + std::min<size_t>(12, largest.size()),
                           largest.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
         for (size_t i = 0; i < std::min<size_t>(12, largest.size()); ++i) {
@@ -862,51 +926,54 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
                      newer_unselected_gpu_overlaps, cpu_modified_overlaps);
         }
     }
-    static const bool batch_downloads = [] {
-        const char* value = std::getenv("EDEN_NX2_TEXTURE_DOWNLOAD_BATCH");
-        return value != nullptr && value[0] == '1' && value[1] == '\0';
-    }();
-    if (batch_downloads && gpu_memory->UsesNativeTiling()) {
-        constexpr size_t MaxBatchBytes = 64_MiB;
+    // Submit the copies together, wait once, then write back in modification order.
+    // Waiting once per overlapping image serializes GPU/CPU work unnecessarily. Neither
+    // dirty-image selection nor the bytes copied changes; large images remain singletons.
+    if (gpu_memory->UsesNativeTiling()) {
+        const auto begin = std::chrono::steady_clock::now();
+        static thread_local struct {
+            std::chrono::steady_clock::time_point begin;
+            std::chrono::steady_clock::duration elapsed{};
+            u64 images{}, batches{}, bytes{};
+        } report{begin};
+        report.images += images.size();
         for (size_t first = 0; first < images.size();) {
-            size_t last = first;
-            size_t batch_bytes = 0;
-            while (last < images.size()) {
-                const size_t bytes =
-                    Common::AlignUp(slot_images[images[last]].unswizzled_size_bytes, 64);
-                if (last != first && bytes > MaxBatchBytes - batch_bytes) {
-                    break;
-                }
-                batch_bytes += bytes;
-                ++last;
-                if (batch_bytes >= MaxBatchBytes) {
-                    break;
-                }
-            }
-            static u32 batch_reports{};
-            if (batch_reports < 8) {
-                ++batch_reports;
-                LOG_INFO(Render_Vulkan, "Experimental texture readback batch: images={}, bytes={}",
-                         last - first, batch_bytes);
-            }
-            auto map = runtime.DownloadStagingBuffer(batch_bytes);
-            for (size_t i = first; i < last; ++i) {
-                Image& image = slot_images[images[i]];
-                const auto copies = FullDownloadCopies(image.info);
-                image.DownloadMemory(map, copies);
-                map.offset += Common::AlignUp(image.unswizzled_size_bytes, 64);
-            }
-            runtime.Finish();
-            size_t offset = 0;
-            for (size_t i = first; i < last; ++i) {
-                Image& image = slot_images[images[i]];
-                const auto copies = FullDownloadCopies(image.info);
-                SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies,
-                             map.mapped_span.subspan(offset, image.unswizzled_size_bytes),
-                             swizzle_data_buffer);
-                offset += Common::AlignUp(image.unswizzled_size_bytes, 64);
-            }
+            const auto batch = PlanDownloadBatch(images.size() - first, [&](size_t index) {
+                return slot_images[images[first + index]].unswizzled_size_bytes;
+            });
+            const size_t last = first + batch.count;
+            ++report.batches;
+            report.bytes += batch.bytes;
+            auto map = runtime.DownloadStagingBuffer(batch.bytes);
+            const auto base_offset = map.offset;
+            ExecuteDownloadBatch(batch.count,
+                [&](size_t i) { return slot_images[images[first + i]].unswizzled_size_bytes; },
+                [&](size_t i, u64 offset) {
+                    Image& image = slot_images[images[first + i]];
+                    const auto copies = FullDownloadCopies(image.info);
+                    map.offset = base_offset + offset;
+                    image.DownloadMemory(map, copies);
+                },
+                [&] { runtime.Finish(); },
+                [&](size_t i, u64 offset) {
+                    Image& image = slot_images[images[first + i]];
+                    const auto copies = FullDownloadCopies(image.info);
+                    SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies,
+                                 map.mapped_span.subspan(offset, image.unswizzled_size_bytes),
+                                 swizzle_data_buffer);
+                });
             first = last;
+        }
+        const auto end = std::chrono::steady_clock::now();
+        report.elapsed += end - begin;
+        if (end - report.begin >= std::chrono::seconds{10}) {
+            LOG_INFO(Render_Vulkan,
+                     "Native texture readback batches: images={}, waits={}, waits_saved={}, "
+                     "bytes={}, readback_ms={:.1f}, window_ms={:.1f}",
+                     report.images, report.batches, report.images - report.batches, report.bytes,
+                     std::chrono::duration<double, std::milli>(report.elapsed).count(),
+                     std::chrono::duration<double, std::milli>(end - report.begin).count());
+            report = {end};
         }
         return;
     }
@@ -3473,7 +3540,11 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     if (retained) {
         LOG_INFO(Render_Vulkan, "Retained image for queued download: id={}", image_id.Value());
     } else if (!immediate_delete) {
-        sentenced_images.Push(std::move(slot_images[image_id]));
+        u64 bytes{};
+        if constexpr (requires { slot_images[image_id].DeviceLocalAllocationBytes(); }) {
+            bytes = slot_images[image_id].DeviceLocalAllocationBytes();
+        }
+        sentenced_images.Push({retired_image_memory, bytes, std::move(slot_images[image_id])});
     }
     slot_images.erase(image_id);
 

@@ -8,10 +8,12 @@ add_executable(tests
     common/bit_field.cpp
     common/cityhash.cpp
     common/container_hash.cpp
+    common/event.cpp
     common/fibers.cpp
     common/host_memory.cpp
     common/host_memory_fallback.cpp
     common/param_package.cpp
+    common/paged_scalar.cpp
     common/range_map.cpp
     common/ring_buffer.cpp
     common/scratch_buffer.cpp
@@ -43,6 +45,7 @@ add_executable(tests
     video_core/nx2_sparse_image_layout.cpp
     video_core/nx2_sparse_image_write.cpp
     video_core/nx2_command_sync.cpp
+    video_core/semaphore_acquire.cpp
     video_core/nx2_command_ranges.cpp
     video_core/physical_alias.cpp
     video_core/ampere_returns.cpp
@@ -51,13 +54,19 @@ add_executable(tests
     video_core/compute_dispatch.cpp
     video_core/gpu_split_metrics.cpp
     video_core/draw_table_snapshot.cpp
+    video_core/download_batch.cpp
     video_core/virtual_range_cache.cpp
     video_core/uniform_upload_cache.cpp
     video_core/storage_binding_sync.cpp
     video_core/command_write_frontier.cpp
+    video_core/split_completion.cpp
+    video_core/fence_download_merge.cpp
+    video_core/texture_audit_collector.cpp
+    video_core/sync_audit_command_fetch.cpp
     video_core/native_storage_mappings.cpp
     video_core/native_qmd_write.cpp
     video_core/readback_coverage.cpp
+    video_core/retired_resource.cpp
     video_core/cooperative_matrix.cpp
     video_core/ampere_kirby.cpp
     video_core/ampere_geometry.cpp

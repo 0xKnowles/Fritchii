@@ -18,6 +18,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/div_ceil.h"
+#include "common/paged_scalar.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/device_memory.h"
@@ -374,23 +375,17 @@ const T* DeviceMemoryManager<Traits>::GetPointer(DAddr address) const {
 template <typename Traits>
 template <typename T>
 void DeviceMemoryManager<Traits>::Write(DAddr address, T value) {
-    T* ptr = GetPointer<T>(address);
-    if (!ptr) [[unlikely]] {
-        return;
-    }
-    std::memcpy(ptr, &value, sizeof(T));
+    Common::WritePagedScalar(address, value, [&](DAddr page_address) {
+        return page_address < device_as_size ? GetPointer<u8>(page_address) : nullptr;
+    });
 }
 
 template <typename Traits>
 template <typename T>
 T DeviceMemoryManager<Traits>::Read(DAddr address) const {
-    const T* ptr = GetPointer<T>(address);
-    T result{};
-    if (!ptr) [[unlikely]] {
-        return result;
-    }
-    std::memcpy(&result, ptr, sizeof(T));
-    return result;
+    return Common::ReadPagedScalar<T>(address, [&](DAddr page_address) {
+        return page_address < device_as_size ? GetPointer<u8>(page_address) : nullptr;
+    });
 }
 
 template <typename Traits>

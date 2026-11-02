@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <barrier>
+#include <thread>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include "shader_recompiler/exception.h"
@@ -135,6 +138,92 @@ TEST_CASE("Recorded native surface writes retain a different descriptor bank",
     REQUIRE(recorded.TakeReads().Matches(env));
 }
 } // namespace
+
+TEST_CASE("Parallel shader cache misses build a matching translation once",
+          "[video_core][shader_reuse]") {
+    Vulkan::ShaderReuseCache cache;
+    Vulkan::ShaderTranslationKey key{};
+    constexpr size_t WorkerCount = 8;
+    std::barrier start{static_cast<std::ptrdiff_t>(WorkerCount)};
+    std::atomic<u32> builds{};
+    std::array<std::shared_ptr<const Vulkan::ReusableShaders>, WorkerCount> results;
+    std::array<std::jthread, WorkerCount> workers;
+    for (size_t i = 0; i < WorkerCount; ++i) {
+        workers[i] = std::jthread([&, i] {
+            // All workers observe the same cold miss before anyone may publish it.
+            auto shaders = cache.Find(key, {}).shaders;
+            start.arrive_and_wait();
+            if (!shaders) {
+                auto guard = cache.LockBuild(key);
+                shaders = cache.Find(key, {}).shaders;
+                if (!shaders) {
+                    ++builds;
+                    shaders = std::make_shared<Vulkan::ReusableShaders>();
+                    cache.Add(key, shaders);
+                }
+            }
+            results[i] = std::move(shaders);
+        });
+    }
+    for (auto& worker : workers) {
+        worker.join();
+    }
+    REQUIRE(builds == 1);
+    REQUIRE(cache.Contains(key));
+    REQUIRE(results.front());
+    for (const auto& result : results) {
+        REQUIRE(result == results.front());
+    }
+}
+
+TEST_CASE("Shader build reservations survive growth and release after failure",
+          "[video_core][shader_reuse]") {
+    Vulkan::ShaderReuseCache cache;
+    Vulkan::ShaderTranslationKey key{};
+    {
+        auto guard = cache.LockBuild(key);
+        REQUIRE_FALSE(cache.Contains(key));
+        REQUIRE_FALSE(cache.Find(key, {}).shaders);
+        REQUIRE_FALSE(cache.Find(key, {}).rejected);
+        // Other keys must not wait for this key; rehashing must not move its mutex.
+        for (u64 i = 1; i <= 128; ++i) {
+            auto other = key;
+            other.unique_hashes[0] = i;
+            auto other_guard = cache.LockBuild(other);
+            REQUIRE(other_guard.owns_lock());
+        }
+    }
+    REQUIRE_THROWS_AS([&] {
+        auto guard = cache.LockBuild(key);
+        throw Shader::RuntimeError("translation failed");
+    }(), Shader::RuntimeError);
+    auto retry = cache.LockBuild(key);
+    REQUIRE(retry.owns_lock());
+    cache.Add(key, std::make_shared<Vulkan::ReusableShaders>());
+    REQUIRE(cache.Find(key, {}).shaders);
+}
+
+TEST_CASE("Shader build reservations still validate environment variants",
+          "[video_core][shader_reuse]") {
+    Vulkan::ShaderReuseCache cache;
+    Vulkan::ShaderTranslationKey key{};
+    NativeEnvironment env;
+    std::array<Shader::Environment*, 1> envs{&env};
+    {
+        auto guard = cache.LockBuild(key);
+        Vulkan::RecordingEnvironment recorded{env};
+        recorded.IsCbufStorageBufferPointer(4, 0x20);
+        auto shaders = std::make_shared<Vulkan::ReusableShaders>();
+        shaders->reads.push_back(recorded.TakeReads());
+        cache.Add(key, shaders);
+    }
+    REQUIRE(cache.Find(key, envs).shaders);
+    env.pointer = false;
+    auto guard = cache.LockBuild(key);
+    const auto different = cache.Find(key, envs);
+    REQUIRE_FALSE(different.shaders);
+    REQUIRE(different.rejected);
+}
 
 TEST_CASE("Native root constants survive translation and shader-info collection",
           "[video_core][ampere][root_table]") {

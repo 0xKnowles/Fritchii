@@ -520,6 +520,16 @@ void Image::SetObjectNameEXT(const char* name) const {
     SetObjectName(dld, owner, handle, VK_OBJECT_TYPE_IMAGE, name);
 }
 
+VkDeviceSize Image::DeviceLocalAllocationBytes() const noexcept {
+    if (!handle || !allocation) return 0;
+    VkMemoryPropertyFlags properties{};
+    vmaGetAllocationMemoryProperties(allocator, allocation, &properties);
+    if ((properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) return 0;
+    VmaAllocationInfo info{};
+    vmaGetAllocationInfo(allocator, allocation, &info);
+    return info.size;
+}
+
 void Image::Release() const noexcept {
     if (handle) {
         vmaDestroyImage(allocator, handle, allocation);
@@ -540,6 +550,16 @@ void Buffer::Invalidate() const {
 
 void Buffer::SetObjectNameEXT(const char* name) const {
     SetObjectName(dld, owner, handle, VK_OBJECT_TYPE_BUFFER, name);
+}
+
+VkDeviceSize Buffer::DeviceLocalAllocationBytes() const noexcept {
+    if (!handle || !allocation) return 0;
+    VkMemoryPropertyFlags properties{};
+    vmaGetAllocationMemoryProperties(allocator, allocation, &properties);
+    if ((properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) return 0;
+    VmaAllocationInfo info{};
+    vmaGetAllocationInfo(allocator, allocation, &info);
+    return info.size;
 }
 
 void Buffer::Release() const noexcept {

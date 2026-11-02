@@ -10,6 +10,7 @@
 
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "video_core/nx2.h"
 
 namespace VideoCommon::ReadbackDiagnostics {
 
@@ -25,18 +26,29 @@ enum class Event : size_t {
     BufferFinish,
     Submit,
     DeviceFinish,
+    FenceDownloadCommit,
+    FenceDownloadWriteback,
+    /// Buffer pages a CPU read newly made eager (downloaded at every fence after a GPU write).
+    EagerPagesAdded,
+    /// One fence writeback in 64: bytes compared with guest memory before being written...
+    FenceWritebackSampled,
+    /// ...and those of them guest memory already held (the copy changed nothing).
+    FenceWritebackUnchanged,
     Count,
 };
 
 inline constexpr std::array<const char*, static_cast<size_t>(Event::Count)> names{
     "ordered_read", "flush_area", "texture_readback", "buffer_readback", "query_readback",
     "download_staging", "deferred_download_staging", "upload_staging", "buffer_finish",
-    "submit", "device_finish",
+    "submit", "device_finish", "fence_download_commit", "fence_download_writeback",
+    "eager_pages_added", "fence_writeback_sampled", "fence_writeback_unchanged",
 };
 
 inline bool Enabled() {
     static const bool enabled = std::getenv("EDEN_NX2_READBACK_DIAGNOSTICS") != nullptr;
-    return enabled;
+    // Per-thread sampling only: do not enable the full GPU profiler and its shared
+    // instruction/page tracking. Native titles need attribution of these stalls.
+    return enabled || Tegra::g_nx2_ampere.load(std::memory_order_relaxed);
 }
 
 struct Measurement {

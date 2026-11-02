@@ -737,6 +737,8 @@ public:
         return usage;
     }
 
+    [[nodiscard]] VkDeviceSize DeviceLocalAllocationBytes() const noexcept;
+
 private:
     void Release() const noexcept;
 
@@ -830,6 +832,8 @@ public:
     MemoryLocation Location() const noexcept {
         return location;
     }
+
+    [[nodiscard]] VkDeviceSize DeviceLocalAllocationBytes() const noexcept;
 
 private:
     void Release() const noexcept;

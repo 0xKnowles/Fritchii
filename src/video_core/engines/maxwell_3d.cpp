@@ -979,7 +979,13 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         }
     }
     if (from_macro) {
-        split.MacroWrite(this, method, argument);
+        // Ordinary state writes only update registers/shadow/dirty flags when no
+        // instanced draw can be pending. Otherwise ConsumeSink or this write can
+        // issue that draw, so it must remain a command-memory hazard. draw_pending
+        // starts true and only clears after queuing the ordered FinishFrontMacro.
+        const bool may_write = VideoCommon::CommandWriteFrontier::StateWriteMayExecute(
+            !execution_mask[method], fs.draw_pending);
+        split.MacroWrite(this, method, argument, may_write);
     } else {
         split.Method(this, method, argument, is_last_call, nullptr);
     }
@@ -1087,7 +1093,9 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
             }
         }
     }
-    split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr);
+    const bool may_write = VideoCommon::CommandWriteFrontier::StateWriteMayExecute(
+        !execution_mask[method], fs.draw_pending);
+    split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr, may_write);
 }
 
 void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
@@ -1142,12 +1150,22 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
 
 void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
                              u32 count) {
+    // Attribute the synchronous read that stalls the command producer. Keep the
+    // measurement bounded and automatic: only one in 64 reads takes timestamps.
+    static thread_local struct {
+        VideoCommon::NativeDmaReadMetrics metrics;
+        u64 window_start{};
+    } report;
+    const u32 words = std::min<u32>(count, 0x1000);
+    const bool sampled = report.metrics.BeginRead(words);
+    const u64 begin = sampled ? VideoCommon::Nx2Profile::Now() : 0;
+    if (sampled && report.window_start == 0) report.window_start = begin;
     // The words may be written by methods still queued for the back (indirect draw arguments
     // from a culling dispatch), and the caches that may hold newer ones belong to it.
     split.Drain();
+    const u64 after_drain = sampled ? VideoCommon::Nx2Profile::Now() : 0;
     const GPUVAddr source = (GPUVAddr{fs.regs[0x154] & 0x1ffffff} << 32) | fs.regs[0x155];
     const u32 ram = fs.regs[0x156];
-    const u32 words = std::min<u32>(count, 0x1000);
     const size_t read_bytes = size_t{words} * sizeof(u32);
     if (VideoCommon::Nx2Profile::Enabled()) {
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
@@ -1155,15 +1173,38 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     // Query reports too (occlusion-based conditional rendering, see MacroEngine::ReadNativeMemory);
     // the back is drained, so its caches are safe to flush from here.
     constexpr auto flush_caches = VideoCommon::CacheType::BufferCache | VideoCommon::CacheType::QueryCache;
-    if (memory_manager.IsMemoryDirty(source, read_bytes, flush_caches)) {
+    const bool dirty = memory_manager.IsMemoryDirty(source, read_bytes, flush_caches);
+    const u64 after_check = sampled ? VideoCommon::Nx2Profile::Now() : 0;
+    if (dirty) {
+        ++report.metrics.flushes;
         memory_manager.FlushRegion(source, read_bytes, flush_caches);
     }
+    const u64 after_flush = sampled ? VideoCommon::Nx2Profile::Now() : 0;
     for (u32 i = 0; i < words; ++i) {
         const u32 word = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
         if (method == 0x158) {
             fs.parameters.push_back(word);
         } else if (ram + i < native_data_ram.size()) {
             native_data_ram[ram + i] = word;
+        }
+    }
+    if (sampled) {
+        const u64 end = VideoCommon::Nx2Profile::Now();
+        auto& metrics = report.metrics;
+        metrics.RecordSample(after_drain - begin, after_check - after_drain,
+                             after_flush - after_check, end - after_flush);
+        if (end - report.window_start >= 10'000'000'000ULL) {
+            LOG_INFO(HW_GPU,
+                     "Native MME DMA read attribution: calls={}, words={}, flushes={}, "
+                     "samples={} (1/{} reads), sampled_drain_ms={:.3f}, "
+                     "sampled_dirty_check_ms={:.3f}, sampled_flush_ms={:.3f}, "
+                     "sampled_read_ms={:.3f}, window_ms={:.1f}",
+                     metrics.calls, metrics.words, metrics.flushes, metrics.samples,
+                     VideoCommon::NativeDmaReadMetrics::SamplePeriod,
+                     metrics.drain_ns / 1e6, metrics.dirty_check_ns / 1e6,
+                     metrics.flush_ns / 1e6, metrics.read_ns / 1e6,
+                     (end - report.window_start) / 1e6);
+            report = {{}, end};
         }
     }
 }

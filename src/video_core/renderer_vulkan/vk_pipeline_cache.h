@@ -235,6 +235,9 @@ private:
 
     /// Declared before every thread pool, which all use it.
     ShaderReuseCache shader_reuse;
+    std::atomic<size_t> reused_translations{};
+    std::atomic<size_t> coalesced_translations{};
+    std::atomic<size_t> translated_sets{};
 
     Shader::Profile profile;
     Shader::HostTranslateInfo host_info;

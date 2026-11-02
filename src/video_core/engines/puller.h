@@ -79,6 +79,7 @@ public:
         u32 operation;
         std::chrono::steady_clock::time_point since;
         bool reported;
+        bool satisfied{};
 
         [[nodiscard]] bool Matches(u32 current) const;
     };
@@ -146,6 +147,7 @@ private:
     void ProcessSemaphoreRelease(DmaPusher& dma_pusher);
     void ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher);
     void ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument);
+    void BeginAcquire(DmaPusher& dma_pusher, PendingAcquire acquire);
     [[nodiscard]] bool ExecuteMethodOnEngine(DmaPusher& dma_pusher, u32 method);
 
     std::optional<PendingAcquire> pending_acquire;

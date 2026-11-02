@@ -155,6 +155,10 @@ public:
 
     void DispatchCalls();
 
+    [[nodiscard]] bool CanDispatch() const {
+        return ib_enable && !dma_pushbuffer.empty();
+    }
+
     /// Switch 2: true while the channel is suspended on a semaphore acquire.
     [[nodiscard]] bool HasPendingAcquire() const {
         return puller.HasPendingAcquire();
@@ -196,7 +200,8 @@ public:
     void CheckSubmitHash(const CommandListHeader& header, u64 submit_hash);
     void RecordParsedEntry(const CommandListHeader& header, std::span<const CommandHeader> commands);
     /// Brings command list words the GPU wrote (still only in host buffers) to guest memory.
-    void FlushGpuWrittenCommands(GPUVAddr address, size_t size);
+    /// `sync_wait`: the GP entry's SYNC bit, recorded as evidence only (it changes nothing).
+    void FlushGpuWrittenCommands(GPUVAddr address, size_t size, bool sync_wait);
 
 private:
 

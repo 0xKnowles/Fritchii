@@ -88,7 +88,7 @@ public:
 
     template <typename T>
     [[nodiscard]] inline const T* GetPointer(GPUVAddr addr) const noexcept {
-        return GetPointer<T*>(addr);
+        return reinterpret_cast<const T*>(GetPointer(addr));
     }
 
     /**

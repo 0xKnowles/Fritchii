@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstring>
 #include <functional>
 #include <limits>
 #include <map>
@@ -14,6 +15,8 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "video_core/command_fetch_sync_audit.h"
+#include "video_core/semaphore_acquire.h"
 
 namespace Tegra {
 
@@ -105,6 +108,33 @@ void Nx2SynchronizeGpuWrittenCommands(GPUVAddr address, size_t size, Drain&& dra
     if (size == 0) return;
     drain();
     if (Nx2HasGpuWrittenPage(address, size, translate)) flush();
+}
+
+// The same synchronization, in the same order (every fetch drains before its historical-page
+// test, so a queued first GPU write is still seen), plus SYNC_WAIT contract evidence
+// (command_fetch_sync_audit.h). Only atomic page history is inspected before the drain:
+// sampling command bytes there would race with queued host-side writers.
+template <typename WritersPending, typename Drain, typename Translate, typename Flush, typename Now>
+bool Nx2SynchronizeGpuWrittenCommandsAudited(GPUVAddr address, size_t size, bool sync_wait,
+                                             VideoCommon::CommandFetchSyncAudit& audit,
+                                             WritersPending&& writers_pending, Drain&& drain,
+                                             Translate&& translate, Flush&& flush,
+                                             Now&& now) {
+    if (size == 0) return false;
+    using Audit = VideoCommon::CommandFetchSyncAudit;
+    Audit::Fetch fetch{};
+    fetch.sync_wait = sync_wait;
+    fetch.known_gpu_written_before = Nx2HasGpuWrittenPage(address, size, translate);
+    const bool candidate = Audit::IsCandidate(sync_wait, fetch.known_gpu_written_before);
+    fetch.writers_pending = candidate && writers_pending();
+    const u64 start = fetch.writers_pending ? now() : 0;
+    drain();
+    if (fetch.writers_pending) fetch.wait_ns = now() - start;
+    const bool hit = Nx2HasGpuWrittenPage(address, size, translate);
+    fetch.gpu_written_after = hit && !fetch.known_gpu_written_before;
+    if (hit) flush();
+    audit.Record(fetch);
+    return hit;
 }
 
 // NVN2 queues release their progress values into the second page of a two-page GPU-accessible
@@ -409,16 +439,7 @@ private:
     };
 
     static bool Matches(const Waiter& w, u32 current) {
-        switch (w.operation) {
-        case AcquireEqual:
-            return current == w.value;
-        case AcquireGequal:
-            return current >= w.value;
-        case AcquireMask:
-            return (current & w.value) != 0;
-        default:
-            return false;
-        }
+        return SemaphoreMatches(w.operation, current, w.value);
     }
 
     std::mutex mutex;

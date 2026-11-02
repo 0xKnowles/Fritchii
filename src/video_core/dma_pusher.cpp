@@ -346,7 +346,7 @@ void DmaPusher::DispatchCalls() {
 }
 
 bool DmaPusher::Step() {
-    if (!ib_enable || dma_pushbuffer.empty()) {
+    if (!CanDispatch()) {
         return false;
     }
     if (puller.HasPendingAcquire()) RecordCapture("acquire-resume-attempt");
@@ -495,7 +495,8 @@ bool DmaPusher::Step() {
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         } else {
-            FlushGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
+            FlushGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32),
+                                    header.sync != 0);
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::UnsafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
             RecordParsedEntry(header, commands);
@@ -845,30 +846,35 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
     }
 }
 
-void DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
+void DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size, bool sync_wait) {
     // Title 1 runs small command lists its culling dispatches fill in each frame. Accurate GPU
     // mode reads every command list through the caches (safe reads); here only the ones on pages
     // the GPU has written are, or their draws run with an older frame's words (trees vanish).
     if (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) || size == 0) {
         return;
     }
-    bool historical_hit = false;
     bool flushed = false;
-    Nx2SynchronizeGpuWrittenCommands(address, size,
-        [] {
-            if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    // Unchanged ordering: drain possible writers, then test the historical pages, then flush.
+    // The SYNC bit and the pre-drain page test are only recorded (see
+    // command_fetch_sync_audit.h); no fetch skips its synchronization because of them.
+    const bool historical_hit = Nx2SynchronizeGpuWrittenCommandsAudited(
+        address, size, sync_wait, split.FetchSyncAudit(),
+        [&] { return split.MemoryWritersPending(); },
+        [&] {
+            if (split.Active()) {
                 split.DrainCommandReads();
             }
         },
         [&](GPUVAddr page) { return memory_manager.GpuToCpuAddress(page); },
         [&] {
-            historical_hit = true;
             if (memory_manager.IsMemoryDirty(address, size, VideoCommon::CacheType::BufferCache)) {
                 memory_manager.FlushRegion(address, size, VideoCommon::CacheType::BufferCache);
                 flushed = true;
             }
-        });
-    VideoCommon::GpuSplit::Get().NoteCommandFetch(size, historical_hit, flushed);
+        },
+        [] { return VideoCommon::Nx2Profile::Now(); });
+    split.NoteCommandFetch(size, historical_hit, flushed);
 }
 
 void DmaPusher::ReportUnboundSubchannel() {

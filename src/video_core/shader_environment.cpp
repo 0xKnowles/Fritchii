@@ -36,6 +36,7 @@
 #include "shader_recompiler/frontend/ampere/trap_guards.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/shader_environment.h"
 #include "video_core/texture_cache/format_lookup_table.h"
 #include "video_core/textures/texture.h"
@@ -602,6 +603,50 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
     if (!lowered) {
         const size_t failed = lowered.error_offset / sizeof(Shader::Ampere::Instruction);
         const auto words = failed < native.size() ? native[failed].words : std::array<u32, 4>{};
+        // ISBE semantics depend on the entire header and on task/mesh controls, not merely
+        // the failing instruction or its stage slot. Keep bounded local evidence automatically
+        // so the next test can resolve that ambiguity without disabling correctness checks.
+        const u32 opcode = words[0] & 0xfff;
+        if (opcode == 0x923 || opcode == 0x927) {
+            static std::atomic<u32> captures{};
+            if (captures.fetch_add(1, std::memory_order_relaxed) < 16) {
+                try {
+                    const auto directory = Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir) /
+                                           "native-shader-rejections";
+                    std::error_code ec;
+                    std::filesystem::create_directories(directory, ec);
+                    if (!ec) {
+                        const auto stem = fmt::format("{:016x}-{:016x}-{:x}",
+                            Tegra::g_nx2_program_id.load(std::memory_order_relaxed),
+                            Shader::Ampere::NativeProgramKey(native), program_base);
+                        const auto path = directory / (stem + ".bin");
+                        if (!std::filesystem::exists(path, ec) && !ec && native_header_size <= 128) {
+                            std::array<u8, 128> header{};
+                            gpu_memory->ReadBlockUnsafe(program_base, header.data(), native_header_size);
+                            std::ofstream capture(path, std::ios::binary);
+                            capture.write(reinterpret_cast<const char*>(header.data()), native_header_size);
+                            capture.write(reinterpret_cast<const char*>(native.data()), native.size() * sizeof(Instruction));
+                            capture.close();
+                            std::ofstream metadata(directory / (stem + ".txt"));
+                            metadata << fmt::format(
+                                "header_bytes={}\nstage={}\nprogram={:#x}\nerror_offset={:#x}\nerror={}\n"
+                                "mesh_control={:#x}\nmesh_shader_a={:#x}\nmesh_shader_b={:#x}\nmesh_init_shader={:#x}\n",
+                                native_header_size, static_cast<u32>(stage), program_base,
+                                lowered.error_offset, lowered.error, native_mesh_state[0],
+                                native_mesh_state[1], native_mesh_state[2], native_mesh_state[3]);
+                            metadata.close();
+                            if (capture && metadata) {
+                                LOG_INFO(Shader, "Rejected ISBE shader captured to {}", path.string());
+                            } else {
+                                LOG_WARNING(Shader, "Could not complete rejected shader capture at {}", path.string());
+                            }
+                        }
+                    }
+                } catch (const std::exception& error) {
+                    LOG_WARNING(Shader, "Rejected shader capture failed: {}", error.what());
+                }
+            }
+        }
         throw Shader::RuntimeError(
             "Native shader at {:#x}, instruction {:#x}: {} [op {:03x} {:08x} {:08x} {:08x} {:08x}]",
             program_base, lowered.error_offset, lowered.error, words[0] & 0xfff, words[0],
@@ -672,6 +717,8 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
         break;
     }
     if (maxwell3d->GetNativeMacroEngine().native_turing) {
+        // SET_MESH_CONTROL, SET_MESH_SHADER_A/B, SET_MESH_INIT_SHADER (byte offsets 0x114c..0x1158).
+        std::copy_n(maxwell3d->regs.reg_array.begin() + 0x114c / 4, 4, native_mesh_state.begin());
         if (program != Maxwell::ShaderType::VertexB && program != Maxwell::ShaderType::Geometry &&
             program != Maxwell::ShaderType::Pixel) {
             if (std::getenv("EDEN_NX2_SHADER_DUMP")) {

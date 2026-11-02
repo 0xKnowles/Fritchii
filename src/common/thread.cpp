@@ -646,6 +646,16 @@ __attribute__((target("waitpkg,mwaitx")))
 #endif
 bool Event::WaitFor(const std::chrono::nanoseconds time) {
 #ifdef _WIN32
+    const auto consume_signal = [this] {
+        bool expected = true;
+        return is_set.compare_exchange_strong(expected, false, std::memory_order_acq_rel);
+    };
+    if (consume_signal()) {
+        return true;
+    }
+    if (time <= std::chrono::nanoseconds::zero()) {
+        return false;
+    }
     auto const start = Common::X64::FencedRDTSC();
     auto const& caps = Common::g_cpu_caps;
     [[maybe_unused]] auto const end = start + Common::g_wall_clock.NsToTicks(time);
@@ -662,31 +672,42 @@ bool Event::WaitFor(const std::chrono::nanoseconds time) {
                 auto const now = _rdtsc();
 #endif
                 if (end > now) {
-                    u32 const cycles = std::min<u32>((std::numeric_limits<u32>::max)(), s64(end) - s64(now));
+                    // Clamp before narrowing: min<u32> truncated the remaining 64-bit
+                    // interval first (and could produce zero, disabling the timer).
+                    const u32 cycles = static_cast<u32>((std::min)(
+                        u64{(std::numeric_limits<u32>::max)()}, end - now));
                     // See here: https://github.com/torvalds/linux/blob/948a64995aca6820abefd17f1a4258f5835c5ad9/arch/x86/lib/delay.c#L93
                     // MWAITX accepts a 32-bit input timer which determines the total number of cycles to wait for
                     // NOT THE TOTAL ABSOLUTE TSC VALUE, it's just a delta
                     // BIT[1] = use a timer
                     // Hint = 0: Use C1 state when sleepy (means slower wakeup but better savings)
                     _mm_mwaitx(1 << 1, 0u, cycles);
-                    if (!is_set.load())
-                        return false;
                 } else
                     return false; //timeout
             }
-            bool expected = true;
-            if (is_set.compare_exchange_weak(expected, false, std::memory_order_release))
+            // Interrupts and unrelated writes to the monitored cache line can wake
+            // MWAITX. Only the event predicate or the actual deadline ends the wait.
+            if (consume_signal())
                 return true;
         }
     } else if (caps.waitpkg) {
         // #UD If CPUID.7.0:ECX.WAITPKG[bit 5]=0.
         while (true) {
             _umonitor(std::addressof(is_set));
-            if (!is_set.load() && !_umwait(0, end)) //umwait is absolute time!!!
+            // Do not issue a failed compare-exchange between UMONITOR and UMWAIT:
+            // the RMW itself can invalidate the monitored line and prevent sleeping.
+            if (is_set.load()) {
+                if (consume_signal()) {
+                    return true;
+                }
+                continue;
+            }
+            if (Common::X64::FencedRDTSC() >= end) {
                 return false;
-            bool expected = true;
-            if (is_set.compare_exchange_weak(expected, false, std::memory_order_release))
-                return true;
+            }
+            // CF reports the OS-imposed wait limit, not whether our event was
+            // signalled. Spurious/limited wakes must recheck predicate and time.
+            (void)_umwait(0, end);
         }
     } else {
 #ifdef _MSC_VER
@@ -696,9 +717,7 @@ bool Event::WaitFor(const std::chrono::nanoseconds time) {
         while (!is_set.load() && end > _rdtsc())
             Common::Windows::SleepForOneTick();
 #endif
-        if (is_set.load())
-            Reset();
-        return true;
+        return consume_signal();
     }
 #else
     std::unique_lock lk{mutex};
@@ -711,12 +730,20 @@ bool Event::WaitFor(const std::chrono::nanoseconds time) {
 #else
 bool Event::WaitFor(const std::chrono::nanoseconds time) {
 #ifdef _WIN32
+    const auto consume_signal = [this] {
+        bool expected = true;
+        return is_set.compare_exchange_strong(expected, false, std::memory_order_acq_rel);
+    };
+    if (consume_signal()) {
+        return true;
+    }
+    if (time <= std::chrono::nanoseconds::zero()) {
+        return false;
+    }
     auto const end = Common::g_wall_clock.GetTimeNS() + time;
     while (!is_set.load() && end > Common::g_wall_clock.GetTimeNS())
         Common::Windows::SleepForOneTick();
-    if (is_set.load())
-        Reset();
-    return true;
+    return consume_signal();
 #else
     std::unique_lock lk{mutex};
     if (!condvar.wait_for(lk, time, [this] { return is_set.load(); }))

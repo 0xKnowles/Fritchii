@@ -116,6 +116,8 @@ protected:
                               u32 source_header_size = 128);
     std::shared_ptr<const LoweredNativeCode> LowerNativeCode(u32 source_header_size);
     size_t native_source_size{};
+    // Raw Turing+ mesh controls retained for bounded rejected-shader diagnostics only.
+    std::array<u32, 4> native_mesh_state{};
     std::shared_ptr<const LoweredNativeCode> lowered_native;
 
     Tegra::Texture::TICEntry ReadTextureInfo(GPUVAddr tic_addr, u32 tic_limit,

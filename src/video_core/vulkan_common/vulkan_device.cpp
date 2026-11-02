@@ -29,6 +29,7 @@
 #include "common/settings_enums.h"
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
 #include "video_core/vulkan_common/cooperative_matrix.h"
+#include "video_core/vulkan_common/memory_budget.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -418,8 +419,7 @@ std::filesystem::path StaticPipelineCacheFilename() {
 // (title 1).
 u64 AllocatedUsage(VkDeviceSize driver_usage, const VmaBudget& vma_budget) {
     const VmaStatistics& statistics = vma_budget.statistics;
-    const u64 unused = statistics.blockBytes - statistics.allocationBytes;
-    return driver_usage - (std::min)(driver_usage, unused);
+    return AllocationAdjustedBytes(driver_usage, statistics.blockBytes, statistics.allocationBytes);
 }
 
 } // Anonymous namespace
@@ -1696,6 +1696,15 @@ u64 Device::GetDeviceMemoryBudget() const {
     if (heap_size_limit != 0) {
         result = (std::min)(result, heap_size_limit);
     }
+    // Deliberately NOT reduced by the unused space in VMA blocks. The texture collector compares
+    // this with GetDeviceMemoryUsage(), which counts allocations (see AllocatedUsage): evicting
+    // an image lowers that count but frees no block until the block is empty. Subtracting the
+    // free block space here lowered the threshold by every byte the collector freed, so its
+    // evictions never made progress (the comparison became raw usage against raw budget): title
+    // 1 re-evicted and re-uploaded costly textures in bursts at each 30-frame budget re-read
+    // while VMA's block total stayed flat for minutes. Free block space is not fictitious
+    // headroom for the collector: the next allocations of that memory type fill it before VMA
+    // creates another block. See VideoCommon::CollectorThresholds.
     for (const size_t heap : valid_heap_memory) {
         if (heap != main_heap) {
             result += AllocatedUsage(budget.heapUsage[heap], heap_budgets[heap]);

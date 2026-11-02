@@ -31,6 +31,7 @@
 #include "common/scratch_buffer.h"
 #include "common/slot_vector.h"
 #include "video_core/texture_cache/pending_download.h"
+#include "video_core/texture_cache/retired_resource.h"
 #include "common/thread_worker.h"
 #include "video_core/compatible_formats.h"
 #include "video_core/control/channel_state_cache.h"
@@ -583,7 +584,9 @@ private:
  #else
     static constexpr size_t TICKS_TO_DESTROY = 8;
 #endif
-    DelayedDestructionRing<Image, TICKS_TO_DESTROY> sentenced_images;
+    // Declared first so it outlives all credits during cache destruction.
+    RetirementMemory retired_image_memory;
+    DelayedDestructionRing<RetiredResource<Image>, TICKS_TO_DESTROY> sentenced_images;
     DelayedDestructionRing<ImageView, TICKS_TO_DESTROY> sentenced_image_view;
     DelayedDestructionRing<Framebuffer, TICKS_TO_DESTROY> sentenced_framebuffers;
 

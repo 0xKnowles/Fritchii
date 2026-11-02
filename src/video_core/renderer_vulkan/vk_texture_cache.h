@@ -410,6 +410,14 @@ public:
         return sparse_layers.bound_bytes;
     }
 
+    // Exact allocation sizes for resources this image alone owns. Sparse allocations
+    // require DEVICE_LOCAL; fallback host-only allocations are not credited as VRAM.
+    u64 DeviceLocalAllocationBytes() const noexcept {
+        return original_image.DeviceLocalAllocationBytes() +
+               scaled_image.DeviceLocalAllocationBytes() +
+               compute_unswizzle_buffer.DeviceLocalAllocationBytes() + sparse_layers.bound_bytes;
+    }
+
     bool IsRescaled() const noexcept;
 
     bool ScaleUp(bool ignore = false);

@@ -879,7 +879,10 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
         return;
     }
     FrontApply(fs, method, argument);
-    split.Method(this, method, argument, is_last_call, segment);
+    const bool state_only = native_mode && method < native_plain_methods.size() &&
+                            native_plain_methods[method];
+    split.Method(this, method, argument, is_last_call, segment,
+                 VideoCommon::CommandWriteFrontier::StateWriteMayExecute(state_only, false));
 }
 
 void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split,
@@ -897,7 +900,12 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
             FrontApply(fs, method, base_start[i]);
         }
     }
-    split.MultiMethod(this, method, base_start, amount, methods_pending, segment);
+    // Use the same predicate as CallMethod's register-only native fast path.
+    // ConsumeSinkImpl only stores registers; compute has no deferred draw to flush.
+    const bool state_only = native_mode && method < native_plain_methods.size() &&
+                            native_plain_methods[method];
+    split.MultiMethod(this, method, base_start, amount, methods_pending, segment,
+                      VideoCommon::CommandWriteFrontier::StateWriteMayExecute(state_only, false));
 }
 
 void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
@@ -928,7 +936,10 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
                 return true;
             }
             FrontApply(fs, address, value);
-            split.MacroWrite(this, address, value);
+            const bool state_only = native_mode && address < native_plain_methods.size() &&
+                                    native_plain_methods[address];
+            split.MacroWrite(this, address, value,
+                VideoCommon::CommandWriteFrontier::StateWriteMayExecute(state_only, false));
             return true;
         });
     if (!result.success) {

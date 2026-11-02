@@ -583,21 +583,24 @@ private:
     Common::RangeSet<DAddr> read_trapped_ranges;
     Common::RangeSet<DAddr> gpu_modified_ranges;
     std::deque<Common::RangeSet<DAddr>> committed_gpu_modified_ranges;
-    /// Buffer pages the guest CPU reads (NoteCpuRead). Without AsyncBufferDownloads, GPU writes
-    /// to them are still copied back at fences: Pokemon Pokopia builds its sky, fog and exposure
-    /// constants from values the GPU computes, and drew a black, flickering sky without them.
-    /// Copying every GPU-written range back instead (each written native storage binding is an
-    /// 8 MiB window) dropped it from 60 to about 42 frames a second.
-    Common::RangeSet<DAddr> cpu_read_ranges;
 
     /// Queues the parts of a GPU write to [addr, addr + size) that are copied back at the next
-    /// fence.
+    /// fence. Without AsyncBufferDownloads those are the Preflushable pages: every page a guest
+    /// CPU read has asked GetFlushArea to flush. Pokemon Pokopia builds its sky, fog and exposure
+    /// constants from values the GPU computes, and drew a black, flickering sky without them.
+    /// Copying every GPU-written range back instead (each written native storage binding is an
+    /// 8 MiB window) dropped it from 60 to about 42 frames a second. (A separate CPU-read range
+    /// set used to duplicate the Preflushable pages here; it was never anything else.)
     void QueueDownload(DAddr addr, u64 size) {
         if (QueueFenceDownloadRanges(AsyncBufferDownloads(), addr, size, memory_tracker,
-                                     cpu_read_ranges, uncommitted_gpu_modified_ranges)) {
+                                     uncommitted_gpu_modified_ranges)) {
             ArmReadTraps(addr, size);
         }
     }
+
+    /// Staging buffers of fence downloads already written back: reusable once the GPU passes
+    /// the current tick. Released at the next commit, not only at the next frame.
+    void ReleaseRetiredDownloadStaging();
 
     // Async Buffers
     Common::OverlapRangeSet<DAddr> async_downloads;
@@ -606,6 +609,8 @@ private:
     std::optional<Async_Buffer> current_buffer;
 
     std::deque<Async_Buffer> async_buffers_death_ring;
+    u64 fence_writeback_count = 0;
+    Common::ScratchBuffer<u8> fence_writeback_compare;
 
     size_t immediate_buffer_capacity = 0;
     Common::ScratchBuffer<u8> immediate_buffer_alloc;

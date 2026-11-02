@@ -219,6 +219,11 @@ public:
     /// Whether shaders with this key exist (they may still not fit the environments).
     [[nodiscard]] bool Contains(const ShaderTranslationKey& key) const;
 
+    /// Serialize cache misses for this key only. Recheck Find after acquiring: a worker
+    /// may have published matching shaders while this caller waited. Never hold across
+    /// driver pipeline compilation. Entries live until all pipeline workers have stopped.
+    [[nodiscard]] std::unique_lock<std::mutex> LockBuild(const ShaderTranslationKey& key);
+
     void Add(const ShaderTranslationKey& key, std::shared_ptr<const ReusableShaders> shaders);
 
 private:
@@ -227,9 +232,15 @@ private:
     /// kept, so a key whose answers keep changing does not grow without bound.
     static constexpr size_t MaxVariants = 4;
     using Variants = boost::container::small_vector<std::shared_ptr<const ReusableShaders>, 1>;
+    struct Entry {
+        std::mutex build_mutex;
+        Variants variants;
+    };
 
     mutable std::mutex mutex;
-    ::Common::unordered_map<ShaderTranslationKey, Variants, ShaderTranslationKeyHash> entries;
+    // Stable addresses: growing the flat map must not move a mutex held by another worker.
+    ::Common::unordered_map<ShaderTranslationKey, std::unique_ptr<Entry>, ShaderTranslationKeyHash>
+        entries;
 };
 
 } // namespace Vulkan

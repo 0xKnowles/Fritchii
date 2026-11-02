@@ -9,6 +9,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging.h"
+#include "common/paged_scalar.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
@@ -284,36 +285,30 @@ T MemoryManager::Read(GPUVAddr addr) const {
         }
     }
 
-    if (auto page_pointer{GetPointer(addr)}; page_pointer) {
-        // NOTE: Avoid adding any extra logic to this fast-path block
-        T value;
-        std::memcpy(&value, page_pointer, sizeof(T));
-        return value;
-    }
-
-    static std::atomic<u32> reported{};
-    if (reported.fetch_add(1) < 16) {
-        LOG_ERROR(HW_GPU, "Read{} of unmapped GPU address {:#x}", sizeof(T) * 8, addr);
-    }
-
-    return {};
+    return Common::ReadPagedScalar<T>(addr, [&](GPUVAddr address) {
+        const auto* pointer = GetPointer(address);
+        if (!pointer) {
+            static std::atomic<u32> reported{};
+            if (reported.fetch_add(1) < 16) {
+                LOG_ERROR(HW_GPU, "Read{} of unmapped GPU address {:#x}", sizeof(T) * 8, address);
+            }
+        }
+        return pointer;
+    });
 }
 
 template <typename T>
 void MemoryManager::Write(GPUVAddr addr, T data) {
-    if (auto page_pointer{GetPointer(addr)}; page_pointer) {
-        // NOTE: Avoid adding any extra logic to this fast-path block
-        std::memcpy(page_pointer, &data, sizeof(T));
-        return;
-    }
-    // A Switch 2 sparse block nobody wrote yet gets its memory now.
-    Tegra::Nx2BackSparseWrite(addr, sizeof(T));
-    if (auto page_pointer{GetPointer(addr)}; page_pointer) {
-        std::memcpy(page_pointer, &data, sizeof(T));
-        return;
-    }
-
-    ASSERT(false);
+    Common::WritePagedScalar(addr, data, [&](GPUVAddr address) {
+        auto* pointer = GetPointer(address);
+        if (!pointer) {
+            // Back the whole scalar, including a second sparse page if it straddles one.
+            Tegra::Nx2BackSparseWrite(addr, sizeof(T));
+            pointer = GetPointer(address);
+            ASSERT(pointer != nullptr);
+        }
+        return pointer;
+    });
 }
 
 template u8 MemoryManager::Read<u8>(GPUVAddr addr) const;
@@ -423,12 +418,9 @@ void MemoryManager::ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std:
         if (!unsafe) {
             rasterizer->FlushRegion(dev_addr_base, copy_amount, which);
         }
-        // A device page without memory (a sparse block nobody wrote yet) reads zero.
-        if (const u8* physical = memory.GetPointer<u8>(dev_addr_base)) [[likely]] {
-            std::memcpy(dest_buffer, physical, copy_amount);
-        } else {
-            std::memset(dest_buffer, 0, copy_amount);
-        }
+        // GPU-page continuity does not imply live, continuous physical backing.
+        // The device walker handles fragmented backing and zero-fills sparse holes.
+        memory.ReadBlockUnsafe(dev_addr_base, dest_buffer, copy_amount);
         dest_buffer = static_cast<u8*>(dest_buffer) + copy_amount;
     };
     auto mapped_big = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
@@ -436,12 +428,7 @@ void MemoryManager::ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std:
         if (!unsafe) {
             rasterizer->FlushRegion(dev_addr_base, copy_amount, which);
         }
-        if (!IsBigPageContinuous(page_index)) [[unlikely]] {
-            memory.ReadBlockUnsafe(dev_addr_base, dest_buffer, copy_amount);
-        } else {
-            u8* physical = memory.GetPointer<u8>(dev_addr_base);
-            std::memcpy(dest_buffer, physical, copy_amount);
-        }
+        memory.ReadBlockUnsafe(dev_addr_base, dest_buffer, copy_amount);
         dest_buffer = static_cast<u8*>(dest_buffer) + copy_amount;
     };
     auto read_short_pages = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
@@ -500,9 +487,7 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
         if (!unsafe) {
             rasterizer->InvalidateRegion(dev_addr_base, copy_amount, which);
         }
-        if (u8* physical = memory.GetPointer<u8>(dev_addr_base)) [[likely]] {
-            std::memcpy(physical, src_buffer, copy_amount);
-        }
+        memory.WriteBlockUnsafe(dev_addr_base, src_buffer, copy_amount);
         src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;
     };
     auto mapped_big = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
@@ -510,12 +495,7 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
         if (!unsafe) {
             rasterizer->InvalidateRegion(dev_addr_base, copy_amount, which);
         }
-        if (!IsBigPageContinuous(page_index)) [[unlikely]] {
-            memory.WriteBlockUnsafe(dev_addr_base, src_buffer, copy_amount);
-        } else {
-            u8* physical = memory.GetPointer<u8>(dev_addr_base);
-            std::memcpy(physical, src_buffer, copy_amount);
-        }
+        memory.WriteBlockUnsafe(dev_addr_base, src_buffer, copy_amount);
         src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;
     };
     auto write_short_pages = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {

@@ -6,11 +6,15 @@
 namespace VideoCommon {
 
 // Producer-owned ring position of the latest entry that could affect command
-// memory. Only non-executing sink appends and engine switches may be omitted.
-// Direct macro writes, multi-methods and callbacks remain conservative hazards:
-// even an ordinary direct state write may flush a deferred draw.
+// memory. Inert sink appends, engine switches and proven state-only writes may be
+// omitted. A direct 3D state write is NOT inert if it could flush a deferred draw.
+// Uploads, dispatches, draws, unknown methods and callbacks remain hazards.
 class CommandWriteFrontier {
 public:
+    static constexpr bool StateWriteMayExecute(bool state_only, bool deferred_draw_pending) {
+        return !state_only || deferred_draw_pending;
+    }
+
     void Commit(u64 end, bool may_write) {
         if (may_write) last_writer = end;
     }

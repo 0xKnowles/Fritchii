@@ -12,7 +12,9 @@
 
 #include "common/common_types.h"
 #include "video_core/gpu_split_metrics.h"
+#include "video_core/command_fetch_sync_audit.h"
 #include "video_core/command_write_frontier.h"
+#include "video_core/split_completion.h"
 #include "video_core/engines/engine_interface.h"
 
 namespace Core {
@@ -61,7 +63,7 @@ public:
     /// An engine method write, executed as DmaPusher would (method sink, ConsumeSink, call).
     /// `segment`: the engine's current_dma_segment for the call, when the engine reads it.
     void Method(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument, bool is_last,
-                const GPUVAddr* segment) {
+                const GPUVAddr* segment, bool may_write = true) {
         SelectEngine(engine);
         const size_t words = segment != nullptr ? 2 : 1;
         u64* const entry = Reserve(words);
@@ -71,17 +73,21 @@ public:
         if (segment != nullptr) {
             entry[1] = *segment;
         }
-        Commit(words, engine->execution_mask[method]);
+        Commit(words, may_write && engine->execution_mask[method]);
     }
     void MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
-                     u32 amount, u32 methods_pending, const GPUVAddr* segment);
+                     u32 amount, u32 methods_pending, const GPUVAddr* segment,
+                     bool may_write = true);
     /// A write made by a macro: CallMethod without the method sink, as the engines' macros do.
-    void MacroWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument) {
+    // Only the owning front engine may prove a write inert, including ConsumeSink's
+    // effects. Unknown callers retain the conservative default.
+    void MacroWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument,
+                    bool may_write = true) {
         SelectEngine(engine);
         u64* const entry = Reserve(1);
         entry[0] = static_cast<u64>(Kind::Method) | IsLast | Direct | (u64{method & 0xffff} << 8) |
                    (u64{argument} << 32);
-        Commit(1);
+        Commit(1, may_write);
     }
 
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
@@ -108,8 +114,20 @@ public:
     void Drain(SplitDrainReason reason = SplitDrainReason::Other);
     /// Wait for possible command-memory writers; leave inert sink appends queued.
     void DrainCommandReads();
+    /// Waits for every queued entry that may write guest memory or use the back's caches,
+    /// rasterizer, query cache or Vulkan scheduler (the command-write frontier). Afterwards the
+    /// back may still run proven register-only entries, so the caller may read guest memory and
+    /// query/flush the buffer and query caches, but must not touch engine registers, method
+    /// sinks or anything a deferred callback could use. Use Drain() for those.
+    void DrainMemoryWriters(SplitDrainReason reason = SplitDrainReason::Other);
+    /// Whether DrainMemoryWriters would currently have to wait (front thread only).
+    [[nodiscard]] bool MemoryWritersPending() const {
+        return active && command_writes.Target() > consumed.load(std::memory_order_acquire);
+    }
     /// Profile the decision made after command-fetch synchronization, without changing it.
     void NoteCommandFetch(u64 bytes, bool historical_hit, bool flushed);
+    /// Front-thread evidence counters for the GP-entry SYNC_WAIT contract (reporting only).
+    CommandFetchSyncAudit& FetchSyncAudit();
 
 private:
     enum class Kind : u64 {
@@ -184,6 +202,7 @@ private:
 
     alignas(64) std::atomic<u64> published{};
     alignas(64) std::atomic<u64> consumed{};
+    SplitCompletion completion;
     alignas(64) std::atomic<bool> back_waiting{};
     std::atomic<u32> wake{};
     std::jthread back_thread;

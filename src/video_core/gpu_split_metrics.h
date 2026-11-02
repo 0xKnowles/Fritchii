@@ -52,4 +52,31 @@ struct SplitDrainMetrics {
     }
 };
 
+// Front-side MME DMA read attribution. Counts include every read; durations include
+// only one read in 64 and must not be reported as whole-window CPU/GPU time.
+struct NativeDmaReadMetrics {
+    static constexpr u64 SamplePeriod = 64;
+    u64 calls{};
+    u64 words{};
+    u64 flushes{};
+    u64 samples{};
+    u64 drain_ns{};
+    u64 dirty_check_ns{};
+    u64 flush_ns{};
+    u64 read_ns{};
+
+    bool BeginRead(u32 read_words) {
+        words += read_words;
+        return (calls++ % SamplePeriod) == 0;
+    }
+
+    void RecordSample(u64 drain, u64 dirty_check, u64 flush, u64 read) {
+        ++samples;
+        drain_ns += drain;
+        dirty_check_ns += dirty_check;
+        flush_ns += flush;
+        read_ns += read;
+    }
+};
+
 } // namespace VideoCommon
