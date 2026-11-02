@@ -544,6 +544,7 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
             words[1], words[2], words[3]);
     }
     auto result = std::make_shared<LoweredNativeCode>();
+    result->native_program_key = Shader::Ampere::NativeProgramKey(native);
     result->texture_bound = lowered.required_texture_buffer;
     result->source_size = native_header_size + lowered.source_size;
     result->trap_prefix.assign(native.begin(), native.begin() + trap_count);

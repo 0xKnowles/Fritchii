@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
 #include <string>
 #include <unordered_set>
 #include <fmt/ranges.h>
@@ -21,6 +22,7 @@
 #include "shader_recompiler/object_pool.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dirty_flags.h"
+#include "video_core/fire_emblem_upscale.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
@@ -181,7 +183,8 @@ const ShaderInfo* ShaderCache::ComputeShader() {
         LOG_ERROR(HW_GPU, "Invalid GPU address for shader {:#016x}", shader_addr);
         return nullptr;
     }
-    if (const ShaderInfo* const shader = TryGet(*cpu_shader_addr)) {
+    const ShaderInfo* shader = TryGet(*cpu_shader_addr);
+    if (shader) {
         if (shader->lowered_native &&
             !Shader::Ampere::VerifyTrapGuards(shader->lowered_native->trap_prefix,
                                              [&](u32 bank, u32 offset) {
@@ -189,19 +192,34 @@ const ShaderInfo* ShaderCache::ComputeShader() {
                                                      *kepler_compute, *gpu_memory, bank, offset);
                                              }))
             throw Shader::Ampere::TrapGuardError{};
-        return shader;
+    } else {
+        try {
+            RethrowIfRejected(*cpu_shader_addr);
+            ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start};
+            shader = MakeShaderInfo(env, *cpu_shader_addr);
+        } catch (const Shader::Ampere::TrapGuardError&) {
+            // Constants can become valid on the next dispatch; do not cache this rejection.
+            throw;
+        } catch (const Shader::Exception&) {
+            RememberRejection(*cpu_shader_addr);
+            throw;
+        }
     }
-    try {
-        RethrowIfRejected(*cpu_shader_addr);
-        ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start};
-        return MakeShaderInfo(env, *cpu_shader_addr);
-    } catch (const Shader::Ampere::TrapGuardError&) {
-        // Constants can become valid on the next dispatch; do not cache this rejection.
-        throw;
-    } catch (const Shader::Exception&) {
-        RememberRejection(*cpu_shader_addr);
-        throw;
+    // Check both warm and cold shader paths, before selecting a disk-cached pipeline.
+    // EDEN_NX2_DLSS_STANDIN=0 restores the native network for same-scene comparisons.
+    static const char* const standin_option = std::getenv("EDEN_NX2_DLSS_STANDIN");
+    if (kepler_compute->IsNativeMode() && shader->lowered_native &&
+        program_id == FireEmblemUpscale::ProgramId &&
+        shader->lowered_native->native_program_key == FireEmblemUpscale::PrepassProgramKey) {
+        kepler_compute->CaptureFireEmblemJitter();
     }
+    if (kepler_compute->IsNativeMode() && shader->lowered_native &&
+        FireEmblemUpscale::UseSpatialStandIn(
+            program_id, shader->lowered_native->native_program_key, standin_option) &&
+        kepler_compute->TryFireEmblemSpatialUpscale()) {
+        throw FireEmblemUpscale::DispatchReplaced{};
+    }
+    return shader;
 }
 
 void ShaderCache::RethrowIfRejected(VAddr addr) {

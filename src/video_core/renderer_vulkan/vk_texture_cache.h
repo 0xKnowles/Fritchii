@@ -103,7 +103,7 @@ public:
     /// a copy of dst's previous contents (the last output). False when dst cannot take it.
     bool TemporalUpscale(Framebuffer* dst_framebuffer, ImageView& dst, ImageView& input_color,
                          ImageView& motion_vectors, std::array<f32, 2> jitter,
-                         std::array<f32, 2> motion_scale);
+                         std::array<f32, 2> motion_scale, bool use_history = true);
 
     void CopyImage(Image& dst, Image& src, std::span<const VideoCommon::ImageCopy> copies);
 

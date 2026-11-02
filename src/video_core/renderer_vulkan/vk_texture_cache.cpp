@@ -1543,13 +1543,24 @@ void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
 bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageView& dst,
                                           ImageView& input_color, ImageView& motion_vectors,
                                           std::array<f32, 2> jitter,
-                                          std::array<f32, 2> motion_scale) {
+                                          std::array<f32, 2> motion_scale, bool use_history) {
     if (dst.Samples() != VK_SAMPLE_COUNT_1_BIT || ImageAspectMask(dst.format) != VK_IMAGE_ASPECT_COLOR_BIT) {
         return false;
     }
     const VkFormat format =
         MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, false, dst.format).format;
     const VkExtent2D extent{dst.size.width, dst.size.height};
+    if (!use_history) {
+        const Region2D region{
+            .start = {0, 0},
+            .end = {static_cast<s32>(extent.width), static_cast<s32>(extent.height)},
+        };
+        // Unused descriptors still need valid images. This mode reads only input_color.
+        blit_image_helper.TemporalUpscale(
+            dst_framebuffer, input_color, input_color,
+            input_color.Handle(Shader::TextureType::Color2D), region, jitter, {0.0f, 0.0f}, -1.0f);
+        return true;
+    }
     const VkImage output = dst.ImageHandle();
     bool reset = false;
     if (!temporal_history.image || temporal_history.format != format ||

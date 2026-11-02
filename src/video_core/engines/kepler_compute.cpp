@@ -19,6 +19,7 @@
 #include "shader_recompiler/exception.h"
 #include "core/core.h"
 #include "video_core/gpu_split.h"
+#include "video_core/fire_emblem_upscale.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2.h"
 #include "video_core/engines/fermi_2d.h"
@@ -548,6 +549,8 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
         return false;
     try {
         rasterizer->DispatchCompute();
+    } catch (const VideoCommon::FireEmblemUpscale::DispatchReplaced&) {
+        return true;
     } catch (const Shader::Exception& error) {
         static std::unordered_set<std::string> logged;
         if (logged.insert(error.what()).second) {
@@ -622,12 +625,55 @@ void KeplerCompute::RememberDlssMotionVectors() {
 // 720p to 1440p docked). Blit one to the other with bilinear filtering when both are plain 2D
 // images of the same format and the output is larger: title 4's slots first, then Fortune's
 // Weave's, else the first two handles in cbuf0+0x80..0x11c that form such a pair.
-bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+void KeplerCompute::CaptureFireEmblemJitter() {
+    (void)fe_upscale_jitter.Take();
+    const auto& cbuf = launch_description.const_buffer_config[0];
+    const GPUVAddr address = (GPUVAddr{cbuf.address_high} << 32) | cbuf.address_low;
+    if (!(launch_description.const_buffer_enable_mask & 1) || cbuf.size.Value() < 0x27c ||
+        !memory_manager.IsFullyMappedRange(address, 0x27c)) {
+        return;
+    }
+    const u32 index = memory_manager.Read<u32>(address + 0x278) & 0xfffff;
+    if (index > regs.tic.limit || !memory_manager.IsFullyMappedRange(
+            regs.tic.Address() + u64{index} * sizeof(Texture::TICEntry), sizeof(Texture::TICEntry))) {
+        return;
+    }
+    const auto color = GetTICEntry(index);
+    if (color.format != Texture::TextureFormat::B10G11R11 || !color.IsBlockLinear()) {
+        return;
+    }
+    fe_upscale_jitter.Capture(color.Address(), color.Width(), color.Height(),
+        {std::bit_cast<f32>(memory_manager.Read<u32>(address + 0x1b0)),
+         std::bit_cast<f32>(memory_manager.Read<u32>(address + 0x1b4))});
+}
+
+bool KeplerCompute::TryFireEmblemSpatialUpscale() {
+    const bool done = UpscaleInsteadOfNativeProgram(true);
+    static u32 logged{};
+    if (logged++ < 4) {
+        LOG_INFO(HW_GPU, "Fire Emblem DLSS output: spatial stand-in {} (no temporal history)",
+                 done ? "applied" : "unavailable; retaining native dispatch");
+    }
+    return done;
+}
+
+bool KeplerCompute::UpscaleInsteadOfNativeProgram(bool fire_emblem_only) {
+    const auto frame_jitter = fire_emblem_only ? fe_upscale_jitter.Take() : std::nullopt;
     const auto& cbuf = launch_description.const_buffer_config[0];
     const GPUVAddr cbuf_address = (GPUVAddr{cbuf.address_high} << 32) | cbuf.address_low;
+    if (fire_emblem_only &&
+        (!(launch_description.const_buffer_enable_mask & 1) || cbuf.size.Value() < 0x34c ||
+         !memory_manager.IsFullyMappedRange(cbuf_address, 0x34c))) {
+        return false;
+    }
     const auto image = [&](u32 offset) -> std::optional<Texture::TICEntry> {
         const u32 tic_index = memory_manager.Read<u32>(cbuf_address + offset) & 0xfffff;
         if (tic_index > regs.tic.limit) return std::nullopt;
+        if (fire_emblem_only && !memory_manager.IsFullyMappedRange(
+                regs.tic.Address() + u64{tic_index} * sizeof(Texture::TICEntry),
+                sizeof(Texture::TICEntry))) {
+            return std::nullopt;
+        }
         return GetTICEntry(tic_index);
     };
     const auto upscale_pair = [](const std::optional<Texture::TICEntry>& from,
@@ -636,7 +682,19 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
                to->Address() != 0 && to->Width() > from->Width() && from->IsBlockLinear() &&
                to->IsBlockLinear();
     };
-    std::optional<Texture::TICEntry> input = image(0x90), output = image(0xa0);
+    std::optional<Texture::TICEntry> input, output;
+    if (fire_emblem_only) {
+        input = image(0x328);
+        output = image(0x348);
+        if (!input || !output || !VideoCommon::FireEmblemUpscale::ValidPair(*input, *output) ||
+            !memory_manager.IsFullyMappedRange(input->Address(), 1) ||
+            !memory_manager.IsFullyMappedRange(output->Address(), 1)) {
+            return false;
+        }
+    } else {
+        input = image(0x90);
+        output = image(0xa0);
+    }
     bool fortunes_weave = false;
     if (!upscale_pair(input, output)) {
         input = image(0x328);
@@ -703,7 +761,8 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
         const char* value = std::getenv("EDEN_NX2_SAMPLE_AT");
         return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 20U;
     }();
-    if (static u32 sampled{}; sampled++ == sample_at) {
+    const bool sample_enabled = !fire_emblem_only || std::getenv("EDEN_NX2_SAMPLE_AT");
+    if (static u32 sampled{}; sample_enabled && sampled++ == sample_at) {
         const auto sample = [&](const Texture::TICEntry& tic) {
             const u64 size = u64{tic.Width()} * tic.Height() * 4;
             if (const auto device = memory_manager.GpuToCpuAddress(tic.Address())) {
@@ -765,7 +824,7 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
             const char* value = std::getenv("EDEN_NX2_TEMPORAL_UPSCALE");
             return value == nullptr || std::string_view{value} != "0";
         }();
-        if (!fortunes_weave || !enabled || !dlss_motion_vectors ||
+        if (fire_emblem_only || !fortunes_weave || !enabled || !dlss_motion_vectors ||
             dlss_motion_color != input->Address())
             return false;
         Fermi2D::Surface motion = surface(*dlss_motion_vectors);
@@ -773,9 +832,25 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
         return rasterizer->AccelerateTemporalUpscale(source, surface(*output), motion, dlss_jitter,
                                                      {1.0f, 1.0f});
     };
-    const bool done = upscale_temporally() ||
+    const auto upscale_without_history = [&] {
+        if (!fire_emblem_only || !frame_jitter || frame_jitter->color != input->Address() ||
+            frame_jitter->width != input->Width() || frame_jitter->height != input->Height()) {
+            return false;
+        }
+        // Reuse the upscale renderer but never allocate, sample or update temporal history.
+        const bool corrected = rasterizer->AccelerateTemporalUpscale(
+            source, surface(*output), source, frame_jitter->offset, {0.0f, 0.0f}, false);
+        static u32 logged{};
+        if (logged++ < 8) {
+            LOG_INFO(HW_GPU, "Fire Emblem jitter compensation: {}, {} pixels: {}",
+                     frame_jitter->offset[0], frame_jitter->offset[1],
+                     corrected ? "applied without history" : "unavailable");
+        }
+        return corrected;
+    };
+    const bool done = upscale_without_history() || upscale_temporally() ||
                       rasterizer->AccelerateSurfaceCopy(source, surface(*output), config);
-    if (static u32 checked{}; checked++ == sample_at) {
+    if (static u32 checked{}; sample_enabled && checked++ == sample_at) {
         const u64 size = u64{output->Width()} * output->Height() * 4;
         if (const auto device = memory_manager.GpuToCpuAddress(output->Address())) {
             rasterizer->FlushRegion(*device, size, VideoCommon::CacheType::All);
@@ -796,7 +871,8 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
         const char* value = std::getenv("EDEN_NX2_TRACE_AFTER_UPSCALE");
         return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 30U;
     }();
-    if (static u32 count{}; ++count == trace_at) g_nx2_trace_draws_after_upscale = 40;
+    if (static u32 count{}; !fire_emblem_only && ++count == trace_at)
+        g_nx2_trace_draws_after_upscale = 40;
     static u32 logged{};
     if (logged++ < 4) {
         LOG_INFO(HW_GPU, "Upscale fallback {:#x} {}x{} block {}/{}/{} -> {:#x} {}x{} block {}/{}/{} levels {}: {}",

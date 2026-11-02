@@ -18,6 +18,7 @@
 #include "common/common_types.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/engine_upload.h"
+#include "video_core/fire_emblem_upscale.h"
 #include "video_core/macro.h"
 #include "video_core/native_qmd.h"
 #include "video_core/textures/texture.h"
@@ -243,6 +244,10 @@ public:
 
     bool IsNativeMode() const { return native_mode; }
 
+    // Called only for the identified Fire Emblem final DLSS pass.
+    bool TryFireEmblemSpatialUpscale();
+    void CaptureFireEmblemJitter();
+
     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
     /// the front instead of CallMethod for native compute engines: runs their macros and macro
     /// uploads against a copy of the registers and sends the register writes to the back.
@@ -267,7 +272,7 @@ private:
     void ProcessNativeReportSemaphore(u32 argument);
     void DescribeNativeResources(const NativeQmdScheduler::Descriptor& qmd);
     void RememberDlssMotionVectors();
-    bool UpscaleInsteadOfNativeProgram();
+    bool UpscaleInsteadOfNativeProgram(bool fire_emblem_only = false);
 
     /// Motion vectors of Fire Emblem: Fortune's Weave's DLSS evaluation, from its first pass (run
     /// earlier in the frame than the network pass the stand-in replaces), with the input colour
@@ -275,6 +280,7 @@ private:
     std::optional<Texture::TICEntry> dlss_motion_vectors;
     GPUVAddr dlss_motion_color{};
     std::array<f32, 2> dlss_jitter{};
+    VideoCommon::FireEmblemUpscale::FrameJitter fe_upscale_jitter;
     bool ProcessNativeMethod(Core::System& system, u32 method, u32 argument, bool is_last_call);
     NativeQmdScheduler native_qmd;
     std::array<u32, 0xc00>* native_data_ram{};

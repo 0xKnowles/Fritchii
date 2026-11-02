@@ -16,7 +16,7 @@ layout(push_constant) uniform PushConstants {
     // The vertex stage's texture scale and offset come first.
     layout(offset = 16) vec2 jitter;  // this frame's sample offset, in input pixels
     vec2 motion_scale;                // motion vector -> UV offset to the previous frame
-    float current_weight;             // largest weight of this frame; 1 ignores the history
+    float current_weight;             // <0: spatial de-jitter only; 1 ignores the history
 };
 
 layout(location = 0) in vec2 texcoord;  // 0 to 1 across the output
@@ -66,17 +66,24 @@ vec3 SampleHistory(vec2 position) {
     const vec2 texel0 = texel1 - 1.0;
     const vec2 texel3 = texel1 + 2.0;
     const vec2 texel12 = texel1 + w2 / w12;
-    vec3 sum = texture(history, vec2(texel12.x, texel0.y)).rgb * (w12.x * w0.y);
-    sum += texture(history, vec2(texel0.x, texel12.y)).rgb * (w0.x * w12.y);
-    sum += texture(history, texel12).rgb * (w12.x * w12.y);
-    sum += texture(history, vec2(texel3.x, texel12.y)).rgb * (w3.x * w12.y);
-    sum += texture(history, vec2(texel12.x, texel3.y)).rgb * (w12.x * w3.y);
+    vec3 sum = textureLod(history, vec2(texel12.x, texel0.y), 0.0).rgb * (w12.x * w0.y);
+    sum += textureLod(history, vec2(texel0.x, texel12.y), 0.0).rgb * (w0.x * w12.y);
+    sum += textureLod(history, texel12, 0.0).rgb * (w12.x * w12.y);
+    sum += textureLod(history, vec2(texel3.x, texel12.y), 0.0).rgb * (w3.x * w12.y);
+    sum += textureLod(history, vec2(texel12.x, texel3.y), 0.0).rgb * (w12.x * w3.y);
     const float weight = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y;
     return max(sum / weight, vec3(0.0));
 }
 
 void main() {
     const ivec2 input_size = textureSize(input_color, 0);
+    if (current_weight < 0.0) {
+        // Spatial stand-in: undo the camera sample offset without any history or motion reads.
+        const vec2 position = clamp(texcoord * vec2(input_size) + jitter,
+                                    vec2(0.5), vec2(input_size) - vec2(0.5));
+        color = vec4(textureLod(input_color, position, 0.0).rgb, 1.0);
+        return;
+    }
     const ivec2 motion_size = textureSize(motion_vectors, 0);
     // The output pixel's centre in input pixels. Input texel k sampled the scene at k + 0.5 - jitter
     // (the sign measured against consecutive frames).

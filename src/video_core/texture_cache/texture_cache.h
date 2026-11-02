@@ -1098,7 +1098,8 @@ template <class P>
 bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& dst,
                                       const Tegra::Engines::Fermi2D::Surface& src,
                                       const Tegra::Engines::Fermi2D::Surface& motion_vectors,
-                                      std::array<f32, 2> jitter, std::array<f32, 2> motion_scale) {
+                                      std::array<f32, 2> jitter, std::array<f32, 2> motion_scale,
+                                      bool use_history) {
     if constexpr (FRAMEBUFFER_BLITS) {
         return false;
     } else {
@@ -1119,10 +1120,11 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
         if (!result) {
             return false;
         }
-        const ImageInfo motion_info(motion_vectors);
+        const auto& motion_surface = use_history ? motion_vectors : src;
+        const ImageInfo motion_info(motion_surface);
         has_deleted_images = false;
         const ImageId motion_id =
-            FindOrInsertImage(motion_info, motion_vectors.Address(), RelaxedOptions{});
+            FindOrInsertImage(motion_info, motion_surface.Address(), RelaxedOptions{});
         if (has_deleted_images || !motion_id) {
             return false; // the colour and output ids may be stale; the caller blits instead
         }
@@ -1147,7 +1149,7 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
             return RenderTargetFromImage(id, ImageViewInfo(ImageViewType::e2D, format, range));
         };
         const auto src_view = view(src_id, src, result->src_format);
-        const auto motion_view = view(motion_id, motion_vectors, motion_info.format);
+        const auto motion_view = view(motion_id, motion_surface, motion_info.format);
         const auto dst_view = view(dst_id, dst, result->dst_format);
         if (!src_view || !motion_view || !dst_view) {
             return false;
@@ -1157,7 +1159,7 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
         return runtime.TemporalUpscale(dst_framebuffer, slot_image_views[dst_view->second],
                                        slot_image_views[src_view->second],
                                        slot_image_views[motion_view->second], jitter,
-                                       motion_scale);
+                                       motion_scale, use_history);
     }
 }
 

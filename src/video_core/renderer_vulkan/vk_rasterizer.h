@@ -132,7 +132,7 @@ public:
                                    const Tegra::Engines::Fermi2D::Surface& dst,
                                    const Tegra::Engines::Fermi2D::Surface& motion_vectors,
                                    std::array<f32, 2> jitter,
-                                   std::array<f32, 2> motion_scale) override;
+                                   std::array<f32, 2> motion_scale, bool use_history = true) override;
     Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() override;
     void AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                   std::span<const u8> memory) override;
