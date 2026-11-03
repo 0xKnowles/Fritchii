@@ -121,13 +121,13 @@ public:
 
     [[nodiscard]] U32 LaneId();
 
-    [[nodiscard]] U32 LoadGlobalU8(const U64& address);
-    [[nodiscard]] U32 LoadGlobalS8(const U64& address);
-    [[nodiscard]] U32 LoadGlobalU16(const U64& address);
-    [[nodiscard]] U32 LoadGlobalS16(const U64& address);
-    [[nodiscard]] U32 LoadGlobal32(const U64& address);
-    [[nodiscard]] Value LoadGlobal64(const U64& address);
-    [[nodiscard]] Value LoadGlobal128(const U64& address);
+    [[nodiscard]] U32 LoadGlobalU8(const U64& address, bool coherent = false);
+    [[nodiscard]] U32 LoadGlobalS8(const U64& address, bool coherent = false);
+    [[nodiscard]] U32 LoadGlobalU16(const U64& address, bool coherent = false);
+    [[nodiscard]] U32 LoadGlobalS16(const U64& address, bool coherent = false);
+    [[nodiscard]] U32 LoadGlobal32(const U64& address, bool coherent = false);
+    [[nodiscard]] Value LoadGlobal64(const U64& address, bool coherent = false);
+    [[nodiscard]] Value LoadGlobal128(const U64& address, bool coherent = false);
 
     void WriteGlobalU8(const U64& address, const U32& value);
     void WriteGlobalS8(const U64& address, const U32& value);

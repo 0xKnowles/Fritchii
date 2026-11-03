@@ -50,11 +50,16 @@ public:
 
     [[nodiscard]] bool Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                                  Tegra::MemoryManager& gpu_memory, Scheduler& scheduler,
-                                 BufferCache& buffer_cache, TextureCache& texture_cache);
+                                 BufferCache& buffer_cache, TextureCache& texture_cache,
+                                 TextureCacheRuntime& texture_runtime,
+                                 std::optional<ByteAddressedShadow>& shadow);
 
     bool IsBound() const noexcept {
         return static_cast<bool>(pipeline);
     }
+
+    /// Advances the frame window of EDEN_NX2_UPSCALER_TRACE
+    static void TickUpscalerTrace();
 
 private:
     const Device& device;

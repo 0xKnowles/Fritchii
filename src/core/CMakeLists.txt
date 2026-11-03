@@ -532,6 +532,8 @@ add_library(core STATIC
     hle/service/audio/audio_renderer_manager.cpp
     hle/service/audio/audio_renderer_manager.h
     hle/service/audio/nx2_audio_device_manager.h
+    hle/service/audio/nx2_sysmix.cpp
+    hle/service/audio/nx2_sysmix.h
     hle/service/audio/nx2_audio_user_client.h
     hle/service/audio/audio_renderer.cpp
     hle/service/audio/audio_renderer.h
@@ -543,6 +545,9 @@ add_library(core STATIC
     hle/service/audio/final_output_recorder_manager.cpp
     hle/service/audio/final_output_recorder_manager.h
     hle/service/audio/hardware_opus_decoder_manager.cpp
+    hle/service/audio/hardware_audio_codec.cpp
+    hle/service/audio/hardware_audio_codec.h
+    hle/service/audio/hardware_audio_codec_protocol.h
     hle/service/audio/hardware_opus_decoder_manager.h
     hle/service/audio/hardware_opus_decoder.cpp
     hle/service/audio/hardware_opus_decoder.h
@@ -1044,6 +1049,7 @@ add_library(core STATIC
     hle/service/nx2_streamplay.h
     hle/service/nx2_stub_interface.h
     hle/service/nx2_gsv.h
+    hle/service/nx2_image_layout.h
     hle/service/services.cpp
     hle/service/services.h
     hle/service/set/factory_settings_server.cpp

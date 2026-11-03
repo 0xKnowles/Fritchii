@@ -132,7 +132,7 @@ public:
                                    const Tegra::Engines::Fermi2D::Surface& dst,
                                    const Tegra::Engines::Fermi2D::Surface& motion_vectors,
                                    std::array<f32, 2> jitter,
-                                   std::array<f32, 2> motion_scale, bool use_history = true) override;
+                                   std::array<f32, 2> motion_scale, const Tegra::Texture::TICEntry* depth) override;
     Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() override;
     void AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                   std::span<const u8> memory) override;
@@ -237,6 +237,7 @@ private:
     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
 
     u32 draw_counter = 0;
+    bool pending_native_work{};
     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
 };
 

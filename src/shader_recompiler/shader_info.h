@@ -240,6 +240,7 @@ struct ImageDescriptor {
     u32 cbuf_offset;
     u32 count;
     u32 size_shift;
+    bool is_byte_addressed{};
 
     auto operator<=>(const ImageDescriptor&) const = default;
 };
@@ -332,6 +333,8 @@ struct Info {
     bool uses_atomic_s32_max{};
     bool uses_int64_bit_atomics{};
     bool uses_global_memory{};
+    bool requires_coherent_global_memory{};
+    bool requires_coherent_image_memory{};
     bool uses_atomic_image_u32{};
     bool uses_shadow_lod{};
     bool uses_rescaling_uniform{};

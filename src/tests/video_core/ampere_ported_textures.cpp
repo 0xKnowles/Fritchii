@@ -265,6 +265,24 @@ TEST_CASE("Ampere array depth comparisons support nonlegacy descriptor bindings"
     // One bound descriptor buffer per program.
     auto other = sample;
     other.words[1] = (other.words[1] & ~(0x1fU << 22)) | (3U << 22);
-    const auto conflict = LowerToMaxwell(std::array{sample, other, Exit});
-    REQUIRE(conflict.error == "native texture descriptor buffer conflict");
+    const auto mixed = LowerToMaxwell(std::array{sample, other, Exit});
+    INFO(mixed.error);
+    REQUIRE(mixed);
+    REQUIRE(mixed.required_texture_buffer == 4);
+    REQUIRE(mixed.instructions[3] ==
+            (0xc000000000070000ULL | 5 | (250ULL << 8) | (1ULL << 20) | (3ULL << 28) |
+             (1ULL << 31) | (0x124ULL << 36) | (1ULL << 49) | (1ULL << 50) | (7ULL << 51)));
+    const std::array<u64, 7> alternate{
+        Copy(7ULL << 16, 250, 8),
+        Copy(7ULL << 16, 251, 9),
+        Copy(7ULL << 16, 252, 0),
+        0x4c98000000070000ULL | 246 | (15ULL << 39) | (0x124ULL << 20) | (3ULL << 34),
+        Copy(7ULL << 16, 247, 1),
+        0xde80000000070000ULL | 250 | (250ULL << 8) | (246ULL << 20) | (3ULL << 28) |
+            (1ULL << 31) | (1ULL << 49) | (1ULL << 50) | (7ULL << 51),
+        Copy(7ULL << 16, 5, 250),
+    };
+    const auto begin = mixed.instructions.begin() + mixed.source_instruction_offsets[1];
+    REQUIRE(std::equal(alternate.begin(), alternate.end(), begin));
+    REQUIRE(begin + alternate.size() + 1 == mixed.instructions.end());
 }

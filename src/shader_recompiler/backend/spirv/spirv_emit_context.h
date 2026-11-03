@@ -213,6 +213,8 @@ public:
 
     const Profile& profile;
     const RuntimeInfo& runtime_info;
+    const bool requires_coherent_global_memory;
+    const bool requires_coherent_image_memory;
     Stage stage{};
 
     Id void_id{};

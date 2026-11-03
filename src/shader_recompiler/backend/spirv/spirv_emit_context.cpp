@@ -311,6 +311,9 @@ void DefineSsbos(EmitContext& ctx, StorageTypeDefinition& type_def,
     const Id struct_type{ctx.TypeStruct(array_type)};
     ctx.Decorate(struct_type, spv::Decoration::Block);
     ctx.MemberDecorate(struct_type, 0, spv::Decoration::Offset, 0U);
+    if (info.requires_coherent_global_memory) {
+        ctx.MemberDecorate(struct_type, 0, spv::Decoration::Coherent);
+    }
 
     const Id struct_pointer{ctx.TypePointer(spv::StorageClass::StorageBuffer, struct_type)};
     type_def.array = struct_pointer;
@@ -468,6 +471,8 @@ void VectorTypes::Define(Sirit::Module& sirit_ctx, Id base_type, std::string_vie
 EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_info_,
                          IR::Program& program, Bindings& bindings)
     : Sirit::Module(profile_.supported_spirv), profile{profile_}, runtime_info{runtime_info_},
+      requires_coherent_global_memory{program.info.requires_coherent_global_memory},
+      requires_coherent_image_memory{program.info.requires_coherent_image_memory},
       stage{program.stage}, texture_rescaling_index{bindings.texture_scaling_index},
       image_rescaling_index{bindings.image_scaling_index} {
     const bool is_unified{profile.unified_descriptor_binding};
@@ -1364,6 +1369,9 @@ void EmitContext::DefineImageBuffers(const Info& info, u32& binding) {
         Decorate(id, spv::Decoration::Binding, binding);
         Decorate(id, spv::Decoration::DescriptorSet, 0U);
         Name(id, NameOf(stage, desc, "imgbuf"));
+        if (info.requires_coherent_image_memory) {
+            Decorate(id, spv::Decoration::Coherent);
+        }
         image_buffers.push_back({
             .id = id,
             .image_type = image_type,
@@ -1419,6 +1427,9 @@ void EmitContext::DefineImages(const Info& info, u32& binding, u32& scaling_inde
         Decorate(id, spv::Decoration::Binding, binding);
         Decorate(id, spv::Decoration::DescriptorSet, 0U);
         Name(id, NameOf(stage, desc, "img"));
+        if (info.requires_coherent_image_memory) {
+            Decorate(id, spv::Decoration::Coherent);
+        }
         images.push_back({
             .id = id,
             .image_type = image_type,

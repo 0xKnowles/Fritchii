@@ -850,7 +850,8 @@ typename P::Framebuffer* TextureCache<P>::GetFramebuffer() {
 template <class P>
 ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
     auto& table = compute ? channel_state->compute_image_table : channel_state->graphics_image_table;
-    index = Tegra::Texture::TextureHeaderIndex(index, table.current_limit);
+    index = Tegra::Texture::TextureHeaderIndex(index, table.current_limit,
+                                               gpu_memory->UsesNativeTiling());
     if (index > table.current_limit) {
         LOG_DEBUG(HW_GPU, "Invalid image view index={}", index);
         return NULL_IMAGE_VIEW_ID;
@@ -1139,7 +1140,7 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
                                       const Tegra::Engines::Fermi2D::Surface& src,
                                       const Tegra::Engines::Fermi2D::Surface& motion_vectors,
                                       std::array<f32, 2> jitter, std::array<f32, 2> motion_scale,
-                                      bool use_history) {
+                                      const Tegra::Texture::TICEntry* depth) {
     if constexpr (FRAMEBUFFER_BLITS) {
         return false;
     } else {
@@ -1160,24 +1161,65 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
         if (!result) {
             return false;
         }
-        const auto& motion_surface = use_history ? motion_vectors : src;
+        const auto& motion_surface = motion_vectors;
         const ImageInfo motion_info(motion_surface);
         has_deleted_images = false;
         const ImageId motion_id =
             FindOrInsertImage(motion_info, motion_surface.Address(), RelaxedOptions{});
+        ImageId depth_id{};
+        if (depth && motion_id && runtime.WantsTemporalUpscaleDepth()) {
+            depth_id = FindOrInsertImage(ImageInfo(*depth), depth->Address(), RelaxedOptions{});
+        }
         if (has_deleted_images || !motion_id) {
-            return false; // the colour and output ids may be stale; the caller blits instead
+            return false;
         }
         const ImageId dst_id = result->dst_id;
         const ImageId src_id = result->src_id;
         PrepareImage(src_id, false, false);
         PrepareImage(motion_id, false, false);
         PrepareImage(dst_id, true, false);
+        if (depth_id) {
+            PrepareImage(depth_id, false, false);
+            if (slot_images[depth_id].info.num_samples != 1 ||
+                slot_images[depth_id].info.format != PixelFormat::D32_FLOAT) {
+                depth_id = {};
+            }
+        }
         for (const ImageId id : {src_id, motion_id, dst_id}) {
-            if (True(slot_images[id].flags & ImageFlagBits::Rescaled) ||
-                slot_images[id].info.num_samples != 1) {
+            if (slot_images[id].info.num_samples != 1) {
                 return false;
             }
+        }
+        // With resolution scaling, bring the images to the same scale as BlitImage does.
+        const auto rescaled = [&](ImageId id) {
+            return True(slot_images[id].flags & ImageFlagBits::Rescaled);
+        };
+        if (rescaled(src_id) || rescaled(motion_id) || rescaled(dst_id) ||
+            (depth_id && rescaled(depth_id))) {
+            for (const ImageId id : {src_id, motion_id, dst_id, depth_id}) {
+                if (id && !rescaled(id) && ImageCanRescale(slot_images[id])) {
+                    ScaleUp(slot_images[id]);
+                }
+            }
+        }
+        // FSR 3.1 reads colour, motion and depth texel for texel: all at the colour's scale.
+        if (depth_id && (rescaled(depth_id) != rescaled(src_id) ||
+                         rescaled(motion_id) != rescaled(src_id))) {
+            depth_id = {};
+        }
+        const Extent3D src_size = slot_images[src_id].info.size;
+        if (src_size.width != src.width || src_size.height != src.height) {
+            return false;
+        }
+        const std::array<u32, 2> render_size =
+            rescaled(src_id)
+                ? std::array{Settings::values.resolution_info.ScaleUp(src_size.width),
+                             Settings::values.resolution_info.ScaleUp(src_size.height)}
+                : std::array{src_size.width, src_size.height};
+        // The jitter is in the input's guest pixels.
+        if (rescaled(src_id)) {
+            const f32 factor = Settings::values.resolution_info.up_factor;
+            jitter = {jitter[0] * factor, jitter[1] * factor};
         }
         const auto view = [&](ImageId id, const Tegra::Engines::Fermi2D::Surface& surface,
                               PixelFormat format) -> std::optional<std::pair<FramebufferId, ImageViewId>> {
@@ -1194,12 +1236,22 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
         if (!src_view || !motion_view || !dst_view) {
             return false;
         }
+        ImageViewId depth_view{};
+        if (depth_id) {
+            if (const std::optional base = slot_images[depth_id].TryFindBase(depth->Address())) {
+                const SubresourceRange range{.base = *base, .extent = {1, 1}};
+                depth_view = FindOrEmplaceImageView(
+                    depth_id, ImageViewInfo(ImageViewType::e2D, PixelFormat::D32_FLOAT, range));
+            }
+        }
         // After the views: creating them may reallocate the framebuffer slots.
         Framebuffer* const dst_framebuffer = &slot_framebuffers[dst_view->first];
+
         return runtime.TemporalUpscale(dst_framebuffer, slot_image_views[dst_view->second],
                                        slot_image_views[src_view->second],
-                                       slot_image_views[motion_view->second], jitter,
-                                       motion_scale, use_history);
+                                       slot_image_views[motion_view->second],
+                                       depth_view ? &slot_image_views[depth_view] : nullptr,
+                                       render_size, jitter, motion_scale);
     }
 }
 
