@@ -1,10 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
+#include "shader_recompiler/environment.h"
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/ir_opt/passes.h"
@@ -12,11 +15,40 @@
 namespace {
 namespace IR = Shader::IR;
 
+class TestEnvironment final : public Shader::Environment {
+public:
+    bool native{};
+    std::vector<u32> scalar_offsets;
+    TestEnvironment() { stage = Shader::Stage::Compute; }
+    bool IsNativeProgram() const override { return native; }
+    bool IsCbufStorageBufferPointer(u32 index, u32 offset) override {
+        return index == 0 && std::ranges::find(scalar_offsets, offset) == scalar_offsets.end();
+    }
+    u64 ReadInstruction(u32) override { return 0; }
+    u32 ReadCbufValue(u32, u32) override { return 0; }
+    Shader::TextureType ReadTextureType(u32) override { return Shader::TextureType::Color2D; }
+    Shader::TexturePixelFormat ReadTexturePixelFormat(u32) override {
+        return Shader::TexturePixelFormat::A8B8G8R8_UNORM;
+    }
+    bool IsTexturePixelFormatInteger(u32) override { return false; }
+    u32 ReadViewportTransformState() override { return 1; }
+    u32 TextureBoundBuffer() const override { return 0; }
+    u32 LocalMemorySize() const override { return 0; }
+    u32 SharedMemorySize() const override { return 0; }
+    std::array<u32, 3> WorkgroupSize() const override { return {32, 1, 1}; }
+    bool HasHLEMacroState() const override { return false; }
+    std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32, u32) override {
+        return std::nullopt;
+    }
+    void Dump(u64, u64) override {}
+};
+
 struct KernelProgram {
     Shader::ObjectPool<IR::Inst> pool{256};
     IR::Block entry{pool};
     IR::Block loop{pool};
     IR::Program program;
+    TestEnvironment env;
 
     KernelProgram() {
         program.stage = Shader::Stage::Compute;
@@ -27,7 +59,7 @@ struct KernelProgram {
     std::vector<u32> TrackedOffsets() {
         Shader::HostTranslateInfo host{};
         host.min_ssbo_alignment = 16;
-        Shader::Optimization::GlobalMemoryToStorageBufferPass(program, host);
+        Shader::Optimization::GlobalMemoryToStorageBufferPass(env, program, host);
         std::vector<u32> offsets;
         for (const auto& descriptor : program.info.storage_buffers_descriptors) {
             offsets.push_back(descriptor.cbuf_offset);
@@ -48,6 +80,7 @@ IR::U64 Address(IR::IREmitter& ir, const IR::U32& low, const IR::U32& high) {
 TEST_CASE("Kernel parameter pointers win over 16-byte aligned strides",
           "[shader][storage_buffer]") {
     KernelProgram fixture;
+    fixture.env.native = GENERATE(false, true);
     IR::IREmitter ir{fixture.entry};
     const IR::U32 lane{ir.LocalInvocationIdX()};
     const IR::U32 row{ir.IAdd(ir.ShiftLeftLogical(lane, ir.Imm32(3)), Word(ir, 0x1c0))};
@@ -59,6 +92,7 @@ TEST_CASE("Kernel parameter pointers win over 16-byte aligned strides",
 TEST_CASE("Filter tap offset tables are not taken for the weight pointer",
           "[shader][storage_buffer]") {
     KernelProgram fixture;
+    fixture.env.native = GENERATE(false, true);
     IR::IREmitter ir{fixture.entry};
     const IR::U32 lane{ir.LocalInvocationIdX()};
     const IR::Value weights{ir.GetCbuf(ir.Imm32(0), ir.Imm32(0x168), 64, false)};
@@ -74,6 +108,7 @@ TEST_CASE("Filter tap offset tables are not taken for the weight pointer",
 
 TEST_CASE("Loop increments are not taken for the iterated pointer", "[shader][storage_buffer]") {
     KernelProgram fixture;
+    fixture.env.native = GENERATE(false, true);
     fixture.entry.AddBranch(&fixture.loop);
     fixture.loop.AddBranch(&fixture.loop);
     fixture.program.blocks = {&fixture.entry, &fixture.loop};
@@ -105,9 +140,37 @@ TEST_CASE("Loop increments are not taken for the iterated pointer", "[shader][st
 
 TEST_CASE("NVN storage buffer records keep their tracking", "[shader][storage_buffer]") {
     KernelProgram fixture;
+    fixture.env.native = GENERATE(false, true);
     IR::IREmitter ir{fixture.entry};
     const IR::U32 lane{ir.LocalInvocationIdX()};
     const IR::U32 low{ir.IAdd(Word(ir, 0x310), ir.ShiftLeftLogical(lane, ir.Imm32(2)))};
     static_cast<void>(ir.LoadGlobal32(Address(ir, low, Word(ir, 0x314))));
     CHECK(fixture.TrackedOffsets() == std::vector<u32>{0x310});
+}
+
+TEST_CASE("Native pointer classification rejects a scalar selected by word tracking",
+          "[shader][storage_buffer]") {
+    KernelProgram fixture;
+    fixture.env.native = true;
+    fixture.env.scalar_offsets = {0x310};
+    IR::IREmitter ir{fixture.entry};
+    const auto low = ir.IAdd(Word(ir, 0x310), Word(ir, 0x168));
+    ir.WriteGlobal32(Address(ir, low, Word(ir, 0x314)), ir.Imm32(1));
+    CHECK(fixture.TrackedOffsets() == std::vector<u32>{0x168});
+    CHECK_FALSE(fixture.program.info.native_global_bounds);
+    CHECK(std::ranges::count_if(fixture.entry.Instructions(), [](const auto& inst) {
+        return inst.GetOpcode() == IR::Opcode::WriteStorage32;
+    }) == 1);
+    CHECK(fixture.program.info.storage_buffers_descriptors.front().is_written);
+}
+
+TEST_CASE("Native accesses without mapped pointers are not rebased on scalars",
+          "[shader][storage_buffer]") {
+    KernelProgram fixture;
+    fixture.env.native = true;
+    fixture.env.scalar_offsets = {0x310};
+    IR::IREmitter ir{fixture.entry};
+    ir.WriteGlobal32(Address(ir, Word(ir, 0x310), Word(ir, 0x314)), ir.Imm32(1));
+    CHECK(fixture.TrackedOffsets().empty());
+    CHECK(fixture.entry.back().GetOpcode() == IR::Opcode::WriteGlobal32);
 }

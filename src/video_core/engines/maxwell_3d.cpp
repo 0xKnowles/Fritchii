@@ -342,7 +342,7 @@ void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
     // the state they were begun with: NVN's draw macros reset the base instance (and its copy in
     // c[0][0x644]) right after the loop, before the macro returns.
     if (draw_manager.HasDeferredDraw() && !DrawManager::IsInstanceLoopMethod(method)) [[unlikely]] {
-        draw_manager.DrawDeferred(*this);
+        draw_manager.DrawDeferred(*this, true);
     }
     regs.reg_array[method] = argument;
     for (auto const& table : dirty.tables)
@@ -518,6 +518,10 @@ void Maxwell3D::DumpRecentWrites(u32 method) {
     }
     LOG_ERROR(HW_GPU, "Write to {:#x} while macro {:#x} collects parameters ({} so far); last writes:",
               method, executing_macro, macro_params.size());
+    if (!record_write_history) {
+        LOG_ERROR(HW_GPU, "Register write history disabled; EDEN_NX2_3D_HISTORY=1 enables it");
+        return;
+    }
     for (size_t i = 0; i < recent_writes.size(); ++i) {
         const auto& w = recent_writes[(recent_write_index + i) % recent_writes.size()];
         if (w.amount != 0) {
@@ -537,7 +541,7 @@ void Maxwell3D::CallMultiMethod(Core::System& system, u32 method, const u32* bas
     }
     // As in ProcessDirtyRegisters: the paths below write without it.
     if (draw_manager.HasDeferredDraw() && !DrawManager::IsInstanceLoopMethod(method)) [[unlikely]] {
-        draw_manager.DrawDeferred(*this);
+        draw_manager.DrawDeferred(*this, true);
     }
     switch (method) {
     case MAXWELL3D_REG_INDEX(const_buffer.buffer):
@@ -818,7 +822,6 @@ struct Maxwell3D::FrontState {
     Regs::ShadowRamControl control{};
     u32 executing_macro{};
     std::vector<u32> parameters;
-    std::vector<u32> fifo;
     u64 calls{};
     /// A method the draw manager handles was sent since the back last ran DrawDeferred: only
     /// then can it have a deferred instanced draw to issue at the end of a macro.
@@ -1110,13 +1113,11 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             engine.native_jit = std::make_shared<TuringMacroJit>();
         }
         engine.native_jit->Prepare(engine.native_code, engine.native_code_generation);
-        fs.fifo.assign(fs.parameters.begin(), fs.parameters.end());
         const auto result = engine.native_jit->Execute(
-            start, fs.fifo, std::span<u32>{native_data_ram}, read, emit);
+            start, fs.parameters, std::span<u32>{native_data_ram}, read, emit);
 #else
-        fs.fifo.assign(fs.parameters.begin(), fs.parameters.end());
         const auto result =
-            engine.native_interpreter.Execute(engine.native_code, start, fs.fifo, read, emit);
+            engine.native_interpreter.Execute(engine.native_code, start, fs.parameters, read, emit);
 #endif
         if (!result.success) {
             engine.native_execution_failed = true;
@@ -1152,7 +1153,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     for (u32 i = 0; i < words; ++i) {
         const u32 word = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
         if (method == 0x158) {
-            fs.fifo.push_back(word);
+            fs.parameters.push_back(word);
         } else if (ram + i < native_data_ram.size()) {
             native_data_ram[ram + i] = word;
         }

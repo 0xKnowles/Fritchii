@@ -5,16 +5,18 @@ Windows, then AMD FSR 3.1.4 if NVIDIA DLSS is disabled or unavailable. FSR uses 
 eight temporal-upscaling passes, including depth, motion, history and optional RCAS.
 This is separate from the presentation filters that scale the finished window image.
 
-The old custom temporal history blend and its jitter-only spatial substitute have been
-removed. If neither replacement can run, the shader-cache interception leaves the native
-dispatch enabled. An already-rejected native tensor shader remains an explicit dispatch
-failure; it is not reported as a successful replacement. General tensor emulation remains.
+Fire Emblem uses the jitter-only spatial workaround by default. Explicit `fsr` and `dlss`
+comparison modes enable temporal replacement for its validated input contract. The upstream
+temporal blend and RCAS fallback remain available if a temporal backend is unavailable.
+Invalid consumed inputs leave the native dispatch enabled. An already-rejected native
+tensor shader remains an explicit dispatch failure. General tensor emulation remains.
 
 ## Supported input contract
 
 Selection currently recognizes Fire Emblem: Fortune's Weave's captured prepass and output
-shader, under its exact program ID. It requires matching B10G11R11 input/output, R16G16
-motion, D32 depth and a fresh jitter sample. The upstream contract uses reversed depth,
+shader, under its exact program ID. Temporal mode requires matching B10G11R11 input/output,
+R16G16 motion, D32 depth and a fresh jitter sample. Spatial mode requires only the matching
+color/output and fresh jitter. The upstream temporal contract uses reversed depth,
 normalized motion toward the previous frame, HDR color and jitter in render pixels.
 Resolution scaling scales the render extent and jitter together. History resets on size
 changes, first use and evaluation gaps longer than 250 ms. An explicit game camera-cut
@@ -35,14 +37,17 @@ and should remain private. No shaders are skipped or game files changed by this 
 ## Settings and comparison runs
 
 "Use NVIDIA DLSS in place of a game's DLSS" defaults to off and takes effect when the game
-starts. Disabled means no NVIDIA runtime is loaded; the validated replacement uses FSR 3.1.
-Missing DLLs, unsupported GPUs and failed DLSS recording fall back to FSR. Failed evaluation
-output is not displayed. Recording waits for the scheduler worker, not GPU completion,
-before choosing the fallback. This adds CPU synchronization whose in-game cost is unmeasured.
+starts. Disabled means no NVIDIA runtime is loaded; an explicitly selected temporal
+replacement uses FSR 3.1. Missing DLLs and unsupported GPUs fall back to FSR. Recording is
+asynchronous. A failed DLSS recording clears that frame's output, restores input layouts,
+and makes later evaluations fall back; it does not wait for the scheduler worker.
 
-`EDEN_NX2_DLSS_REPLACEMENT=fsr` forces FSR for comparison. `native` preserves the guest
-evaluation. The old `standin` and `EDEN_NX2_DLSS_STANDIN` modes no longer select a fallback.
-The RCAS sharpness setting controls FSR's sharpening. NVIDIA model-selection overrides
+`EDEN_NX2_DLSS_REPLACEMENT=fsr` selects temporal replacement and forces FSR for comparison.
+`dlss` selects temporal replacement with NVIDIA preferred when enabled and available.
+`native` preserves the guest evaluation. With no override, Fire Emblem uses spatial de-jitter.
+The old `EDEN_NX2_DLSS_STANDIN` variable is not read. The internal `standin` backend override
+does not select Fire Emblem's intercepted dispatch. The RCAS sharpness setting controls FSR
+and fallback sharpening. NVIDIA model-selection overrides
 from the upstream implementation remain available for diagnostic comparisons.
 
 ## Build and distribution
@@ -55,7 +60,8 @@ For the optional Windows NVIDIA path, obtain only the MIT Streamline headers and
 from NVIDIA-RTX/Streamline tag `v2.14.16`, commit
 `625db07d4bca5abc67d781c42af7e7fb0761f1b6`. The SDK directory must contain `include/sl.h`,
 `include/sl_dlss.h`, `include/sl_helpers_vk.h`, `include/sl_security.h` and their companion
-headers. Configure with `-DEGLANTINE_STREAMLINE_SDK=<header-root>`. This adds Windows
+headers. MSVC x86_64 builds enable `ENABLE_NVIDIA_DLSS` by default and fetch the headers;
+`-DEGLANTINE_STREAMLINE_SDK=<header-root>` selects a local copy. This adds Windows
 `version`, `wintrust` and `crypt32` libraries, not NVIDIA import libraries. Retain Streamline's
 MIT `license.txt` in the packaged notices.
 
@@ -71,4 +77,5 @@ This backport is AI-assisted and requires human review and testing before distri
 It carries upstream work by Duck912 from Eglantine commits `08dbcc7e3b3d`, `11cebf56014a`
 and PR #434 through `f9d0c802e8e4`, plus Jonas's warning fix `537c1f4e173a`. The empty-extension requirement
 fix `1889602c7a0d` is a separately included follow-up. Existing SPDX notices and AMD/NVIDIA
-license text are retained. No commit, push or upstream submission was made by the agent.
+license text are retained. The upstream nx2 merge also carries newer asynchronous recording
+and fallback changes while retaining the fork's signature checks and input validation.

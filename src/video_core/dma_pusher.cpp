@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstdio>
 
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/memory.h"
@@ -103,8 +104,11 @@ bool DmaPusher::Step() {
     }
 
     if (header.size > 0) {
-        bool gpu_written = FlushGpuWrittenCommands(
-            dma_state.dma_get, size_t{header.size} * sizeof(u32));
+        if (g_nx2_ampere.load(std::memory_order_relaxed)) {
+            VideoCommon::GpuSplit::Get().Drain();
+        }
+        bool gpu_written = IsGpuWrittenCommands(dma_state.dma_get,
+                                                 size_t{header.size} * sizeof(u32));
         if (subchannels[dma_state.subchannel] && dma_state.method_count) {
             const auto engine = subchannel_type[dma_state.subchannel];
             const bool kepler_payload = engine == Engines::EngineTypes::KeplerCompute && dma_state.method == ComputeInline && dma_state.non_incrementing;
@@ -123,7 +127,8 @@ bool DmaPusher::Step() {
                         gpu_written = true;
                     }
                 }
-                if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+                if (auto& split = VideoCommon::GpuSplit::Get();
+                    split.Active() && !g_nx2_ampere.load(std::memory_order_relaxed)) {
                     // The caches behind IsMemoryDirty belong to the split's back thread.
                     split.Defer([engine_state, memory = &memory_manager, address = GPUVAddr{dma_state.dma_get},
                                  bytes = words * sizeof(u32)] {
@@ -170,7 +175,10 @@ bool DmaPusher::Step() {
         const bool use_safe = !VideoCommon::GpuSplit::Get().Active() &&
                               (Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe());
         // Resume and GPU-written entries need live words, even after a flush cleared dirty state.
-        const bool submitted = VideoCommon::CanUseSubmittedCommands(
+        const bool submitted = (command_list.snapshot_suspensions & 1) == 0 &&
+                               command_list.snapshot_suspensions ==
+                                   suspensions.load(std::memory_order_acquire) &&
+                               VideoCommon::CanUseSubmittedCommands(
             command_resume_offset != 0,
             dma_pushbuffer_subindex < command_list.submitted_offsets.size(), gpu_written,
             use_safe && memory_manager.IsMemoryDirty(dma_state.dma_get,
@@ -188,7 +196,13 @@ bool DmaPusher::Step() {
             RecordParsedEntry(header, commands);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+        } else if (ReadGpuWrittenCommands(dma_state.dma_get, static_cast<u32>(header.size))) {
+            const std::span<const CommandHeader> commands{command_headers.data(), header.size};
+            RecordParsedEntry(header, commands);
+            command_resume_offset +=
+                ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         } else {
+            FlushGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::UnsafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
             RecordParsedEntry(header, commands);
@@ -391,6 +405,15 @@ void DmaPusher::CallMethod(u32 argument) {
             ReportUnboundSubchannel();
             return;
         }
+        // Compute dispatches and DMA copies write the command lists ReadGpuWrittenCommands reads.
+        const auto engine_type = subchannel_type[dma_state.subchannel];
+        const bool writer = engine_type == Engines::EngineTypes::KeplerCompute ||
+                            engine_type == Engines::EngineTypes::MaxwellDMA;
+        SCOPE_EXIT {
+            if (writer) {
+                split.NoteWriter();
+            }
+        };
         if (split.Active()) {
             const GPUVAddr segment = dma_state.dma_get + dma_state.dma_word_offset;
             if (split.FrontMacros()) {
@@ -441,6 +464,15 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
             ReportUnboundSubchannel();
             return;
         }
+        // Compute dispatches and DMA copies write the command lists ReadGpuWrittenCommands reads.
+        const auto engine_type = subchannel_type[dma_state.subchannel];
+        const bool writer = engine_type == Engines::EngineTypes::KeplerCompute ||
+                            engine_type == Engines::EngineTypes::MaxwellDMA;
+        SCOPE_EXIT {
+            if (writer) {
+                split.NoteWriter();
+            }
+        };
         if (split.Active()) {
             const GPUVAddr segment = dma_state.dma_get + dma_state.dma_word_offset;
             if (split.FrontMacros()) {
@@ -485,18 +517,81 @@ bool DmaPusher::IsGpuWrittenCommands(GPUVAddr address, size_t size) {
     return false;
 }
 
+bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
+    // The pages are marked as command list pages: from the next write on, the buffer cache copies
+    // them to host memory right after the dispatch or copy that writes them and submits. The
+    // front then waits only for the back to run that work and for the GPU to finish the copy, not
+    // for everything queued and a cache flush (FlushGpuWrittenCommands: ~400 GPU round trips a
+    // second in a Mario Kart World race, during which the back had nothing to do). Pages
+    // FlushGpuWrittenCommands flushed whole and no GPU work wrote since are read from guest
+    // memory.
+    if (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) || count == 0 ||
+        rasterizer == nullptr) {
+        return false;
+    }
+    const GPUVAddr end = address + u64{count} * sizeof(u32);
+    bool written = false;
+    for (GPUVAddr page = address & ~GPUVAddr{0xfff}; page < end; page += 0x1000) {
+        if (const auto device = memory_manager.GpuToCpuAddress(page);
+            device && Tegra::Nx2IsGpuWritten(*device)) {
+            Tegra::Nx2MarkCommandListPage(*device);
+            written = true;
+        }
+    }
+    if (!written) {
+        return false;
+    }
+    if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+        split.WaitForWriters();
+    }
+    using GpuWrittenList = VideoCore::RasterizerInterface::GpuWrittenList;
+    command_headers.resize_destructive(count);
+    u8* const out = reinterpret_cast<u8*>(command_headers.data());
+    for (GPUVAddr chunk = address; chunk < end;) {
+        const GPUVAddr chunk_end = (std::min)(end, (chunk & ~GPUVAddr{0xfff}) + 0x1000);
+        const std::span<u8> part{out + (chunk - address), static_cast<size_t>(chunk_end - chunk)};
+        const auto device = memory_manager.GpuToCpuAddress(chunk);
+        if (!device) {
+            return false;
+        }
+        GpuWrittenList where = GpuWrittenList::Synced;
+        if (Tegra::Nx2IsGpuWritten(*device)) {
+            where = rasterizer->ReadGpuWrittenCommandList(*device, part);
+        }
+        if (where == GpuWrittenList::Unknown) {
+            return false;
+        }
+        if (where == GpuWrittenList::Synced) {
+            memory_manager.ReadBlockUnsafe(chunk, part.data(), part.size());
+        }
+        chunk = chunk_end;
+    }
+    return true;
+}
+
 bool DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
     if (!g_nx2_ampere.load(std::memory_order_relaxed) || size == 0) {
         return false;
     }
-    return VideoCommon::SynchronizeCommandFetch(
-        [] { VideoCommon::GpuSplit::Get().Drain(); },
-        [&] { return IsGpuWrittenCommands(address, size); },
-        [&] {
-            if (memory_manager.IsMemoryDirty(address, size, VideoCommon::CacheType::BufferCache)) {
-                memory_manager.FlushRegion(address, size, VideoCommon::CacheType::BufferCache);
+    if (!IsGpuWrittenCommands(address, size)) {
+        return false;
+    }
+    const GPUVAddr first_page = address & ~GPUVAddr{0xfff};
+    const GPUVAddr end_page = (address + size + 0xfff) & ~GPUVAddr{0xfff};
+    if (memory_manager.IsMemoryDirty(first_page, end_page - first_page,
+                                     VideoCommon::CacheType::BufferCache)) {
+        memory_manager.FlushRegion(first_page, end_page - first_page,
+                                   VideoCommon::CacheType::BufferCache);
+    }
+    if (rasterizer != nullptr) {
+        for (GPUVAddr page = first_page; page < end_page; page += 0x1000) {
+            if (const auto device = memory_manager.GpuToCpuAddress(page);
+                device && Tegra::Nx2IsCommandListPage(*device)) {
+                rasterizer->NoteGpuWrittenCommandListSynced(*device);
             }
-        });
+        }
+    }
+    return true;
 }
 
 void DmaPusher::ReportUnboundSubchannel() {

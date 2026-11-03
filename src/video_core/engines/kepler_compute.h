@@ -274,9 +274,9 @@ private:
     void DescribeNativeResources(const NativeQmdScheduler::Descriptor& qmd);
     void RememberDlssMotionVectors();
 
-    /// Motion vectors of Fire Emblem: Fortune's Weave's DLSS evaluation, from its first pass (run
-    /// earlier in the frame than the network pass the stand-in replaces), with the input colour
-    /// image and camera jitter they go with.
+    /// Motion vectors and depth of Fire Emblem: Fortune's Weave's DLSS evaluation, from its first
+    /// pass (run earlier in the frame than the network pass the stand-in replaces), with the input
+    /// colour image and camera jitter they go with.
     std::optional<Texture::TICEntry> dlss_motion_vectors;
     std::optional<Texture::TICEntry> dlss_depth;
     u32 dlss_contract_trace_count{};

@@ -215,6 +215,10 @@ struct GPU::Impl {
         gpu_thread.Run(std::move(func), is_async);
     }
 
+    void MapInOrder(std::function<void()>&& func) {
+        gpu_thread.Run(std::move(func), is_async, true);
+    }
+
     /// Notify rasterizer that any caches of the specified region should be flushed to Switch memory
     void FlushRegion(DAddr addr, u64 size) {
         gpu_thread.FlushRegion(addr, size, is_async);
@@ -233,7 +237,9 @@ struct GPU::Impl {
                      raster_area.start_address, raster_area.end_address,
                      reads.load(std::memory_order_relaxed));
         }
-        const u64 fence = RequestSyncOperation([this, &raster_area]() {
+        const u64 fence = RequestSyncOperation([this, raster_area]() {
+            // Apply collected guest writes before downloading GPU data over guest memory.
+            InvalidateGPUCache();
             renderer->ReadRasterizer()->FlushRegion(raster_area.start_address, raster_area.end_address - raster_area.start_address);
         });
         gpu_thread.TickGPU(is_async);
@@ -510,6 +516,10 @@ bool GPU::IsAsync() const {
     return impl->is_async;
 }
 
+bool GPU::HasSuspendedChannels() const {
+    return impl->scheduler.HasPendingChannelsAnyThread();
+}
+
 bool GPU::UseNvdec() const {
     return impl->use_nvdec;
 }
@@ -552,6 +562,10 @@ void GPU::FlushRegion(DAddr addr, u64 size) {
 
 void GPU::RunInOrder(std::function<void()>&& func) {
     impl->RunInOrder(std::move(func));
+}
+
+void GPU::MapInOrder(std::function<void()>&& func) {
+    impl->MapInOrder(std::move(func));
 }
 
 void GPU::InvalidateRegion(DAddr addr, u64 size, bool preserve_gpu_writes) {

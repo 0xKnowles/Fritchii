@@ -24,7 +24,8 @@ establishes a routing difference, not which network instruction or input is wron
   (`4cbf6eff32525aec`) supplies this frame's input-colour identity and camera jitter.
   When these match the output pass's input, a fractional-pixel correction removes
   jitter before bilinear sampling. No motion vectors or previous-frame history are
-  used, allocated or updated by this path. Completion is handled separately from shader
+  sampled by this path. The current image is stored for same-frame RCAS sharpening.
+  Completion is handled separately from shader
   rejection and is never added to the rejected-program cache.
 - If the pair does not qualify or the renderer cannot accelerate the copy, the
   original shader dispatch remains enabled.
@@ -33,12 +34,13 @@ establishes a routing difference, not which network instruction or input is wron
 ## Same-scene verification
 
 The candidate enables this narrow workaround by default.
-`EDEN_NX2_DLSS_STANDIN=0` restores the native path for a fresh process;
-`EDEN_NX2_DLSS_STANDIN=1` explicitly selects the workaround.
+`EDEN_NX2_DLSS_REPLACEMENT=native` restores the native path for a fresh process.
+Explicit `fsr` or `dlss` values select the validated temporal path described in
+[Game-DLSS replacement](native-dlss-replacement.md), rather than the spatial workaround.
 The setting is process-local and does not modify saved configuration.
 
-Look for `Fire Emblem DLSS output: spatial stand-in applied (no temporal history)`
-in the log. `unavailable; retaining native dispatch` means the workaround did not
+Look for `Fire Emblem DLSS replacement: applied` in the log with no replacement override.
+`unavailable; retaining native dispatch` means the workaround did not
 apply; do not treat that run as evidence for or against the DLSS hypothesis.
 
 Use the same save, camera motion and scene for both runs. If the trails vanish,
@@ -48,8 +50,7 @@ confirmation log, capture the input colour and depth before this pass.
 The original spatial-only candidate removed the reported smearing but exposed camera
 jitter (user report). The de-jitter candidate consumes each prepass sample once and
 rejects non-finite/out-of-range values or mismatched input images. Missing samples
-fall back to the original spatial copy. Confirm compensation with
-`Fire Emblem jitter compensation: ... applied without history` in the log.
+retain the native dispatch rather than applying an uncorrected copy.
 
 This spatial substitute may look softer or more aliased than correct DLSS.
 It deliberately avoids adding a second unverified temporal-history path.

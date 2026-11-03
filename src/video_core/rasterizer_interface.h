@@ -97,6 +97,20 @@ public:
     virtual void FlushRegion(DAddr addr, u64 size,
                              VideoCommon::CacheType which = VideoCommon::CacheType::All) = 0;
 
+    /// Switch 2, from the GPU thread's front: where a GPU-written command list's words are.
+    enum class GpuWrittenList {
+        Unknown, ///< Neither: the caller drains, flushes the page and notes it synced
+        Copied,  ///< `out` (within one 4 KiB page) is filled from the copy made after its writer
+        Synced,  ///< Guest memory holds the page: no GPU work wrote it since it was flushed
+    };
+    virtual GpuWrittenList ReadGpuWrittenCommandList([[maybe_unused]] DAddr addr,
+                                                     [[maybe_unused]] std::span<u8> out) {
+        return GpuWrittenList::Unknown;
+    }
+
+    /// Switch 2: the front flushed this command list page with the split drained.
+    virtual void NoteGpuWrittenCommandListSynced([[maybe_unused]] DAddr page) {}
+
     /// Check if the the specified memory area requires flushing to CPU Memory.
     virtual bool MustFlushRegion(DAddr addr, u64 size,
                                  VideoCommon::CacheType which = VideoCommon::CacheType::All) = 0;
@@ -168,12 +182,13 @@ public:
 
     /// Stand-in for a DLSS evaluation: temporal upscale of src into dst along motion_vectors
     /// (jitter in src pixels; motion_scale turns a motion vector into a UV offset to the previous
-    /// frame), with depth required by NVIDIA DLSS or FSR 3.1.
+    /// frame), with depth for NVIDIA DLSS or FSR 3.1. With use_history=false, only de-jitter src.
     /// False when unsupported; the caller retains its native dispatch.
     [[nodiscard]] virtual bool AccelerateTemporalUpscale(
         const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst,
-        const Tegra::Engines::Fermi2D::Surface& motion_vectors, std::array<f32, 2> jitter,
-        std::array<f32, 2> motion_scale, const Tegra::Texture::TICEntry* depth) {
+        const Tegra::Engines::Fermi2D::Surface& motion_vectors,
+        const Tegra::Texture::TICEntry* depth, std::array<f32, 2> jitter,
+        std::array<f32, 2> motion_scale, bool use_history = true) {
         return false;
     }
 

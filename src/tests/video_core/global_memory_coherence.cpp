@@ -119,7 +119,7 @@ TEST_CASE("Global load coherency survives storage buffer tracking", "[video_core
                 }
                 HostTranslateInfo host{};
                 host.min_ssbo_alignment = 16;
-                Optimization::GlobalMemoryToStorageBufferPass(fixture.program, host);
+                Optimization::GlobalMemoryToStorageBufferPass(env, fixture.program, host);
                 const auto expected = static_cast<IR::Opcode>(
                     static_cast<u32>(tracked ? IR::Opcode::LoadStorageU8 : IR::Opcode::LoadGlobalU8) + size);
                 const auto& instructions = fixture.block.Instructions();

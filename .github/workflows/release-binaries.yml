@@ -13,6 +13,9 @@ on:
     # A binary only changes when build inputs change; docs-only pushes skip the build.
     paths:
       - "src/**"
+      # Test-only changes cannot change a binary: the build configures with BUILD_TESTING=OFF and
+      # YUZU_TESTS=OFF below, so a push that only touches src/tests has nothing to rebuild.
+      - "!src/tests/**"
       - "CMakeLists.txt"
       - "CMakeModules/**"
       - "externals/**"
@@ -29,11 +32,13 @@ permissions:
 # and an older reader refuses it, so this has to stay at or above whatever produced
 # eglantine.profdata; bump it when a refreshed profile needs a newer LLVM.
 env:
-  PGO_LLVM_VERSION: '23'
+  PGO_LLVM_VERSION: "23"
 
+# A running build is never cancelled: it finishes and publishes. A push meanwhile queues one build;
+# a later push replaces it, so the newest commit builds as soon as the running one is done.
 concurrency:
   group: release-binaries-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   prepare-release:
@@ -135,7 +140,7 @@ jobs:
         if: startsWith(matrix.platform, 'linux') && runner.arch != 'ARM64'
         uses: jurplel/install-qt-action@v4
         with:
-          version: '6.8.3'
+          version: "6.8.3"
           host: linux
           target: desktop
           arch: linux_gcc_64
@@ -146,7 +151,7 @@ jobs:
         if: startsWith(matrix.platform, 'linux') && runner.arch == 'ARM64'
         uses: jurplel/install-qt-action@v4
         with:
-          version: '6.8.3'
+          version: "6.8.3"
           host: linux_arm64
           target: desktop
           arch: linux_gcc_arm64
@@ -187,7 +192,7 @@ jobs:
         if: matrix.platform == 'windows-x86_64'
         uses: jurplel/install-qt-action@v4
         with:
-          version: '6.8.3'
+          version: "6.8.3"
           host: windows
           target: desktop
           arch: win64_msvc2022_64
@@ -409,9 +414,9 @@ jobs:
           test -x build/release/bin/lichii
           test -x build/release/bin/eden-cli
           strip build/release/bin/lichii build/release/bin/eden-cli
-          tar -czf "eglantine-${GITHUB_SHA}-${{ matrix.platform }}.tar.gz" \
+          tar -czf "lichii-${GITHUB_SHA}-${{ matrix.platform }}.tar.gz" \
             -C build/release/bin lichii eden-cli
-          ls -la "eglantine-${GITHUB_SHA}-${{ matrix.platform }}.tar.gz"
+          ls -la "lichii-${GITHUB_SHA}-${{ matrix.platform }}.tar.gz"
 
       # A self-contained AppImage: linuxdeploy bundles every library the two programs need except
       # the base system ones (glibc, X11/Wayland client libraries, the GPU driver and Vulkan loader),
@@ -436,7 +441,12 @@ jobs:
           cp dist/lichii.png "$icon"
           export APPIMAGE_EXTRACT_AND_RUN=1
           export QMAKE="$QT_ROOT_DIR/bin/qmake"
-          export LDAI_OUTPUT="eglantine-${GITHUB_SHA}-${{ matrix.platform }}.AppImage"
+          # Include Wayland platform plugins and their graphics/shell integrations.
+          export EXTRA_QT_MODULES=waylandcompositor
+          export EXTRA_PLATFORM_PLUGINS='libqwayland-egl.so;libqwayland-generic.so'
+          # Embedded in the AppImage metadata; matches the release tag (build-N) plus the commit.
+          export LDAI_VERSION="build-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
+          export LDAI_OUTPUT="lichii-${GITHUB_SHA}-${{ matrix.platform }}.AppImage"
           export OUTPUT="$LDAI_OUTPUT"
           export ARCH="$arch"
           "$tools/linuxdeploy-$arch.AppImage" --appdir AppDir \
@@ -545,15 +555,15 @@ jobs:
             codesign --force --sign - --entitlements dist/eglantine.entitlements "$app"
           fi
           codesign --verify --deep --strict "$app"
-          ditto -c -k --keepParent "$app" "eglantine-${GITHUB_SHA}-${{ matrix.platform }}.zip"
-          ls -la "eglantine-${GITHUB_SHA}-${{ matrix.platform }}.zip"
+          ditto -c -k --keepParent "$app" "lichii-${GITHUB_SHA}-${{ matrix.platform }}.zip"
+          ls -la "lichii-${GITHUB_SHA}-${{ matrix.platform }}.zip"
           # Also ship a .dmg (drag lichii.app onto Applications).
           dmgdir=$(mktemp -d)
           ditto "$app" "$dmgdir/lichii.app"
           ln -s /Applications "$dmgdir/Applications"
           hdiutil create -volname "Lichii" -srcfolder "$dmgdir" -ov -format UDZO \
-            "eglantine-${GITHUB_SHA}-${{ matrix.platform }}.dmg"
-          ls -la "eglantine-${GITHUB_SHA}-${{ matrix.platform }}.dmg"
+            "lichii-${GITHUB_SHA}-${{ matrix.platform }}.dmg"
+          ls -la "lichii-${GITHUB_SHA}-${{ matrix.platform }}.dmg"
 
       # The artifact is the bin folder itself: GitHub zips artifacts on download, and uploading a
       # zip gave a zip inside a zip. The release job zips it once for the release.
@@ -561,7 +571,7 @@ jobs:
         if: matrix.platform == 'windows-x86_64'
         uses: actions/upload-artifact@v7
         with:
-          name: eglantine-${{ matrix.platform }}-${{ github.sha }}
+          name: lichii-${{ matrix.platform }}-${{ github.sha }}
           path: build/release/bin/
           if-no-files-found: error
           retention-days: 7
@@ -570,7 +580,7 @@ jobs:
         if: matrix.mingw
         uses: actions/upload-artifact@v7
         with:
-          name: eglantine-${{ matrix.platform }}-${{ github.sha }}
+          name: lichii-${{ matrix.platform }}-${{ github.sha }}
           path: build/release/bin/
           if-no-files-found: error
           retention-days: 7
@@ -580,10 +590,10 @@ jobs:
         if: startsWith(matrix.platform, 'linux')
         uses: actions/upload-artifact@v7
         with:
-          name: eglantine-${{ matrix.platform }}-${{ github.sha }}
+          name: lichii-${{ matrix.platform }}-${{ github.sha }}
           path: |
-            eglantine-${{ github.sha }}-${{ matrix.platform }}.tar.gz
-            eglantine-${{ github.sha }}-${{ matrix.platform }}.AppImage
+            lichii-${{ github.sha }}-${{ matrix.platform }}.tar.gz
+            lichii-${{ github.sha }}-${{ matrix.platform }}.AppImage
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
@@ -593,10 +603,10 @@ jobs:
         if: startsWith(matrix.platform, 'macos')
         uses: actions/upload-artifact@v7
         with:
-          name: eglantine-${{ matrix.platform }}-${{ github.sha }}
+          name: lichii-${{ matrix.platform }}-${{ github.sha }}
           path: |
-            eglantine-${{ github.sha }}-${{ matrix.platform }}.zip
-            eglantine-${{ github.sha }}-${{ matrix.platform }}.dmg
+            lichii-${{ github.sha }}-${{ matrix.platform }}.zip
+            lichii-${{ github.sha }}-${{ matrix.platform }}.dmg
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
@@ -615,7 +625,7 @@ jobs:
       - name: Download binaries
         uses: actions/download-artifact@v7
         with:
-          pattern: eglantine-*-${{ github.sha }}
+          pattern: lichii-*-${{ github.sha }}
           path: artifacts
 
       - name: Package release files
@@ -623,18 +633,25 @@ jobs:
         run: |
           set -euo pipefail
           mkdir dist
+          # Asset names drop the commit sha: the release tag already identifies the build, and
+          # stable names let the notes table link to them.
+          strip_sha() { sed "s/-${GITHUB_SHA}//" <<< "$1"; }
           for artifact in artifacts/*/; do
             name=$(basename "$artifact")
             if compgen -G "$artifact*.AppImage" > /dev/null; then
               # Linux: ship the AppImage and the tar.gz as they are.
-              cp "$artifact"/*.AppImage "$artifact"/*.tar.gz dist/
+              for file in "$artifact"*.AppImage "$artifact"*.tar.gz; do
+                cp "$file" "dist/$(strip_sha "$(basename "$file")")"
+              done
             elif compgen -G "$artifact*.zip" > /dev/null; then
-              cp "$artifact"/*.zip dist/
-              cp "$artifact"/*.dmg dist/ 2>/dev/null || true
+              for file in "$artifact"*.zip "$artifact"*.dmg; do
+                [[ -e "$file" ]] && cp "$file" "dist/$(strip_sha "$(basename "$file")")"
+              done
             else
-              (cd "$artifact" && zip -qr "${GITHUB_WORKSPACE}/dist/${name}.zip" .)
+              (cd "$artifact" && zip -qr "${GITHUB_WORKSPACE}/dist/$(strip_sha "$name").zip" .)
             fi
           done
+          ls -la dist
 
       - name: Create release
         shell: bash
@@ -647,16 +664,42 @@ jobs:
             echo "Release tag build-${GITHUB_RUN_NUMBER} points to $tag_sha instead of $GITHUB_SHA"
             exit 1
           fi
-          ls -la dist
-          gh release create "build-${GITHUB_RUN_NUMBER}" dist/* \
+          tag="build-${GITHUB_RUN_NUMBER}"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"
+
+          cat > notes.md <<EOF
+          Automatic build of \`${GITHUB_REF_NAME}\` at ${GITHUB_SHA}.
+
+          ## Linux
+
+          Linux packages come as an AppImage (self-contained, needs glibc 2.39 or newer: Ubuntu 24.04, Fedora 40, Debian 13, Arch) and a tar.gz (uses your system libraries, so Qt 6 and the usual libraries must be installed).
+
+          | Build Type | Standard | PGO (Recommended) | Notes |
+          | --- | --- | --- | --- |
+          | amd64 | [AppImage](${base}/lichii-linux-x86_64.AppImage) · [tar.gz](${base}/lichii-linux-x86_64.tar.gz) | [AppImage](${base}/lichii-linux-x86_64-pgo.AppImage) · [tar.gz](${base}/lichii-linux-x86_64-pgo.tar.gz) | Make the AppImage executable (\`chmod +x\`) and run it |
+          | ARM (aarch64) | [AppImage](${base}/lichii-linux-aarch64.AppImage) · [tar.gz](${base}/lichii-linux-aarch64.tar.gz) | [AppImage](${base}/lichii-linux-aarch64-pgo.AppImage) · [tar.gz](${base}/lichii-linux-aarch64-pgo.tar.gz) | |
+
+          ## Windows
+
+          Windows packages are in-place zip files: extract and run \`lichii.exe\`, or \`eden-cli.exe\` from a terminal.
+
+          | Build Type | Standard | PGO (Recommended) | Notes |
+          | --- | --- | --- | --- |
+          | amd64 / x86_64 (MSVC) | [MSVC zip](${base}/lichii-windows-x86_64.zip) | | Use if you run into graphical issues on other builds |
+          | amd64 / x86_64 (MinGW) | | [PGO zip](${base}/lichii-windows-x86_64-pgo.zip) | Built with MinGW clang; bundles its own DLLs, no Visual C++ redistributable needed |
+
+          ## macOS
+
+          | Build Type | Standard | PGO (Recommended) | Notes |
+          | --- | --- | --- | --- |
+          | arm64 (Apple Silicon) | [zip](${base}/lichii-macos-arm64.zip) | | macOS 15 or newer. Not notarized: right-click and choose Open the first time, or run \`xattr -dr com.apple.quarantine lichii.app\`. \`eden-cli\` is inside the app, in \`Contents/MacOS\` |
+
+          The PGO builds are the same programs compiled with profile-guided optimization (clang plus Eglantine's profile); prefer them when your CPU supports it.
+          EOF
+
+          gh release create "${tag}" dist/* \
             --repo "${GITHUB_REPOSITORY}" \
             --verify-tag \
             --prerelease \
-            --title "Eglantine ${GITHUB_REF_NAME} build ${GITHUB_RUN_NUMBER} (${GITHUB_SHA::7})" \
-            --notes "Automatic build of ${GITHUB_REF_NAME} at ${GITHUB_SHA}.
-
-          Windows: extract the zip and run lichii.exe, or eden-cli.exe from a terminal.
-          Linux (AppImage): make it executable (chmod +x) and run it; it bundles its libraries and needs glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, Debian 13, Arch).
-          Linux (tar.gz): extract it and run ./lichii or ./eden-cli; it uses your system libraries, so Qt 6 and the usual libraries must be installed.
-          macOS: Apple Silicon and macOS 15 or newer. Unzip and move lichii.app to Applications; eden-cli is inside it, in Contents/MacOS. The app is not notarized, so the first time right-click it and choose Open (or run xattr -dr com.apple.quarantine lichii.app).
-          The -pgo builds are the same programs compiled with profile-guided optimization (clang plus Eglantine's profile); prefer them when your CPU supports it. The Windows PGO build is a MinGW build, so it carries its own DLLs and needs no Visual C++ redistributable."
+            --title "Lichii ${GITHUB_REF_NAME} build ${GITHUB_RUN_NUMBER} (${GITHUB_SHA::7})" \
+            --notes-file notes.md

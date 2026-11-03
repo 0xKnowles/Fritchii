@@ -189,6 +189,9 @@ struct TextureBufferDescriptor {
     u32 secondary_shift_left;
     u32 count;
     u32 size_shift;
+    /// Index in Info::handle_programs when the handle is computed at draw time (read from a
+    /// storage buffer), ~0 when it is the constant buffer word.
+    u32 handle_program{~0U};
 
     auto operator<=>(const TextureBufferDescriptor&) const = default;
 };
@@ -203,6 +206,9 @@ struct ImageBufferDescriptor {
     u32 cbuf_offset;
     u32 count;
     u32 size_shift;
+    /// Index in Info::handle_programs when the handle is computed at draw time (read from a
+    /// storage buffer), ~0 when it is the constant buffer word.
+    u32 handle_program{~0U};
 
     auto operator<=>(const ImageBufferDescriptor&) const = default;
 };
@@ -241,6 +247,9 @@ struct ImageDescriptor {
     u32 count;
     u32 size_shift;
     bool is_byte_addressed{};
+    /// Index in Info::handle_programs when the handle is computed at draw time (read from a
+    /// storage buffer), ~0 when it is the constant buffer word.
+    u32 handle_program{~0U};
 
     auto operator<=>(const ImageDescriptor&) const = default;
 };
@@ -335,6 +344,9 @@ struct Info {
     bool uses_global_memory{};
     bool requires_coherent_global_memory{};
     bool requires_coherent_image_memory{};
+    /// Native global accesses whose pointer is chosen at run time: every storage buffer descriptor
+    /// is a candidate and its bound length (not an NVN size word) limits the range.
+    bool native_global_bounds{};
     bool uses_atomic_image_u32{};
     bool uses_shadow_lod{};
     bool uses_rescaling_uniform{};

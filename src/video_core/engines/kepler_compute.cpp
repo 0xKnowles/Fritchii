@@ -712,15 +712,19 @@ void KeplerCompute::TraceDlssContract(u64 native_key) {
 }
 
 bool KeplerCompute::TryFireEmblemUpscale() {
+    static const bool use_history = [] {
+        const char* const option = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
+        return option && (std::string_view{option} == "fsr" || std::string_view{option} == "dlss");
+    }();
     const auto jitter = fe_upscale_jitter.Take();
     const auto motion = std::exchange(dlss_motion_vectors, std::nullopt);
     const auto depth = std::exchange(dlss_depth, std::nullopt);
-    if (!jitter || !motion || !depth) {
+    if (!jitter || (use_history && (!motion || !depth))) {
         static bool reported{};
         if (!reported) {
             reported = true;
-            LOG_WARNING(HW_GPU, "Fire Emblem replacement lacks current inputs: jitter={} motion={} depth={}; retaining native dispatch",
-                        jitter.has_value(), motion.has_value(), depth.has_value());
+            LOG_WARNING(HW_GPU, "Fire Emblem replacement lacks current inputs: jitter={} motion={} depth={} temporal={}; retaining native dispatch",
+                        jitter.has_value(), motion.has_value(), depth.has_value(), use_history);
         }
         return false;
     }
@@ -741,7 +745,7 @@ bool KeplerCompute::TryFireEmblemUpscale() {
     const auto input = image(0x328);
     const auto output = image(0x348);
     if (!input || !output || !VideoCommon::FireEmblemUpscale::ValidPair(*input, *output) ||
-        jitter->color != input->Address() || dlss_motion_color != input->Address() ||
+        jitter->color != input->Address() || (use_history && dlss_motion_color != input->Address()) ||
         jitter->width != input->Width() || jitter->height != input->Height()) {
         return false;
     }
@@ -762,8 +766,9 @@ bool KeplerCompute::TryFireEmblemUpscale() {
     const bool done = rasterizer->AccelerateTemporalUpscale(
         surface(*input, Tegra::RenderTargetFormat::B10G11R11_FLOAT),
         surface(*output, Tegra::RenderTargetFormat::B10G11R11_FLOAT),
-        surface(*motion, Tegra::RenderTargetFormat::R16G16_FLOAT), jitter->offset,
-        {1.0f, 1.0f}, &*depth);
+        use_history ? surface(*motion, Tegra::RenderTargetFormat::R16G16_FLOAT) : Fermi2D::Surface{},
+        use_history ? &*depth : nullptr, jitter->offset,
+        use_history ? std::array{1.0f, 1.0f} : std::array{0.0f, 0.0f}, use_history);
     static u32 logged{};
     if (logged++ < 8) {
         LOG_INFO(HW_GPU, "Fire Emblem DLSS replacement: {}",
