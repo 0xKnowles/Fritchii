@@ -45,7 +45,7 @@ See the [build guide](docs/Build.md), [user documentation](docs/user/README.md) 
 Keep changes focused and distinguish code-level checks from actual gameplay testing.
 
 ## Artwork
-
+Art created by YOB (yobslab)
 The supplied Lichii logo, icon and library artwork are in [dist/branding](dist/branding). Windows, Linux and macOS icon resources are generated from that artwork by [Generate-LichiiIcons.ps1](tools/Generate-LichiiIcons.ps1).
 
 ## Credits and license
