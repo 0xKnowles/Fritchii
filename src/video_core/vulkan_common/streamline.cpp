@@ -12,7 +12,6 @@
 #include <string_view>
 #include <type_traits>
 #include <vector>
-#include <windows.h>
 
 #include <fmt/format.h>
 

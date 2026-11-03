@@ -13,6 +13,9 @@
 
 namespace VideoCommon {
 
+inline constexpr u32 OpenGLPipelineCacheVersion = 44;
+inline constexpr u32 VulkanPipelineCacheVersion = 47;
+
 // Official Eglantine (cache version 18 at c0cb3325) and this fork (a different version) both
 // used <shader dir>/<title>/vulkan.bin and vulkan_pipelines.bin. Each build deletes a file
 // with another version at boot, so alternating builds made every run start with no pipelines

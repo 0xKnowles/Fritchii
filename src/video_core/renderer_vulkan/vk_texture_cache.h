@@ -10,7 +10,6 @@
 #include <deque>
 #include <memory>
 #include <optional>
-#include <optional>
 #include <span>
 
 #include "video_core/texture_cache/texture_cache_base.h"
@@ -133,12 +132,15 @@ public:
                    Tegra::Engines::Fermi2D::Filter filter,
                    Tegra::Engines::Fermi2D::Operation operation);
 
-    /// Replaces a validated DLSS evaluation with NVIDIA DLSS or FSR 3.1.
+    /// Stands in for a DLSS evaluation: temporal upscale of input_color (render_size on the host)
+    /// into dst, with FSR 3.1 when given the depth, else with the temporal stand-in. False when dst
+    /// cannot take it.
     bool TemporalUpscale(Framebuffer* dst_framebuffer, ImageView& dst, ImageView& input_color,
                          ImageView& motion_vectors, ImageView* depth,
                          std::array<u32, 2> render_size, std::array<f32, 2> jitter,
-                         std::array<f32, 2> motion_scale);
+                         std::array<f32, 2> motion_scale, bool use_history);
 
+    /// True when TemporalUpscale would use the depth (FSR 3.1 not forced off and not failed).
     [[nodiscard]] bool WantsTemporalUpscaleDepth() const;
 
     void CopyImage(Image& dst, Image& src, std::span<const VideoCommon::ImageCopy> copies);
@@ -233,7 +235,7 @@ public:
     DescriptorPool& descriptor_pool;
     ComputePassDescriptorQueue& compute_pass_descriptor_queue;
 
-    /// NVIDIA DLSS, then FSR 3.1, created on first use.
+    /// FSR 3.1 in place of a DLSS evaluation (TemporalUpscale), created on first use.
     bool UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageView& input_color,
                          ImageView& motion_vectors, ImageView& depth,
                          std::array<u32, 2> render_size, std::array<f32, 2> jitter,
@@ -256,6 +258,15 @@ public:
     bool dlss_unsupported{};
 #endif
 
+    /// TemporalUpscale's history: its previous result (images[current]) and the image the next
+    /// result is stored to.
+    struct TemporalHistory {
+        std::array<vk::Image, 2> images;
+        std::array<vk::ImageView, 2> views;
+        size_t current{};
+        VkFormat format{};
+        VkExtent2D extent{};
+    } temporal_history;
 
     std::optional<ASTCDecoderPass> astc_decoder_pass;
     std::optional<BcEncoderPass> bc_encoder_pass;

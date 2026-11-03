@@ -4,13 +4,40 @@
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
+#include "shader_recompiler/environment.h"
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/ir_opt/passes.h"
 
 namespace {
 namespace IR = Shader::IR;
+
+class TestEnvironment final : public Shader::Environment {
+public:
+    bool native{};
+    TestEnvironment() { stage = Shader::Stage::Compute; }
+    bool IsNativeProgram() const override { return native; }
+    bool IsCbufStorageBufferPointer(u32, u32) override { return true; }
+    u64 ReadInstruction(u32) override { return 0; }
+    u32 ReadCbufValue(u32, u32) override { return 0; }
+    Shader::TextureType ReadTextureType(u32) override { return Shader::TextureType::Color2D; }
+    Shader::TexturePixelFormat ReadTexturePixelFormat(u32) override {
+        return Shader::TexturePixelFormat::A8B8G8R8_UNORM;
+    }
+    bool IsTexturePixelFormatInteger(u32) override { return false; }
+    u32 ReadViewportTransformState() override { return 1; }
+    u32 TextureBoundBuffer() const override { return 0; }
+    u32 LocalMemorySize() const override { return 0; }
+    u32 SharedMemorySize() const override { return 0; }
+    std::array<u32, 3> WorkgroupSize() const override { return {32, 1, 1}; }
+    bool HasHLEMacroState() const override { return false; }
+    std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32, u32) override {
+        return std::nullopt;
+    }
+    void Dump(u64, u64) override {}
+};
 
 IR::U32 Word(IR::IREmitter& ir, u32 offset) { return ir.GetCbuf(ir.Imm32(0), ir.Imm32(offset)); }
 
@@ -25,10 +52,12 @@ IR::U64 Address(IR::IREmitter& ir, IR::U32 low, IR::U32 high) {
     return ir.PackUint2x32(ir.CompositeConstruct(low, high));
 }
 
-std::vector<u32> Offsets(IR::Program& program) {
+std::vector<u32> Offsets(IR::Program& program, bool native = false) {
+    TestEnvironment env;
+    env.native = native;
     Shader::HostTranslateInfo host{};
     host.min_ssbo_alignment = 16;
-    Shader::Optimization::GlobalMemoryToStorageBufferPass(program, host);
+    Shader::Optimization::GlobalMemoryToStorageBufferPass(env, program, host);
     std::vector<u32> offsets;
     for (const auto& descriptor : program.info.storage_buffers_descriptors) {
         offsets.push_back(descriptor.cbuf_offset);
@@ -37,6 +66,7 @@ std::vector<u32> Offsets(IR::Program& program) {
 }
 
 struct ConditionalPointer {
+    bool native{};
     Shader::ObjectPool<IR::Inst> pool{256};
     IR::Block entry{pool};
     IR::Block definition{pool};
@@ -112,7 +142,7 @@ struct ConditionalPointer {
             {.data{.end_if{&exit}}, .type = IR::AbstractSyntaxNode::Type::EndIf},
             {.data{.block = &exit}, .type = IR::AbstractSyntaxNode::Type::Block},
         };
-        return Offsets(program);
+        return Offsets(program, native);
     }
 };
 } // namespace
@@ -120,19 +150,23 @@ struct ConditionalPointer {
 TEST_CASE("Predicated stores ignore the pointer from their untaken definition",
           "[shader][storage_buffer_control_flow]") {
     ConditionalPointer fixture;
+    fixture.native = GENERATE(false, true);
     CHECK(fixture.Run(true, false, false) == std::vector<u32>{0x168});
 }
 
 TEST_CASE("Restored predicate bits retain pointer-definition correlation",
           "[shader][storage_buffer_control_flow]") {
     ConditionalPointer fixture;
+    fixture.native = GENERATE(false, true);
     CHECK(fixture.Run(true, false, true) == std::vector<u32>{0x168});
 }
 
 TEST_CASE("Predicated input and weight loads reject a nearer stale skip pointer",
           "[shader][storage_buffer_control_flow]") {
+    const bool native = GENERATE(false, true);
     for (const u32 base : {0x160, 0x170}) {
         ConditionalPointer fixture;
+        fixture.native = native;
         CHECK(fixture.Run(true, false, 0, 0x168, base, true) == std::vector<u32>{base});
     }
 }
@@ -140,12 +174,14 @@ TEST_CASE("Predicated input and weight loads reject a nearer stale skip pointer"
 TEST_CASE("Conditionally written output mask bits retain pointer-definition correlation",
           "[shader][storage_buffer_control_flow]") {
     ConditionalPointer fixture;
+    fixture.native = GENERATE(false, true);
     CHECK(fixture.Run(true, false, 2) == std::vector<u32>{0x168});
 }
 
 TEST_CASE("Complementary predicates select the unchanged pointer",
           "[shader][storage_buffer_control_flow]") {
     ConditionalPointer fixture;
+    fixture.native = GENERATE(false, true);
     CHECK(fixture.Run(true, true, true) == std::vector<u32>{0x160});
 }
 
@@ -159,6 +195,7 @@ TEST_CASE("Unrelated predicates do not justify pruning a pointer phi",
 
 TEST_CASE("Conditionally advanced pointers retain their base through selects and phis",
           "[shader][storage_buffer_control_flow]") {
+    const bool native = GENERATE(false, true);
     for (const bool select_update : {false, true}) {
         Shader::ObjectPool<IR::Inst> pool{256};
         IR::Block entry{pool};
@@ -204,12 +241,13 @@ TEST_CASE("Conditionally advanced pointers retain their base through selects and
         high->AddPhiOperand(&entry, initial_high);
         high->AddPhiOperand(&merge, selected_high);
         static_cast<void>(join.LoadGlobal128(Address(join, selected_low, selected_high)));
-        CHECK(Offsets(program) == std::vector<u32>{0x168});
+        CHECK(Offsets(program, native) == std::vector<u32>{0x168});
     }
 }
 
 TEST_CASE("A current loop predicate cannot select the preceding iteration's pointer",
           "[shader][storage_buffer_control_flow]") {
+    const bool native = GENERATE(false, true);
     Shader::ObjectPool<IR::Inst> pool{256};
     IR::Block entry{pool};
     IR::Block loop{pool};
@@ -282,5 +320,24 @@ TEST_CASE("A current loop predicate cannot select the preceding iteration's poin
          .type = IR::AbstractSyntaxNode::Type::Repeat},
         {.data{.block = &exit}, .type = IR::AbstractSyntaxNode::Type::Block},
     };
-    CHECK(Offsets(program) == std::vector<u32>{0x160});
+    if (native) {
+        CHECK(Offsets(program, true) == std::vector<u32>{0x160, 0x168});
+        CHECK(program.info.native_global_bounds);
+    } else {
+        CHECK(Offsets(program) == std::vector<u32>{0x160});
+    }
+}
+
+TEST_CASE("Unrelated native predicates retain every candidate pointer",
+          "[shader][storage_buffer_control_flow]") {
+    for (const bool packed : {false, true}) {
+        ConditionalPointer fixture;
+        fixture.native = true;
+        CHECK(fixture.Run(false, false, packed) == std::vector<u32>{0x160, 0x168});
+        CHECK(fixture.program.info.native_global_bounds);
+        CHECK(fixture.access.back().GetOpcode() == IR::Opcode::WriteGlobal32);
+        for (const auto& descriptor : fixture.program.info.storage_buffers_descriptors) {
+            CHECK(descriptor.is_written);
+        }
+    }
 }

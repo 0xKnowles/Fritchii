@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 // Streamline's API as loaded from the user's sl.interposer.dll. Only for the
-// Streamline sources: it pulls in Streamline's MIT-licensed headers.
+// Streamline sources: it pulls in <windows.h> and Streamline's (MIT-licensed) headers.
 
 #pragma once
+
+#include <windows.h>
 
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
