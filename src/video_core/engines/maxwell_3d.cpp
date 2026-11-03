@@ -22,6 +22,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/query_cache/frame_trace.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/textures/texture.h"
 #ifdef ARCHITECTURE_x86_64
@@ -607,6 +608,12 @@ void Maxwell3D::StampQueryResult(Core::System& system, u64 payload, bool long_qu
     } else {
         memory_manager.Write<u32>(sequence_address, static_cast<u32>(payload));
     }
+    if (const u64 trace = VideoCommon::QueryTrace::Sample(VideoCommon::QueryTrace::Event::Write)) {
+        LOG_INFO(HW_GPU,
+                 "DKB_QUERY write n={} path=stamp as={} gpu={:#x} bytes={} value={:#x}",
+                 trace, memory_manager.GetID(), sequence_address, long_query ? 8 : 4,
+                 long_query ? payload : static_cast<u32>(payload));
+    }
 }
 
 void Maxwell3D::ProcessQueryGet() {
@@ -649,6 +656,8 @@ void Maxwell3D::ProcessQueryCondition() {
         return;
     }
     const GPUVAddr condition_address{regs.render_enable.Address()};
+    Regs::ReportSemaphore::Compare cmp{};
+    bool operands_read = false;
     switch (regs.render_enable_override) {
     case Regs::RenderEnable::Override::AlwaysRender:
         execute_on = true;
@@ -667,21 +676,21 @@ void Maxwell3D::ProcessQueryCondition() {
             break;
         }
         case Regs::RenderEnable::Mode::Conditional: {
-            Regs::ReportSemaphore::Compare cmp;
             memory_manager.ReadBlock(condition_address, &cmp, sizeof(cmp));
+            operands_read = true;
             execute_on = cmp.initial_sequence != 0U && cmp.initial_mode != 0U;
             break;
         }
         case Regs::RenderEnable::Mode::IfEqual: {
-            Regs::ReportSemaphore::Compare cmp;
             memory_manager.ReadBlock(condition_address, &cmp, sizeof(cmp));
+            operands_read = true;
             execute_on = cmp.initial_sequence == cmp.current_sequence &&
                          cmp.initial_mode == cmp.current_mode;
             break;
         }
         case Regs::RenderEnable::Mode::IfNotEqual: {
-            Regs::ReportSemaphore::Compare cmp;
             memory_manager.ReadBlock(condition_address, &cmp, sizeof(cmp));
+            operands_read = true;
             execute_on = cmp.initial_sequence != cmp.current_sequence ||
                          cmp.initial_mode != cmp.current_mode;
             break;
@@ -694,6 +703,16 @@ void Maxwell3D::ProcessQueryCondition() {
         }
         break;
     }
+    }
+    if (const u64 trace =
+            VideoCommon::QueryTrace::Sample(VideoCommon::QueryTrace::Event::CpuCondition)) {
+        LOG_INFO(HW_GPU,
+                 "DKB_CONDITION cpu n={} as={} gpu={:#x} mode={} override={} execute={} "
+                 "operands_read={} initial={:#x}/{:#x} current={:#x}/{:#x}",
+                 trace, memory_manager.GetID(), condition_address,
+                 static_cast<u32>(regs.render_enable.mode),
+                 static_cast<u32>(regs.render_enable_override), execute_on, operands_read,
+                 cmp.initial_sequence, cmp.initial_mode, cmp.current_sequence, cmp.current_mode);
     }
 }
 

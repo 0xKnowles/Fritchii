@@ -387,7 +387,13 @@ std::optional<StorageBufferAddr> Track(const IR::Value& value, const Bias* bias)
         }
         return storage_buffer;
     }};
-    return BreadthFirstSearch(value, pred);
+    const auto stop_at_memory = [](IR::Value operand) {
+        if (!operand.IsImmediate() && IsGlobalMemory(*operand.InstRecursive())) {
+            return IR::Value{u32{0}};
+        }
+        return operand;
+    };
+    return BreadthFirstSearch(value, pred, stop_at_memory);
 }
 
 /// Finds the one constant buffer word added directly into the low address, which is the base

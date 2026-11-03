@@ -109,12 +109,45 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
       master_semaphore{std::make_unique<MasterSemaphore>(device)},
       command_pool{std::make_unique<CommandPool>(*master_semaphore, device)} {
 
+    if (Common::DkbFrameTrace::Enabled()) {
+        const auto physical = device.GetPhysical();
+        trace_timestamp_bits =
+            physical.GetQueueFamilyProperties()[device.GetGraphicsFamily()].timestampValidBits;
+        trace_timestamp_period = physical.GetProperties().limits.timestampPeriod;
+        if (trace_timestamp_bits != 0 && trace_timestamp_bits <= 64 && trace_timestamp_period > 0) {
+            try {
+                trace_query_pool = device.GetLogical().CreateQueryPool({
+                    .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                    .pNext = nullptr,
+                    .flags = 0,
+                    .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                    .queryCount = TraceMaxSubmissions * 2,
+                    .pipelineStatistics = 0,
+                });
+            } catch (const vk::Exception& error) {
+                LOG_WARNING(Render_Vulkan, "DKB gpu_timestamp unavailable: {}", error.what());
+            }
+        } else {
+            LOG_INFO(Render_Vulkan, "DKB gpu_timestamp unsupported: valid_bits={} period_ns={}",
+                     trace_timestamp_bits, trace_timestamp_period);
+        }
+    }
+
     AcquireNewChunk();
     AllocateWorkerCommandBuffer();
     worker_thread = std::jthread([this](std::stop_token token) { WorkerThread(token); });
 }
 
-Scheduler::~Scheduler() = default;
+Scheduler::~Scheduler() {
+    if (trace_query_pool) {
+        WaitWorker();
+        worker_thread.request_stop();
+        worker_thread.join();
+        if (trace_gpu_tick != 0) {
+            master_semaphore->Wait(trace_gpu_tick);
+        }
+    }
+}
 
 u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                      std::source_location location) {
@@ -163,6 +196,12 @@ void Scheduler::WaitWorker() {
 
     // Now wait for execution to finish.
     std::scoped_lock el{execution_mutex};
+}
+
+void Scheduler::MarkFrameEnd(u64 frame) {
+    if (Common::DkbFrameTrace::Enabled()) {
+        Record([this, frame](vk::CommandBuffer) { trace_frame_end = frame; });
+    }
 }
 
 void Scheduler::DispatchWork() {
@@ -442,6 +481,69 @@ void Scheduler::AllocateWorkerCommandBuffer() {
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
         .pInheritanceInfo = nullptr,
     });
+    if (trace_query_pool && !trace_gpu_failed) {
+        TraceGpuSubmission();
+    }
+}
+
+void Scheduler::TraceGpuSubmission() {
+    if (trace_gpu_pending) {
+        master_semaphore->Refresh();
+        if (!master_semaphore->IsFree(trace_gpu_tick)) {
+            return;
+        }
+        struct Result {
+            u64 timestamp;
+            u64 available;
+        };
+        std::array<Result, TraceMaxSubmissions * 2> results{};
+        const auto result = device.GetLogical().GetQueryResults(
+            *trace_query_pool, 0, trace_gpu_count * 2, trace_gpu_count * 2 * sizeof(Result),
+            results.data(), sizeof(Result),
+            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+        if (result == VK_NOT_READY) {
+            return;
+        }
+        if (result != VK_SUCCESS) {
+            LOG_WARNING(Render_Vulkan, "DKB gpu_timestamp disabled: query result {}",
+                        static_cast<int>(result));
+            trace_gpu_failed = true;
+            return;
+        }
+        double total_ms{};
+        for (u32 i = 0; i < trace_gpu_count * 2; i += 2) {
+            if (results[i].available == 0 || results[i + 1].available == 0) {
+                return;
+            }
+            const auto ticks = Common::DkbFrameTrace::TimestampDelta(
+                results[i].timestamp, results[i + 1].timestamp, trace_timestamp_bits);
+            total_ms += static_cast<double>(ticks) * trace_timestamp_period / 1e6;
+        }
+        const double span_ms = trace_gpu_skipped == 0
+            ? static_cast<double>(Common::DkbFrameTrace::TimestampDelta(
+                  results[0].timestamp, results[trace_gpu_count * 2 - 1].timestamp,
+                  trace_timestamp_bits)) * trace_timestamp_period / 1e6
+            : -1.0;
+        LOG_INFO(Render_Vulkan,
+                 "DKB gpu_frame renderer_frame={} last_submission_tick={} "
+                 "gpu_frame_span_ms={:.3f} gpu_submission_sum_ms={:.3f} "
+                 "measured_submissions={} dropped_submissions={} "
+                 "valid_bits={} period_ns={}",
+                 trace_sample_frame, trace_gpu_tick, span_ms, total_ms, trace_gpu_count,
+                 trace_gpu_skipped, trace_timestamp_bits, trace_timestamp_period);
+        trace_gpu_tick = 0;
+        trace_gpu_count = 0;
+        trace_gpu_skipped = 0;
+        trace_gpu_pending = false;
+        trace_gpu_rate.next = std::chrono::steady_clock::now() + std::chrono::seconds{1};
+    }
+    if (!trace_gpu_sampling || trace_gpu_count == TraceMaxSubmissions) {
+        return;
+    }
+    current_upload_cmdbuf.ResetQueryPool(*trace_query_pool, trace_gpu_count * 2, 2);
+    current_upload_cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, *trace_query_pool,
+                                        trace_gpu_count * 2);
+    trace_gpu_recording = true;
 }
 
 u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
@@ -463,6 +565,15 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         };
         upload_cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, WRITE_BARRIER);
         upload_cmdbuf.End();
+        if (trace_gpu_recording) {
+            cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *trace_query_pool,
+                                 trace_gpu_count * 2 + 1);
+            trace_gpu_tick = signal_value;
+            ++trace_gpu_count;
+            trace_gpu_recording = false;
+        } else if (trace_gpu_sampling) {
+            ++trace_gpu_skipped;
+        }
         cmdbuf.End();
 
         if (on_submit) {
@@ -486,6 +597,18 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         default:
             vk::Check(result);
             break;
+        }
+        if (trace_frame_end != 0) {
+            if (trace_gpu_sampling) {
+                trace_gpu_pending = true;
+                trace_gpu_sampling = false;
+            }
+            if (trace_query_pool && !trace_gpu_failed && !trace_gpu_pending &&
+                trace_gpu_rate.Ready(std::chrono::steady_clock::now())) {
+                trace_sample_frame = trace_frame_end + 1;
+                trace_gpu_sampling = true;
+            }
+            trace_frame_end = 0;
         }
     });
     chunk->MarkSubmit();

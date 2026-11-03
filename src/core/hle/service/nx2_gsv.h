@@ -27,6 +27,7 @@
 
 #include "common/alignment.h"
 #include "common/div_ceil.h"
+#include "common/dkb_frame_trace.h"
 #include "common/settings.h"
 #include "common/game_presets.h"
 #include "common/thread.h"
@@ -1744,6 +1745,33 @@ private:
         const auto composited = std::chrono::steady_clock::now();
         PaceToVblank(w[12]);
         const auto paced = std::chrono::steady_clock::now();
+        if (Common::DkbFrameTrace::Enabled()) {
+            const auto ms = [](auto duration) {
+                return std::chrono::duration<double, std::milli>(duration).count();
+            };
+            if (m_frame_trace.rate.Ready(paced)) {
+                LOG_INFO(Service,
+                         "DKB frame present={} word12={:#x} requested_interval={} "
+                         "requested_hz={} effective_interval={} effective_hz={} forced_interval={} "
+                         "speed_limit={} speed_percent={} switches={} last_switch={:#x}->{:#x} "
+                         "cpu_frame_wall_ms={:.3f} cpu_present_wall_ms={:.3f} fence_wall_ms={:.3f} "
+                         "composite_wall_ms={:.3f} target_ms={:.3f} sleep_requested_ms={:.3f} "
+                         "sleep_actual_wall_ms={:.3f} pace_wall_ms={:.3f} deadline_reset={}",
+                         m_presents, w[12], w[12] >> 16, w[12] & 0xffff,
+                         m_frame_trace.interval, m_frame_trace.refresh, m_frame_trace.forced,
+                         Settings::values.use_speed_limit.GetValue(), Settings::SpeedLimit(),
+                         m_frame_trace.switches, m_frame_trace.switch_from,
+                         m_frame_trace.switch_to,
+                         m_frame_trace.last_present == std::chrono::steady_clock::time_point{}
+                             ? -1.0 : ms(entered - m_frame_trace.last_present),
+                         ms(paced - entered), ms(waited - entered), ms(composited - waited),
+                         m_frame_trace.target_ms, m_frame_trace.sleep_requested_ms,
+                         m_frame_trace.sleep_actual_ms, ms(paced - composited),
+                         m_frame_trace.deadline_reset);
+                m_frame_trace.switches = 0;
+            }
+            m_frame_trace.last_present = entered;
+        }
         // Where each frame's time goes on the present thread, averaged per 600 presents: the
         // game is blocked here while Eden's GPU thread catches up (fence) and composites.
         {
@@ -1800,12 +1828,32 @@ private:
     std::chrono::steady_clock::time_point m_next_vblank{};
     u32 m_swap_word{};
 
+    struct FrameTrace {
+        Common::DkbFrameTrace::RateLimit rate;
+        std::chrono::steady_clock::time_point last_present{};
+        std::optional<u32> previous_word;
+        u64 switches{};
+        u32 switch_from{}, switch_to{}, interval{}, refresh{}, forced{};
+        double target_ms{}, sleep_requested_ms{}, sleep_actual_ms{};
+        bool deadline_reset{};
+    } m_frame_trace;
+
     // timing: present word 12, (swap interval << 16) | refresh rate. Fire Emblem: Fortune's Weave
     // sends 0x1003c during its boot logos and 0x2003c (two vblanks per frame, 30 fps) after; paced
     // at every vblank it ran at double speed. EDEN_NX2_SWAP_INTERVAL=<n> forces the interval.
     void PaceToVblank(u32 timing) {
-        if (!Settings::values.use_speed_limit.GetValue() || Settings::SpeedLimit() == 0) {
-            return;
+        const bool trace = Common::DkbFrameTrace::Enabled();
+        if (trace) {
+            if (m_frame_trace.previous_word && *m_frame_trace.previous_word != timing) {
+                ++m_frame_trace.switches;
+                m_frame_trace.switch_from = *m_frame_trace.previous_word;
+                m_frame_trace.switch_to = timing;
+            }
+            m_frame_trace.previous_word = timing;
+            m_frame_trace.target_ms = 0;
+            m_frame_trace.sleep_requested_ms = 0;
+            m_frame_trace.sleep_actual_ms = 0;
+            m_frame_trace.deadline_reset = false;
         }
         static const u32 forced_interval = [] {
             const char* value = std::getenv("EDEN_NX2_SWAP_INTERVAL");
@@ -1814,23 +1862,45 @@ private:
         const u32 swap_interval =
             forced_interval != 0 ? forced_interval : std::clamp<u32>(timing >> 16, 1, 4);
         const u32 refresh_rate = (timing & 0xffff) >= 30 && (timing & 0xffff) <= 240 ? timing & 0xffff : 60;
+        if (trace) {
+            m_frame_trace.interval = swap_interval;
+            m_frame_trace.refresh = refresh_rate;
+            m_frame_trace.forced = forced_interval;
+        }
+        if (!Settings::values.use_speed_limit.GetValue() || Settings::SpeedLimit() == 0) {
+            return;
+        }
         if (timing != std::exchange(m_swap_word, timing)) {
             LOG_INFO(Service, "nx2:vi2 present #{} swap interval {} at {} Hz (word 12 = {:#x})",
                      m_presents, swap_interval, refresh_rate, timing);
         }
         const auto interval = std::chrono::nanoseconds{
             100'000'000'000LL * swap_interval / refresh_rate / Settings::SpeedLimit()};
+        if (trace) {
+            m_frame_trace.target_ms = std::chrono::duration<double, std::milli>(interval).count();
+        }
         const auto now = std::chrono::steady_clock::now();
         if (now > m_next_vblank + interval) {
             // Running slower than the swap interval: show at once and don't bank the lost time.
             m_next_vblank = now;
+            if (trace) {
+                m_frame_trace.deadline_reset = true;
+            }
         } else if (now < m_next_vblank) {
             // Sleep this service thread in the guest kernel. It runs on guest core 3, and a host
             // sleep held that core for the whole wait: game threads scheduled there ran only
             // between presents (Fortune's Weave's loader read one RomFS block per frame).
             const auto wait = std::chrono::duration_cast<std::chrono::nanoseconds>(m_next_vblank - now);
+            const auto sleep_start = trace ? std::chrono::steady_clock::now()
+                                           : std::chrono::steady_clock::time_point{};
             static_cast<void>(Kernel::GetCurrentThread(kernel).Sleep(
                 kernel, kernel.HardwareTimer().GetTick() + wait.count() + 2));
+            if (trace) {
+                m_frame_trace.sleep_requested_ms =
+                    std::chrono::duration<double, std::milli>(wait).count();
+                m_frame_trace.sleep_actual_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - sleep_start).count();
+            }
         }
         m_next_vblank += interval;
     }

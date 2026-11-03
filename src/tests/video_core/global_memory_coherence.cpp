@@ -4,6 +4,7 @@
 #include <array>
 #include <map>
 #include <set>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -14,6 +15,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
 #include "shader_recompiler/frontend/maxwell/translate/impl/impl.h"
+#include "shader_recompiler/frontend/maxwell/translate_program.h"
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/ir_opt/passes.h"
 
@@ -22,8 +24,22 @@ using namespace Shader;
 
 class TestEnvironment final : public Environment {
 public:
-    explicit TestEnvironment(bool native_ = false) : native{native_} { stage = Stage::Compute; }
-    u64 ReadInstruction(u32) override { return 0; }
+    explicit TestEnvironment(bool native_ = false, std::span<const u64> code_ = {})
+        : native{native_}, code{code_} {
+        stage = Stage::Compute;
+    }
+    u64 ReadInstruction(u32 address) override {
+        if (code.empty()) {
+            return 0;
+        }
+        for (u32 index = 0; index < code.size(); ++index) {
+            if (address == 0x50 + index * 8 + ((index + 1) / 3) * 8) {
+                return code[index];
+            }
+        }
+        FAIL("Read outside shader fixture at " << address);
+        return 0;
+    }
     u32 ReadCbufValue(u32, u32) override { return 0; }
     TextureType ReadTextureType(u32) override { return TextureType::Color2D; }
     TexturePixelFormat ReadTexturePixelFormat(u32) override {
@@ -40,6 +56,7 @@ public:
     std::optional<ReplaceConstant> GetReplaceConstBuffer(u32, u32) override { return std::nullopt; }
     void Dump(u64, u64) override {}
     bool native;
+    std::span<const u64> code;
 };
 
 struct Program {
@@ -244,4 +261,116 @@ TEST_CASE("Joining vertex storage preserves coherent memory requirement", "[vide
             CHECK(vertex_a.requires_coherent_global_memory == (a || b));
         }
     }
+}
+
+TEST_CASE("Global fallback backends address sparse guest slots through compact bindings",
+          "[shader][storage_buffer][nvn]") {
+    for (const u32 backend : {0U, 1U, 2U}) {
+        CAPTURE(backend);
+        Program fixture;
+        auto& info = fixture.program.info;
+        info.used_storage_buffer_types = IR::Type::U32 | IR::Type::U32x2 | IR::Type::U32x4;
+        info.storage_buffers_descriptors = {
+            {1, 0x340, 1, true}, {0, 0x340, 1, true},
+            {0, 0x400, 1, true}, {0, 0x330, 1, true},
+        };
+        info.nvn_buffer_base = 0x310;
+        info.nvn_buffer_used.set(3);
+        info.nvn_buffer_used.set(15);
+        info.uses_global_memory = true;
+        info.uses_int64 = true;
+        info.used_constant_buffer_types = IR::Type::U32 | IR::Type::U32x2;
+        info.stores_global_memory = true;
+        info.constant_buffer_descriptors = {{0, 1}, {1, 1}};
+        info.uses_local_invocation_id = true;
+        fixture.profile.support_int64 = true;
+        fixture.profile.support_descriptor_aliasing = true;
+        IR::IREmitter ir{fixture.block};
+        const auto address = ir.PackUint2x32(
+            ir.CompositeConstruct(ir.LocalInvocationIdX(), ir.Imm32(0)));
+        ir.WriteGlobal32(address, ir.Imm32(42));
+
+        if (backend == 0) {
+            const auto code = Backend::SPIRV::EmitSPIRV(fixture.profile, fixture.program);
+            std::set<u32> storage_variables;
+            std::map<u32, u32> bindings;
+            for (const auto& op : Instructions(code, 59)) {
+                if (op.size() >= 3 && op[2] == 12) {
+                    storage_variables.insert(op[1]);
+                }
+            }
+            for (const auto& op : Instructions(code, 71)) {
+                if (op.size() >= 3 && op[1] == 33) {
+                    bindings[op[0]] = op[2];
+                }
+            }
+            std::set<u32> accessed_bindings;
+            for (const auto& op : Instructions(code, 65)) {
+                if (op.size() >= 3 && storage_variables.contains(op[2])) {
+                    REQUIRE(bindings.contains(op[2]));
+                    accessed_bindings.insert(bindings.at(op[2]));
+                }
+            }
+            std::set<u32> declared_bindings;
+            for (const u32 variable : storage_variables) {
+                REQUIRE(bindings.contains(variable));
+                declared_bindings.insert(bindings.at(variable));
+            }
+            REQUIRE(declared_bindings.size() == 4);
+            std::set<u32> expected_bindings;
+            const u32 first_storage_binding = *declared_bindings.begin();
+            for (const u32 binding : {1U, 2U}) {
+                expected_bindings.insert(first_storage_binding + binding);
+            }
+            CHECK(accessed_bindings == expected_bindings);
+        } else if (backend == 1) {
+            const auto code = Backend::GLSL::EmitGLSL(fixture.profile, fixture.program);
+            CHECK(code.find("uint64_t ssbo_addr1=") != std::string::npos);
+            CHECK(code.find("uint64_t ssbo_addr2=") != std::string::npos);
+            CHECK(code.find("uint64_t ssbo_addr0=") == std::string::npos);
+            CHECK(code.find("uint64_t ssbo_addr3=") == std::string::npos);
+        } else {
+            RuntimeInfo runtime{};
+            runtime.glasm_use_storage_buffers = true;
+            const auto code = Backend::GLASM::EmitGLASM(fixture.profile, runtime, fixture.program);
+            CHECK(code.find("LDC.U64 DC.x,c0[832];") != std::string::npos);
+            CHECK(code.find("LDC.U64 DC.x,c0[1024];") != std::string::npos);
+            CHECK(code.find("LDC.U64 DC.x,c1[832];") == std::string::npos);
+            CHECK(code.find("LDC.U64 DC.x,c0[816];") == std::string::npos);
+            CHECK(code.find("ssbo1[RC.x]") != std::string::npos);
+            CHECK(code.find("ssbo2[RC.x]") != std::string::npos);
+        }
+    }
+}
+
+TEST_CASE("NVN fallback does not deduplicate descriptors from different constant buffers",
+          "[shader][storage_buffer][nvn]") {
+    const std::array<u64, 5> code{
+        0xef90000000070000ULL | (u64{255} << 8) | (u64{0x310} << 20) |
+            (u64{1} << 36) | (u64{5} << 48),
+        0xeed0000000070000ULL | 2 | (u64{1} << 45) | (u64{5} << 48),
+        0xef90000000070000ULL | 4 | (u64{255} << 8) | (u64{0x310} << 20) |
+            (u64{4} << 48),
+        0xeed8000000070000ULL | 4 | (u64{2} << 8) | (u64{1} << 45) | (u64{4} << 48),
+        0xe30000000007000fULL,
+    };
+    TestEnvironment env{false, code};
+    ObjectPool<Maxwell::Flow::Block> flow_pool;
+    Maxwell::Flow::CFG cfg{env, flow_pool, Maxwell::Location{0x50}};
+    ObjectPool<IR::Inst> inst_pool;
+    ObjectPool<IR::Block> block_pool;
+    HostTranslateInfo host{};
+    host.min_ssbo_alignment = 16;
+    host.support_int64 = true;
+    auto program = Maxwell::TranslateProgram(inst_pool, block_pool, env, cfg, host);
+    REQUIRE(program.info.uses_global_memory);
+    REQUIRE(program.info.nvn_buffer_used.test(0));
+    const auto& descriptors = program.info.storage_buffers_descriptors;
+    REQUIRE(descriptors.size() == 2);
+    CHECK(descriptors[0].cbuf_index == 1);
+    CHECK(descriptors[0].cbuf_offset == 0x310);
+    CHECK_FALSE(descriptors[0].is_written);
+    CHECK(descriptors[1].cbuf_index == 0);
+    CHECK(descriptors[1].cbuf_offset == 0x310);
+    CHECK(descriptors[1].is_written);
 }

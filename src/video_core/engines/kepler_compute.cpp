@@ -16,6 +16,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include "common/assert.h"
+#include "common/dkb_frame_trace.h"
 #include "common/logging.h"
 #include "shader_recompiler/exception.h"
 #include "core/core.h"
@@ -553,6 +554,18 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
     } catch (const VideoCommon::FireEmblemUpscale::DispatchReplaced&) {
         return true;
     } catch (const Shader::Exception& error) {
+        if (Common::DkbFrameTrace::Enabled()) {
+            static thread_local Common::DkbFrameTrace::RateLimit limit;
+            static thread_local u64 rejected{};
+            ++rejected;
+            if (limit.Ready(std::chrono::steady_clock::now())) {
+                LOG_INFO(HW_GPU,
+                         "DKB shader rejected stage=compute address={:#x} count={} reason={}",
+                         regs.code_loc.Address() + launch_description.program_start, rejected,
+                         error.what());
+                rejected = 0;
+            }
+        }
         dlss_motion_vectors.reset();
         dlss_depth.reset();
         (void)fe_upscale_jitter.Take();
