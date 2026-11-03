@@ -10,6 +10,9 @@ Users report game bugs with Lichii logs (`eden_log.txt`, `eden_log.txt.old`). Ea
 
 | Program id | Game |
 |---|---|
+| 040074A01BF12000 | Donkey Kong Bananza |
+| 040077201BE50000 | Kirby Air Riders |
+| 04007C6028AA8000 | Yoshi and the Mysterious Book (demo) |
 | 0400D4201C6EA000 | Mario Tennis Fever |
 | 0400E88025B1A000 | Star Fox |
 
