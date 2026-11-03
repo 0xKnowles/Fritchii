@@ -22,6 +22,7 @@
 #include "shader_recompiler/object_pool.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dirty_flags.h"
+#include "video_core/dlss_contract.h"
 #include "video_core/fire_emblem_upscale.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -206,17 +207,22 @@ const ShaderInfo* ShaderCache::ComputeShader() {
         }
     }
     // Check both warm and cold shader paths, before selecting a disk-cached pipeline.
-    // EDEN_NX2_DLSS_STANDIN=0 restores the native network for same-scene comparisons.
-    static const char* const standin_option = std::getenv("EDEN_NX2_DLSS_STANDIN");
+    // EDEN_NX2_DLSS_REPLACEMENT=native retains the native network for comparisons.
+    static const char* const replacement_option = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
+    if (kepler_compute->IsNativeMode() && shader->lowered_native &&
+        DlssContract::IsFastFusionCandidate(program_id,
+                                            shader->lowered_native->native_program_key)) {
+        kepler_compute->TraceDlssContract(shader->lowered_native->native_program_key);
+    }
     if (kepler_compute->IsNativeMode() && shader->lowered_native &&
         program_id == FireEmblemUpscale::ProgramId &&
         shader->lowered_native->native_program_key == FireEmblemUpscale::PrepassProgramKey) {
         kepler_compute->CaptureFireEmblemJitter();
     }
     if (kepler_compute->IsNativeMode() && shader->lowered_native &&
-        FireEmblemUpscale::UseSpatialStandIn(
-            program_id, shader->lowered_native->native_program_key, standin_option) &&
-        kepler_compute->TryFireEmblemSpatialUpscale()) {
+        FireEmblemUpscale::UseReplacement(
+            program_id, shader->lowered_native->native_program_key, replacement_option) &&
+        kepler_compute->TryFireEmblemUpscale()) {
         throw FireEmblemUpscale::DispatchReplaced{};
     }
     return shader;

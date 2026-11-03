@@ -325,7 +325,8 @@ std::optional<u64> GenericEnvironment::TryFindSize() {
 Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, u32 tic_limit,
                                                              bool via_header_index, u32 raw) {
     const auto handle{Tegra::Texture::TexturePair(raw, via_header_index)};
-    const u32 index{Tegra::Texture::TextureHeaderIndex(handle.first, tic_limit)};
+    const u32 index{Tegra::Texture::TextureHeaderIndex(handle.first, tic_limit,
+                                                       gpu_memory->UsesNativeTiling())};
     ASSERT(index <= tic_limit);
     const GPUVAddr descriptor_addr{tic_addr + index * sizeof(Tegra::Texture::TICEntry)};
     Tegra::Texture::TICEntry entry;
@@ -336,9 +337,7 @@ Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, 
 namespace {
 
 // Reads a native program a 4 KiB page at a time instead of one 16-byte instruction at a time.
-// The reads do not flush the GPU caches first (ReadBlockUnsafe): the previous per-instruction
-// ReadBlock did, once per instruction. An instruction that is not inside a fully mapped page is
-// left to the caller.
+// An instruction that is not inside a fully mapped page is left to the caller.
 class NativeInstructionReader {
 public:
     using Instruction = Shader::Ampere::Instruction;
@@ -373,7 +372,7 @@ private:
         page_begin = address;
         page_end = address;
         if (length >= sizeof(Instruction) && gpu_memory.IsFullyMappedRange(address, length)) {
-            gpu_memory.ReadBlockUnsafe(address, page.data(), length);
+            gpu_memory.ReadBlock(address, page.data(), length);
             page_end = next_page;
         }
     }
@@ -428,7 +427,7 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
                 if (!native.empty()) break;
                 throw Shader::RuntimeError("Unmapped native shader instruction at {:#x}", address);
             }
-            gpu_memory->ReadBlockUnsafe(address, &instruction, sizeof(instruction));
+            gpu_memory->ReadBlock(address, &instruction, sizeof(instruction));
         }
         native.push_back(instruction);
         const auto status = capture.Observe(instruction, index);
@@ -787,7 +786,44 @@ Shader::TexturePixelFormat ComputeEnvironment::ReadTexturePixelFormat(u32 handle
     const auto& qmd{kepler_compute->launch_description};
     auto entry = ReadTextureInfo(regs.tic.Address(), regs.tic.limit, qmd.linked_tsc != 0, handle);
     const Shader::TexturePixelFormat result(ConvertTexturePixelFormat(entry));
-    texture_pixel_formats.emplace(handle, result);
+    const bool inserted{texture_pixel_formats.emplace(handle, result).second};
+    if (inserted && result == Shader::TexturePixelFormat::R16_FLOAT &&
+        kepler_compute->IsNativeMode() && std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS")) {
+        const auto pair{Tegra::Texture::TexturePair(handle, qmd.linked_tsc != 0)};
+        const u32 index{Tegra::Texture::TextureHeaderIndex(pair.first, regs.tic.limit,
+                                                        gpu_memory->UsesNativeTiling())};
+        const GPUVAddr tic_gpu{regs.tic.Address() + index * sizeof(entry)};
+        const auto tic_device{gpu_memory->GpuToCpuAddress(tic_gpu)};
+        const auto image_device{gpu_memory->GpuToCpuAddress(entry.Address())};
+        LOG_INFO(HW_GPU,
+                 "Native compute R16_FLOAT descriptor: program_base={:#x} raw_handle={:#010x} "
+                 "tic_pool={:#x} tic_limit={:#x} tic_low20={:#x} tic_candidate={:#x} tic_index={:#x} "
+                 "via_header_index={} native_tiling={} tic_gpu={:#x} tic_mapped={} "
+                 "tic_device={:#x} image_gpu={:#x} image_mapped={} image_device={:#x} "
+                 "tic64={:016x} {:016x} {:016x} {:016x} "
+                 "pixel_format={} texture_type={} tic_format={:#x} tic_type={} size={}x{}x{}",
+                 program_base, handle, regs.tic.Address(), regs.tic.limit, handle & 0xfffff,
+                 pair.first, index, qmd.linked_tsc != 0, gpu_memory->UsesNativeTiling(), tic_gpu,
+                 tic_device.has_value(), tic_device.value_or(0), entry.Address(),
+                 image_device.has_value(), image_device.value_or(0), entry.raw[0], entry.raw[1],
+                 entry.raw[2], entry.raw[3], result, ConvertTextureType(entry),
+                 static_cast<u32>(entry.format.Value()),
+                 static_cast<u32>(entry.texture_type.Value()), entry.Width(), entry.Height(),
+                 entry.Depth());
+        for (const auto& [key, value] : cbuf_values) {
+            if (value != handle) {
+                continue;
+            }
+            const u32 bank{static_cast<u32>(key >> 32)};
+            const u32 offset{static_cast<u32>(key)};
+            const auto& cbuf{qmd.const_buffer_config[bank]};
+            LOG_INFO(HW_GPU,
+                     "Native compute R16_FLOAT cached cbuf candidate: program_base={:#x} "
+                     "raw_handle={:#010x} bank={} offset={:#x} base={:#x} size={:#x} enabled={}",
+                     program_base, handle, bank, offset, cbuf.Address(), cbuf.size.Value(),
+                     ((qmd.const_buffer_enable_mask.Value() >> bank) & 1) != 0);
+        }
+    }
     return result;
 }
 

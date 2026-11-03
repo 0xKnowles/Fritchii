@@ -169,8 +169,8 @@ static_assert(sizeof(TextureHandle) == 4, "TextureHandle has wrong size");
 /// the texture header's byte offset in the pool, index * 32, where the handle normally has the
 /// index. Read it as an offset only when the plain index falls past the pool and the offset
 /// lands inside it, so handles that already resolve are left alone.
-[[nodiscard]] constexpr u32 TextureHeaderIndex(u32 index, u32 limit) {
-    if (index > limit && index % 32 == 0 && index / 32 <= limit) {
+[[nodiscard]] constexpr u32 TextureHeaderIndex(u32 index, u32 limit, bool native_tiling) {
+    if (native_tiling && index > limit && index % 32 == 0 && index / 32 <= limit) {
         return index / 32;
     }
     return index;

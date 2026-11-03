@@ -29,6 +29,7 @@
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
+#include "core/arm/dynarmic/window_trace.h"
 #include "core/device_memory.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
@@ -66,6 +67,7 @@
 #include "core/hle/service/nvdrv/nvdrv.h"
 #include "core/hle/service/nvdrv/nvdrv_interface.h"
 #include "core/hle/service/nx2_stub_interface.h"
+#include "core/hle/service/nx2_image_layout.h"
 #include "core/hle/service/sm/sm.h"
 #include "core/hle/service/server_manager.h"
 #include "core/hle/service/service.h"
@@ -1470,39 +1472,6 @@ struct Nx2NativeObjects {
     u32 next_image{1};
 };
 
-// Block-linear layout of an InterModuleUserImagePreference (16 words): word 2 holds
-// (width - 1) | (height - 1) << 16, word 4 the block height (log2 of GOB rows), word 5 the row
-// pitch in 64-byte GOBs. Formula from changes.patch (native_image_layout.h); preferences outside
-// it fall back to 4 bytes per pixel and 128-row blocks.
-struct Nx2ImageLayout {
-    u32 width;
-    u32 height;
-    u64 pitch;
-    u32 block_height_log2;
-    u64 size;
-    u64 alignment;
-};
-
-inline Nx2ImageLayout Nx2CalculateImageLayout(const u32* preference) {
-    Nx2ImageLayout layout{};
-    layout.width = (preference[2] & 0xFFFF) + 1;
-    layout.height = (preference[2] >> 16) + 1;
-    const u64 pitch_gobs = preference[5];
-    const u32 block_height_log2 = preference[4];
-    if (block_height_log2 <= 8 && pitch_gobs >= (u64{layout.width} * 4 + 63) / 64 &&
-        pitch_gobs <= 4096) {
-        layout.pitch = pitch_gobs * 64;
-        layout.block_height_log2 = block_height_log2;
-    } else {
-        layout.pitch = Common::AlignUp(u64{layout.width} * 4, 64);
-        layout.block_height_log2 = 7;
-    }
-    const u64 block_rows = u64{1} << layout.block_height_log2;
-    layout.size = layout.pitch * Common::AlignUp(u64{layout.height}, block_rows);
-    layout.alignment = std::max<u64>(64 * block_rows, 0x1000);
-    return layout;
-}
-
 // GameChat's graphics side (nn::chat::gsv), handed out by gsv 1202. Read from the SDK's
 // nn::chat::gsv::Initialize: TIPC 1() returns a u32 id at word 3 (it aborts with 2162-0001 if
 // the id is over 0x3ff), then TIPC 11(u32 id) returns an event (copy handle at word 3, result at
@@ -2447,6 +2416,11 @@ private:
             const auto name = ctx.ReadBufferA(0);
             codec.assign(reinterpret_cast<const char*>(name.data()),
                          strnlen(reinterpret_cast<const char*>(name.data()), name.size()));
+            if (codec.empty()) {
+                LOG_WARNING(Service, "{} empty codec name: buffer size {}, first bytes {:02x}",
+                            GetServiceName(), name.size(),
+                            fmt::join(name.first(std::min(name.size(), size_t{48})), " "));
+            }
         }
         Log(ctx, "configure");
         LOG_INFO(Service, "{} configure codec \"{}\" {}x{} rate {}", GetServiceName(), codec, w[5],
@@ -2658,6 +2632,14 @@ private:
             const std::string codec = m_codec;
             lk.unlock();
             if (!decoder || decoder->Name() != codec) {
+                if (codec.empty()) {
+                    LOG_WARNING(Service,
+                                "{} input without codec: size {}, pts {}, end {}, first bytes {:02x}",
+                                GetServiceName(), input.data.size(), input.pts, input.end,
+                                fmt::join(std::span<const u8>{input.data}.first(
+                                              std::min(input.data.size(), size_t{16})),
+                                          " "));
+                }
                 decoder = std::make_unique<Tegra::Host1x::Nx2VideoDecoder>(codec);
             }
             pictures.clear();
@@ -3184,7 +3166,17 @@ private:
     // size, u64 alignment; the client raises the alignment to at least 4 KiB and rounds the size.
     void CalculateRequirements(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
-        const auto layout = Nx2CalculateImageLayout(w + 2);
+        const auto layout = Nx2CalculateNativeImageRequirements(
+            std::span<const u32, 16>{w + 2, 16}, w[18]);
+        const auto trace = Core::WindowTrace::Enabled()
+                               ? Core::WindowTrace::sessions.Find(ctx.GetThread().GetOwnerProcess())
+                               : nullptr;
+        if (trace && trace->TakeGsvLog()) {
+            LOG_INFO(Service, "Star Fox gsv 1510: session={} tls={:#x} kind={} {}x{} raw_block={} raw_pitch_gobs={} format={} block_format_and_luminance={:#x} count={} -> pitch={:#x} block_rows_log2={} size={:#x} alignment={:#x}",
+                     trace->id, GetInteger(ctx.GetThread().GetTlsAddress()), w[3], layout.width, layout.height,
+                     w[6], w[7], w[8], w[9], w[18],
+                     layout.pitch, layout.block_height_log2, layout.size, layout.alignment);
+        }
         LOG_DEBUG(Service, "nx2:gsv 1510 kind={} {}x{} block={} pitch={:#x} format={} -> size={:#x} align={:#x}",
                   w[3], layout.width, layout.height, layout.block_height_log2, layout.pitch, w[8],
                   layout.size, layout.alignment);

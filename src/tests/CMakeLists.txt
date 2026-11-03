@@ -5,7 +5,38 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 add_executable(tests
+    audio_core/nx2_sysmix.cpp
+    audio_core/sysmix_sink.cpp
+    audio_core/sysmix_test_context.h
+    video_core/ampere_starfox_test10.cpp
+    video_core/texture_rect_descriptor.cpp
+    audio_core/batch_decoder.cpp
+    audio_core/hardware_audio_codec.cpp
+    core/memory_acquire.cpp
+    core/system_test_context.h
+    video_core/ampere_branch_modifiers.cpp
+    video_core/ampere_fast_fusion_logged.cpp
+    video_core/fast_fusion_surface_store.cpp
+    video_core/fast_fusion_byte_store.cpp
+    video_core/vk_byte_addressed_shadow.cpp
+    video_core/global_memory_coherence.cpp
+    video_core/storage_buffer_pointer_tracking.cpp
+    video_core/storage_buffer_control_flow.cpp
+    common/slot_vector.cpp
+    core/nup_validation.cpp
+    input_common/calibration_lifetime.cpp
+    video_core/ampere_logged_numeric.cpp
+    video_core/ampere_logged_textures.cpp
+    video_core/native_texture_header_index.cpp
+    video_core/texture_handles.cpp
+    video_core/ampere_selevet_modes.cpp
+    video_core/ampere_selevet_spills.cpp
+    video_core/blit_dither.cpp
+    video_core/maxwell_numeric.cpp
+    video_core/maxwell_permute_lod.cpp
+    video_core/submission_policy.cpp
     video_core/fire_emblem_upscale.cpp
+    video_core/dlss_contract.cpp
     video_core/ampere_fast_fusion.cpp
     video_core/ampere_async_copy.cpp
     video_core/ampere_trap_guards.cpp
@@ -47,6 +78,8 @@ add_executable(tests
     core/core_timing.cpp
     core/thread_startup_policy.cpp
     core/nup_writer.cpp
+    core/nup_metadata.cpp
+    core/nx2_image_layout.cpp
     core/internal_network/network.cpp
     video_core/memory_tracker.cpp
     video_core/vertex_repack.cpp
@@ -56,8 +89,13 @@ add_executable(tests
 
 create_target_directory_groups(tests)
 
-target_link_libraries(tests PRIVATE common core input_common video_core)
+target_link_libraries(tests PRIVATE common core audio_core input_common video_core)
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
+
+if (TARGET dynarmic::dynarmic)
+    target_sources(tests PRIVATE core/window_trace.cpp)
+    target_link_libraries(tests PRIVATE dynarmic::dynarmic)
+endif()
 
 add_test(NAME tests COMMAND tests)
 

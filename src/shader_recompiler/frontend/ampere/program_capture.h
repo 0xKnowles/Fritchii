@@ -38,7 +38,8 @@ public:
             }
         }
         if (opcode == 0x944 || opcode == 0x947 || opcode == 0x945) {
-            const u64 raw = instruction.words[1] | (u64{instruction.words[2] & 0x3ffff} << 32);
+            const u64 raw = (opcode == 0x947 ? instruction.words[1] & ~3U : instruction.words[1]) |
+                            (u64{instruction.words[2] & 0x3ffff} << 32);
             const s64 relative = opcode == 0x945 ? static_cast<s32>(instruction.words[1])
                                                 : static_cast<s64>(raw << 14) >> 14;
             const s64 target = s64{index} * 16 + 16 + relative;

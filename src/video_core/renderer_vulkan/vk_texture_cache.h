@@ -6,13 +6,21 @@
 
 #pragma once
 
+#include <chrono>
 #include <deque>
+#include <memory>
+#include <optional>
+#include <optional>
 #include <span>
 
 #include "video_core/texture_cache/texture_cache_base.h"
 
 #include "shader_recompiler/shader_info.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
+#include "video_core/renderer_vulkan/vk_fsr3_upscaler.h"
+#ifdef EGLANTINE_STREAMLINE
+#include "video_core/renderer_vulkan/vk_streamline_dlss.h"
+#endif
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/texture_cache/image_view_base.h"
@@ -40,6 +48,32 @@ class Framebuffer;
 class RenderPassCache;
 class StagingBufferPool;
 class Scheduler;
+
+struct ByteAddressedShadow {
+    VkImage original{};
+    VkImage packed{};
+    VkImageView view{};
+    VkBuffer bridge{};
+    VkExtent2D extent{};
+};
+
+struct ByteAddressedRange {
+    DAddr address{};
+    u64 size{};
+
+    [[nodiscard]] bool Overlaps(const ByteAddressedRange& other) const noexcept {
+        return size != 0 && other.size != 0 &&
+               (address < other.address ? other.address - address < size
+                                        : address - other.address < other.size);
+    }
+};
+
+[[nodiscard]] inline std::optional<VkExtent2D> PackedByteAddressedExtent(u32 width, u32 height) {
+    if (width < 2 || (width & 1) != 0 || height == 0) {
+        return std::nullopt;
+    }
+    return VkExtent2D{width / 2, height};
+}
 
 class TextureCacheRuntime {
 public:
@@ -99,11 +133,13 @@ public:
                    Tegra::Engines::Fermi2D::Filter filter,
                    Tegra::Engines::Fermi2D::Operation operation);
 
-    /// Stands in for a DLSS evaluation: temporal upscale of input_color into dst, accumulated with
-    /// a copy of dst's previous contents (the last output). False when dst cannot take it.
+    /// Replaces a validated DLSS evaluation with NVIDIA DLSS or FSR 3.1.
     bool TemporalUpscale(Framebuffer* dst_framebuffer, ImageView& dst, ImageView& input_color,
-                         ImageView& motion_vectors, std::array<f32, 2> jitter,
-                         std::array<f32, 2> motion_scale, bool use_history = true);
+                         ImageView& motion_vectors, ImageView* depth,
+                         std::array<u32, 2> render_size, std::array<f32, 2> jitter,
+                         std::array<f32, 2> motion_scale);
+
+    [[nodiscard]] bool WantsTemporalUpscaleDepth() const;
 
     void CopyImage(Image& dst, Image& src, std::span<const VideoCommon::ImageCopy> copies);
 
@@ -112,6 +148,13 @@ public:
     bool ShouldReinterpret(Image& dst, Image& src);
 
     void ReinterpretImage(Image& dst, Image& src, std::span<const VideoCommon::ImageCopy> copies);
+
+    [[nodiscard]] ByteAddressedShadow CreateByteAddressedShadow(const ImageView& view);
+
+    void RetireByteAddressedShadow(const ByteAddressedShadow& shadow);
+
+    static void CopyByteAddressedShadow(vk::CommandBuffer cmdbuf,
+                                        const ByteAddressedShadow& shadow, bool unpack);
 
     void ConvertImage(Framebuffer* dst, ImageView& dst_view, ImageView& src_view);
 
@@ -187,14 +230,32 @@ public:
     StagingBufferPool& staging_buffer_pool;
     BlitImageHelper& blit_image_helper;
     RenderPassCache& render_pass_cache;
+    DescriptorPool& descriptor_pool;
+    ComputePassDescriptorQueue& compute_pass_descriptor_queue;
 
-    /// TemporalUpscale's history: its previous result, copied right after drawing it.
-    struct TemporalHistory {
-        vk::Image image;
-        vk::ImageView view;
-        VkFormat format{};
-        VkExtent2D extent{};
-    } temporal_history;
+    /// NVIDIA DLSS, then FSR 3.1, created on first use.
+    bool UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageView& input_color,
+                         ImageView& motion_vectors, ImageView& depth,
+                         std::array<u32, 2> render_size, std::array<f32, 2> jitter,
+                         std::array<f32, 2> motion_scale);
+    std::unique_ptr<Fsr3Upscaler> fsr3_upscaler;
+    bool fsr3_unsupported{};
+    std::optional<std::chrono::steady_clock::time_point> fsr3_last_evaluation;
+
+    /// Draws an upscaler's RGBA16F output into the DLSS output and returns it to GENERAL.
+    void DrawUpscaledOutput(Framebuffer* dst_framebuffer, VkImageView view, VkImage image,
+                            VkSampler sampler);
+#ifdef EGLANTINE_STREAMLINE
+    /// NVIDIA's DLSS (through NVIDIA Streamline) in place of the game's,
+    /// before FSR 3.1, when the setting is on. Returns false to fall back to FSR 3.1.
+    bool UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageView& input_color,
+                         ImageView& motion_vectors, ImageView& depth,
+                         std::array<u32, 2> render_size, std::array<f32, 2> jitter,
+                         std::array<f32, 2> motion_scale, bool reset);
+    std::unique_ptr<StreamlineDlssUpscaler> dlss_upscaler;
+    bool dlss_unsupported{};
+#endif
+
 
     std::optional<ASTCDecoderPass> astc_decoder_pass;
     std::optional<BcEncoderPass> bc_encoder_pass;
@@ -249,6 +310,14 @@ public:
     std::vector<MsaaScratchImage> msaa_scratch_images;
     ::Common::unordered_map<VkImage, ResolveShadow> resolve_shadows;
     std::vector<std::pair<u64, ResolveShadow>> pending_resolve_shadows;
+
+    struct PendingByteAddressedShadow {
+        u64 tick;
+        vk::Image image;
+        vk::ImageView view;
+        vk::Buffer bridge;
+    };
+    std::deque<PendingByteAddressedShadow> pending_byte_addressed_shadows;
 };
 
 class Framebuffer {
@@ -611,7 +680,7 @@ public:
     [[nodiscard]] VkImageView ColorView();
 
     [[nodiscard]] VkImageView StorageView(Shader::TextureType texture_type,
-                                          Shader::ImageFormat image_format);
+                                          Shader::ImageFormat image_format, bool is_byte_addressed);
 
     [[nodiscard]] bool IsRescaled() const noexcept;
 
@@ -621,6 +690,10 @@ public:
 
     [[nodiscard]] VkImage ImageHandle() const noexcept {
         return image_handle;
+    }
+
+    [[nodiscard]] const Image* BackingImage() const noexcept {
+        return slot_images && image_id ? &(*slot_images)[image_id] : nullptr;
     }
 
     [[nodiscard]] VkImageView RenderTarget() const noexcept {
@@ -661,8 +734,8 @@ public:
 
 private:
     struct StorageViews {
-        std::array<vk::ImageView, Shader::NUM_TEXTURE_TYPES> signeds;
-        std::array<vk::ImageView, Shader::NUM_TEXTURE_TYPES> unsigneds;
+        std::array<std::array<vk::ImageView, Shader::NUM_TEXTURE_TYPES>,
+                   static_cast<size_t>(Shader::ImageFormat::R32G32B32A32_UINT) + 1> formats;
     };
 
     [[nodiscard]] vk::ImageView MakeView(VkFormat vk_format, VkImageAspectFlags aspect_mask,

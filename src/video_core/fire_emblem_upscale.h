@@ -44,9 +44,9 @@ private:
     std::optional<JitterSample> sample;
 };
 
-inline bool UseSpatialStandIn(u64 program_id, u64 native_key, const char* option) {
+inline bool UseReplacement(u64 program_id, u64 native_key, const char* option) {
     return program_id == ProgramId && native_key == OutputProgramKey &&
-           (option == nullptr || std::string_view{option} == "1");
+           (option == nullptr || (std::string_view{option} == "fsr" || std::string_view{option} == "dlss"));
 }
 
 inline bool ValidPair(const Tegra::Texture::TICEntry& input,

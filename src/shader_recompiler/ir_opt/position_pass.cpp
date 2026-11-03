@@ -114,6 +114,38 @@ void BlitConstantsPass(Environment& env, IR::Program& program) {
     if (!reads_nonzero_word) {
         return;
     }
+    if (env.ShaderStage() == Stage::Fragment && env.HasNativeInstructions()) {
+        for (IR::Block* const block : program.post_order_blocks) {
+            for (IR::Inst& inst : block->Instructions()) {
+                if (inst.GetOpcode() != IR::Opcode::BitCastF32U32) {
+                    continue;
+                }
+                const IR::Inst* const arithmetic = inst.Arg(0).TryInstRecursive();
+                if (!arithmetic || (arithmetic->GetOpcode() != IR::Opcode::IAdd32 &&
+                                    arithmetic->GetOpcode() != IR::Opcode::ISub32)) {
+                    continue;
+                }
+                for (size_t bias_arg = 0; bias_arg < 2; ++bias_arg) {
+                    if (bias_arg == 0 && arithmetic->GetOpcode() == IR::Opcode::ISub32) {
+                        continue;
+                    }
+                    const IR::Inst* const bias = arithmetic->Arg(bias_arg).TryInstRecursive();
+                    const IR::Inst* const color = arithmetic->Arg(1 - bias_arg).TryInstRecursive();
+                    if (!bias || bias->GetOpcode() != IR::Opcode::GetCbufU32 || !color ||
+                        color->GetOpcode() != IR::Opcode::BitCastU32F32 ||
+                        !bias->Arg(0).IsImmediate() || bias->Arg(0).U32() != 17 ||
+                        !bias->Arg(1).IsImmediate()) {
+                        continue;
+                    }
+                    const u32 offset = bias->Arg(1).U32();
+                    if (offset == 0x10 || offset == 0x14 || offset == 0x18) {
+                        inst.SetArg(0, arithmetic->Arg(1 - bias_arg));
+                        break;
+                    }
+                }
+            }
+        }
+    }
     bool used{};
     for (IR::Block* const block : program.post_order_blocks) {
         for (IR::Inst& inst : block->Instructions()) {

@@ -89,6 +89,8 @@ public:
 
         std::vector<u8> npdm;
         std::string title_name;
+        std::string publisher;
+        std::string source_dump;
         std::vector<std::pair<std::string, std::string>> localized_titles;
         std::vector<u8> icon;
         std::vector<std::pair<std::string, std::vector<u8>>> localized_icons;
@@ -150,6 +152,7 @@ private:
     };
 
     bool Parse();
+    bool ValidateDirTree() const;
     bool ParseMeta(PackageInfo& package);
     void BuildDirTree(u32 dir_index, VectorVfsDirectory& out);
     VirtualDir BuildPackageDir(u32 dir_index);

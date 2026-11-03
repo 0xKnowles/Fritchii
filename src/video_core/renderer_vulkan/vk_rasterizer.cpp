@@ -37,6 +37,7 @@
 #include "video_core/renderer_vulkan/blit_image.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
+#include "video_core/renderer_vulkan/submission_policy.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
@@ -989,8 +990,14 @@ void RasterizerVulkan::DispatchCompute() {
         return;
     }
     std::scoped_lock lock{texture_cache.mutex, buffer_cache.mutex};
+    std::optional<ByteAddressedShadow> byte_addressed_shadow;
+    SCOPE_EXIT {
+        if (byte_addressed_shadow) {
+            texture_cache_runtime.RetireByteAddressedShadow(*byte_addressed_shadow);
+        }
+    };
     if (!pipeline->Configure(*kepler_compute, *gpu_memory, scheduler, buffer_cache,
-                             texture_cache)) {
+                             texture_cache, texture_cache_runtime, byte_addressed_shadow)) {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute resources unavailable");
         return;
     }
@@ -1027,11 +1034,17 @@ void RasterizerVulkan::DispatchCompute() {
     };
     scheduler.Record([](vk::CommandBuffer cmdbuf) { cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                0, READ_BARRIER); });
-    scheduler.Record([pipeline, dim](vk::CommandBuffer cmdbuf) {
+    scheduler.Record([pipeline, dim, byte_addressed_shadow](vk::CommandBuffer cmdbuf) {
         if (!pipeline->IsBound()) {
             return;
         }
+        if (byte_addressed_shadow) {
+            TextureCacheRuntime::CopyByteAddressedShadow(cmdbuf, *byte_addressed_shadow, false);
+        }
         cmdbuf.Dispatch(dim[0], dim[1], dim[2]);
+        if (byte_addressed_shadow) {
+            TextureCacheRuntime::CopyByteAddressedShadow(cmdbuf, *byte_addressed_shadow, true);
+        }
     });
 
     // Log compute dispatch
@@ -1301,15 +1314,18 @@ void RasterizerVulkan::TiledCacheBarrier() {
 }
 
 void RasterizerVulkan::FlushCommands() {
-    if (draw_counter == 0) {
+    if (draw_counter == 0 && !pending_native_work) {
         return;
     }
     draw_counter = 0;
+    pending_native_work = false;
     scheduler.Flush();
 }
 
 void RasterizerVulkan::TickFrame() {
+    ComputePipeline::TickUpscalerTrace();
     draw_counter = 0;
+    pending_native_work = false;
     pipeline_cache.TickFrame();
     guest_descriptor_queue.TickFrame();
     compute_pass_descriptor_queue.TickFrame();
@@ -1345,9 +1361,9 @@ bool RasterizerVulkan::AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surf
 bool RasterizerVulkan::AccelerateTemporalUpscale(
     const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst,
     const Tegra::Engines::Fermi2D::Surface& motion_vectors, std::array<f32, 2> jitter,
-    std::array<f32, 2> motion_scale, bool use_history) {
+    std::array<f32, 2> motion_scale, const Tegra::Texture::TICEntry* depth) {
     std::scoped_lock lock{texture_cache.mutex};
-    return texture_cache.TemporalUpscale(dst, src, motion_vectors, jitter, motion_scale, use_history);
+    return texture_cache.TemporalUpscale(dst, src, motion_vectors, jitter, motion_scale, depth);
 }
 
 Tegra::Engines::AccelerateDMAInterface& RasterizerVulkan::AccessAccelerateDMA() {
@@ -1449,25 +1465,41 @@ void RasterizerVulkan::LoadDiskResources(u64 title_id, std::stop_token stop_load
 
 void RasterizerVulkan::FlushWork() {
 #ifdef __ANDROID__
-    static constexpr u32 DRAWS_TO_DISPATCH = 512;
-    static constexpr u32 CHECK_MASK = 3;
+    static constexpr bool android = true;
 #else
-    // Every 32 draws (was 8): each dispatch woke the worker thread, and Switch 2 titles make
-    // ~55,000 draws a second. A full chunk is dispatched on its own (Scheduler::Record).
-    static constexpr u32 DRAWS_TO_DISPATCH = 4096;
-    static constexpr u32 CHECK_MASK = 31;
+    static constexpr bool android = false;
 #endif // __ANDROID__
-
-    static_assert(DRAWS_TO_DISPATCH % (CHECK_MASK + 1) == 0);
-    if ((++draw_counter & CHECK_MASK) != CHECK_MASK) {
-        return;
+    const bool native = gpu_memory->UsesNativeTiling();
+    u32 budget = SubmissionPolicy::DefaultNativeBudget;
+    if (native && !android) {
+        static const u32 configured_budget = [] {
+            if (const char* value = std::getenv("EDEN_NX2_FLUSH_DRAWS")) {
+                if (const auto parsed = SubmissionPolicy::ParseBudget(value)) {
+                    return *parsed;
+                }
+                LOG_WARNING(Render_Vulkan,
+                            "Invalid EDEN_NX2_FLUSH_DRAWS; expected an integer from 1 to {}, "
+                            "using {}",
+                            (std::numeric_limits<u32>::max)(), SubmissionPolicy::DefaultNativeBudget);
+            }
+            return SubmissionPolicy::DefaultNativeBudget;
+        }();
+        budget = configured_budget;
     }
-    if (draw_counter < DRAWS_TO_DISPATCH) {
+    switch (SubmissionPolicy::Advance(draw_counter, native, android, budget)) {
+    case SubmissionPolicy::Action::None:
+        break;
+    case SubmissionPolicy::Action::Dispatch:
         scheduler.DispatchWork();
-        return;
+        break;
+    case SubmissionPolicy::Action::Flush:
+        scheduler.Flush();
+        pending_native_work = false;
+        break;
     }
-    scheduler.Flush();
-    draw_counter = 0;
+    if (native && !android) {
+        pending_native_work = true;
+    }
 }
 
 AccelerateDMA::AccelerateDMA(BufferCache& buffer_cache_, TextureCache& texture_cache_,

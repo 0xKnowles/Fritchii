@@ -23,18 +23,18 @@ TICEntry Image(u32 address, u32 width, u32 height) {
 } // namespace
 
 TEST_CASE("FE upscale substitute only selects the captured output pass", "[fe_upscale]") {
-    REQUIRE(FE::UseSpatialStandIn(FE::ProgramId, FE::OutputProgramKey, nullptr));
-    REQUIRE(FE::UseSpatialStandIn(FE::ProgramId, FE::OutputProgramKey, "1"));
-    for (const char* option : {"0", "", "10", "invalid"}) {
-        REQUIRE_FALSE(FE::UseSpatialStandIn(FE::ProgramId, FE::OutputProgramKey, option));
+    REQUIRE(FE::UseReplacement(FE::ProgramId, FE::OutputProgramKey, nullptr));
+    REQUIRE(FE::UseReplacement(FE::ProgramId, FE::OutputProgramKey, "fsr"));
+    for (const char* option : {"native", "standin", "0", "", "10", "invalid"}) {
+        REQUIRE_FALSE(FE::UseReplacement(FE::ProgramId, FE::OutputProgramKey, option));
     }
     for (u64 title : {0ULL, 0x040074A01BF12000ULL, 0x0400C3F00006E000ULL}) {
-        REQUIRE_FALSE(FE::UseSpatialStandIn(title, FE::OutputProgramKey, nullptr));
+        REQUIRE_FALSE(FE::UseReplacement(title, FE::OutputProgramKey, nullptr));
     }
     for (unsigned bit = 0; bit < 64; ++bit) {
-        REQUIRE_FALSE(FE::UseSpatialStandIn(FE::ProgramId, FE::OutputProgramKey ^ (1ULL << bit),
+        REQUIRE_FALSE(FE::UseReplacement(FE::ProgramId, FE::OutputProgramKey ^ (1ULL << bit),
                                           nullptr));
-        REQUIRE_FALSE(FE::UseSpatialStandIn(FE::ProgramId ^ (1ULL << bit), FE::OutputProgramKey,
+        REQUIRE_FALSE(FE::UseReplacement(FE::ProgramId ^ (1ULL << bit), FE::OutputProgramKey,
                                           nullptr));
     }
 }
