@@ -2005,7 +2005,11 @@ private:
     // nx2-frame-<n>.tga in <dir> (lets hidden test runs check the output; idea from changes.patch).
     void CaptureFrame() {
         static const char* const directory = std::getenv("EDEN_NX2_FRAME_CAPTURE");
-        if (directory == nullptr || (m_presents % 120) != 1 || m_capture_pending->exchange(true)) {
+        static const u64 every = [] {
+            const char* value = std::getenv("EDEN_NX2_FRAME_CAPTURE_EVERY");
+            return value != nullptr ? (std::max)(u64{1}, static_cast<u64>(std::strtoull(value, nullptr, 10))) : u64{120};
+        }();
+        if (directory == nullptr || (m_presents % every) != 1 % every || m_capture_pending->exchange(true)) {
             return;
         }
         const auto layout = Layout::DefaultFrameLayout(1280, 720);
@@ -2509,7 +2513,17 @@ private:
             if (release_fence) {
                 m_release_fences[image] = *release_fence;
             }
-            value = m_sync_base + ++m_handed;
+            // After the end of a stream nothing fills an image again, so a release completes at
+            // once as another end-of-stream frame. Mario Kart World releases its images after a
+            // movie ends and waits for the returned fences; a fence for a frame that never comes
+            // hung the game on a black screen after its title movie.
+            if (release_fence && m_stream_ended && m_inputs.empty() && m_decoded.empty()) {
+                value = DrainFreeAsEndOfStream();
+                m_sync_base = value;
+                m_handed = 0;
+            } else {
+                value = m_sync_base + ++m_handed;
+            }
         }
         m_cv.notify_one();
         return {~m_syncpoint, 0, value, 0};
@@ -2555,6 +2569,7 @@ private:
         {
             std::scoped_lock lk{m_mutex};
             m_inputs.push_back(std::move(input));
+            m_stream_ended = false;
             m_ready->room.store(m_inputs.size() < MaxQueuedInputs, std::memory_order_relaxed);
         }
         m_cv.notify_one();
@@ -2570,6 +2585,7 @@ private:
             std::scoped_lock lk{m_mutex};
             m_inputs.clear();
             m_flush = true;
+            m_stream_ended = false;
             m_ready->room.store(true, std::memory_order_relaxed);
         }
         m_cv.notify_one();
@@ -2643,7 +2659,12 @@ private:
                 lk.lock();
                 // Even an image written during a flush counts: the client waits for its value.
                 m_outputs.push_back({image, width, height, frame.pts, frame.end});
+                m_stream_ended = frame.end;
                 system.Host1x().GetSyncpointManager().IncrementGuest(m_syncpoint);
+                m_last_output = m_outputs.back();
+                if (frame.end && m_inputs.empty() && m_decoded.empty()) {
+                    DrainFreeAsEndOfStream();
+                }
                 ++m_frames_out;
                 if (m_frames_out == 1 || (m_frames_out % 600) == 0 || frame.end) {
                     LOG_INFO(Service, "{} frame {} ({}x{}, pts {} us{}) in image {}",
@@ -2654,6 +2675,7 @@ private:
             }
             Input input = std::move(m_inputs.front());
             m_inputs.pop_front();
+            m_stream_ended = false;
             m_ready->room.store(m_inputs.size() < MaxQueuedInputs, std::memory_order_relaxed);
             const std::string codec = m_codec;
             lk.unlock();
@@ -2683,6 +2705,18 @@ private:
                 }
             }
         }
+    }
+
+    u32 DrainFreeAsEndOfStream() {
+        auto& syncpoints = system.Host1x().GetSyncpointManager();
+        while (!m_free.empty()) {
+            const u32 image = m_free.front();
+            m_free.pop_front();
+            m_release_fences.erase(image);
+            m_outputs.push_back({image, m_last_output.width, m_last_output.height, m_last_output.pts, true});
+            syncpoints.IncrementGuest(m_syncpoint);
+        }
+        return static_cast<u32>(syncpoints.GetGuestSyncpointValue(m_syncpoint));
     }
 
     // Waits (bounded) until the client's reads of an image it gave back have passed.
@@ -2805,6 +2839,8 @@ private:
     std::deque<u32> m_free;            ///< Output images, in the order the client acquires them
     std::map<u32, Fence> m_release_fences;
     std::deque<Output> m_outputs;      ///< Finished, for 213
+    Output m_last_output{};
+    bool m_stream_ended{};             ///< End-of-stream frame handed out, nothing submitted since
     bool m_flush{};
     bool m_quit{};
     std::thread m_worker;

@@ -5,6 +5,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <memory>
+#include <algorithm>
+#include <vector>
+#include <string_view>
+#include <string>
+#include <map>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -16,6 +21,7 @@
 #include "common/settings.h"
 #include "common/thread.h"
 #include "video_core/gpu_logging/gpu_logging.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/renderer_vulkan/vk_command_pool.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
@@ -26,6 +32,62 @@
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Vulkan {
+
+namespace {
+std::atomic<u64> g_profile_submits{};
+std::atomic<u64> g_profile_renderpasses{};
+std::atomic<u64> g_profile_finishes{};
+std::atomic<u64> g_profile_finish_ns{};
+std::atomic<u64> g_profile_window_start{};
+std::mutex g_profile_end_mutex;
+std::map<std::string, u64> g_profile_ends;
+
+void CountRenderPassEnd(const char* file, u32 line) {
+    if (!VideoCommon::Nx2Profile::Enabled()) {
+        return;
+    }
+    std::string_view name{file};
+    if (const auto slash = name.find_last_of('/'); slash != std::string_view::npos) {
+        name.remove_prefix(slash + 1);
+    }
+    std::scoped_lock lock{g_profile_end_mutex};
+    ++g_profile_ends[fmt::format("{}:{}", name, line)];
+}
+
+void ReportSubmitCounts() {
+    const u64 now = VideoCommon::Nx2Profile::Now();
+    u64 start = g_profile_window_start.load(std::memory_order_relaxed);
+    if (start == 0) {
+        g_profile_window_start.compare_exchange_strong(start, now);
+        return;
+    }
+    if (now - start < 10'000'000'000ULL ||
+        !g_profile_window_start.compare_exchange_strong(start, now)) {
+        return;
+    }
+    const double seconds = static_cast<double>(now - start) / 1e9;
+    LOG_INFO(Render_Vulkan,
+             "Scheduler per second: {:.0f} submits, {:.0f} render passes, {:.0f} finishes "
+             "waiting {:.1f} ms",
+             static_cast<double>(g_profile_submits.exchange(0)) / seconds,
+             static_cast<double>(g_profile_renderpasses.exchange(0)) / seconds,
+             static_cast<double>(g_profile_finishes.exchange(0)) / seconds,
+             static_cast<double>(g_profile_finish_ns.exchange(0)) / 1e6 / seconds);
+    std::vector<std::pair<u64, std::string>> ends;
+    {
+        std::scoped_lock lock{g_profile_end_mutex};
+        for (const auto& [site, count] : g_profile_ends) {
+            ends.emplace_back(count, site);
+        }
+        g_profile_ends.clear();
+    }
+    std::sort(ends.rbegin(), ends.rend());
+    for (size_t i = 0; i < ends.size() && i < 16; ++i) {
+        LOG_INFO(Render_Vulkan, "Render pass ends {:.0f}/s at {}",
+                 static_cast<double>(ends[i].first) / seconds, ends[i].second);
+    }
+}
+}
 
 void Scheduler::CommandChunk::ExecuteAll(vk::CommandBuffer cmdbuf,
                                          vk::CommandBuffer upload_cmdbuf) {
@@ -54,7 +116,11 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
 
 Scheduler::~Scheduler() = default;
 
-u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
+u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
+                     std::source_location location) {
+    if (state.renderpass) {
+        CountRenderPassEnd(location.file_name(), location.line());
+    }
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Flush");
     }
@@ -64,15 +130,26 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
     return signal_value;
 }
 
-void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
+void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
+                       std::source_location location) {
+    if (state.renderpass) {
+        CountRenderPassEnd(location.file_name(), location.line());
+    }
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Finish");
     }
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
+    const bool profile = VideoCommon::Nx2Profile::Enabled();
+    const u64 start = profile ? VideoCommon::Nx2Profile::Now() : 0;
     SubmitExecution(signal_semaphore, wait_semaphore);
     Wait(presubmit_tick);
     AllocateNewContext();
+    if (profile) {
+        g_profile_finishes.fetch_add(1, std::memory_order_relaxed);
+        g_profile_finish_ns.fetch_add(VideoCommon::Nx2Profile::Now() - start,
+                                      std::memory_order_relaxed);
+    }
 }
 
 void Scheduler::WaitWorker() {
@@ -110,6 +187,9 @@ void Scheduler::DispatchWork() {
 
 void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass renderpass,
                                     const VkClearValue* clear_values, u32 clear_value_count) {
+    if (VideoCommon::Nx2Profile::Enabled()) {
+        g_profile_renderpasses.fetch_add(1, std::memory_order_relaxed);
+    }
     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
     const VkExtent2D render_area = framebuffer->RenderArea();
     state.renderpass = renderpass;
@@ -216,7 +296,7 @@ void Scheduler::FlushDeferredClear() {
     EndRenderPass();
 }
 
-void Scheduler::RequestRenderpass(const Framebuffer* framebuffer) {
+void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_location location) {
     if (deferred_clear.framebuffer == framebuffer) {
         RealizeDeferredClear();
         return;
@@ -229,12 +309,18 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer) {
         render_area.height == state.render_area.height) {
         return;
     }
+    if (state.renderpass) {
+        CountRenderPassEnd(location.file_name(), location.line());
+    }
     // Ends any active pass and realizes a deferred clear
     EndRenderPass();
     BeginRenderPassImpl(framebuffer, renderpass, nullptr, 0);
 }
 
-void Scheduler::RequestOutsideRenderPassOperationContext() {
+void Scheduler::RequestOutsideRenderPassOperationContext(std::source_location location) {
+    if (state.renderpass) {
+        CountRenderPassEnd(location.file_name(), location.line());
+    }
     EndRenderPass();
 }
 
@@ -359,6 +445,10 @@ void Scheduler::AllocateWorkerCommandBuffer() {
 }
 
 u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
+    if (VideoCommon::Nx2Profile::Enabled()) {
+        g_profile_submits.fetch_add(1, std::memory_order_relaxed);
+        ReportSubmitCounts();
+    }
     EndPendingOperations();
     InvalidateState();
 
@@ -425,6 +515,8 @@ void Scheduler::EndRenderPass()
         if (!state.renderpass) {
             return;
         }
+        fragment_barrier_pending = false;
+        render_pass_has_stores = false;
 
         query_cache->CounterClose(VideoCommon::QueryType::StreamingByteCount);
 

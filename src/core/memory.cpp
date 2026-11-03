@@ -569,17 +569,27 @@ struct Memory::Impl {
         for (u64 page = vaddr >> YUZU_PAGEBITS; page != page_end; ++page) {
             const bool cached = std::as_const(current_page_table->entries)[page].Type() ==
                                 Common::PageType::RasterizerCachedMemory;
+            armed_read_trap_count.fetch_add(1, std::memory_order_relaxed);
             if (!cached || !armed_read_traps.insert(page).second) {
+                armed_read_trap_count.fetch_sub(1, std::memory_order_relaxed);
                 protect_run();
                 continue;
             }
-            armed_read_trap_count.fetch_add(1, std::memory_order_relaxed);
             if (run_pages == 0) {
                 run_begin = page;
             }
             ++run_pages;
         }
         protect_run();
+    }
+
+    bool ReadTrapArmed(u64 vaddr, u64 size) {
+        if (armed_read_trap_count.load(std::memory_order_relaxed) == 0) {
+            return false;
+        }
+        std::scoped_lock lk{read_trap_mutex};
+        const auto it = armed_read_traps.lower_bound(vaddr >> YUZU_PAGEBITS);
+        return it != armed_read_traps.end() && *it <= ((vaddr + size - 1) >> YUZU_PAGEBITS);
     }
 
     /// Takes read permission away again from armed pages that were just cached again.
@@ -721,7 +731,9 @@ struct Memory::Impl {
             }
             ++UnmappedReadFlag();
         }, [&]() {
-            HandleRasterizerDownload(addr, sizeof(T));
+            if (!ReadTrapsEnabled() || ReadTrapArmed(addr & 0xffffffffffffULL, sizeof(T))) {
+                HandleRasterizerDownload(addr, sizeof(T));
+            }
         }); ptr) [[likely]] {
             // It may be tempting to rewrite this particular section to use "reinterpret_cast";
             // afterall, it's trivially copyable so surely it can be copied ov- Alignment.

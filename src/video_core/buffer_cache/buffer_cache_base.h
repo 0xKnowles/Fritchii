@@ -586,6 +586,7 @@ private:
 
     size_t immediate_buffer_capacity = 0;
     Common::ScratchBuffer<u8> immediate_buffer_alloc;
+    std::vector<u8> guest_uint8_indices;
     /// Guest memory large uploads came from since the last cold hint (device address, size).
     std::vector<std::pair<DAddr, u64>> uploaded_buffer_ranges;
 
