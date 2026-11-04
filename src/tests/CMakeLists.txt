@@ -141,6 +141,12 @@ endif()
 
 add_test(NAME tests COMMAND tests)
 
+add_executable(update_checker_tests
+    common/update_checker.cpp
+    ../frontend_common/update_checker.cpp)
+target_link_libraries(update_checker_tests PRIVATE common Catch2::Catch2WithMain)
+add_test(NAME update_checker_tests COMMAND update_checker_tests)
+
 # needed for vma
 if (NOT MSVC)
     target_compile_options(tests PRIVATE
