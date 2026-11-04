@@ -18,6 +18,7 @@
 #include "common/assert.h"
 #include "common/dkb_frame_trace.h"
 #include "common/logging.h"
+#include "common/settings.h"
 #include "shader_recompiler/exception.h"
 #include "core/core.h"
 #include "video_core/gpu_split.h"
@@ -27,6 +28,7 @@
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/game_dlss_status.h"
 #include "video_core/memory_manager.h"
 #include "video_core/native_query_trace.h"
 #ifdef ARCHITECTURE_x86_64
@@ -549,6 +551,18 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
     }
     if (!launch_description.block_dim_x || !launch_description.block_dim_y || !launch_description.block_dim_z)
         return false;
+    dlss_chain.output_pass = false;
+    // Fortune's Weave's evaluation is 13 dispatches. Bound incomplete evaluations, including
+    // skipped dispatches, so a missing output pass cannot keep the chain active indefinitely.
+    constexpr u32 max_dispatches = 64;
+    if (dlss_chain.active && ++dlss_chain.dispatches > max_dispatches) {
+        dlss_chain.active = false;
+        dlss_chain.pending.clear();
+        dlss_motion_vectors.reset();
+        dlss_depth.reset();
+        (void)fe_upscale_jitter.Take();
+    }
+    bool dispatched = true;
     try {
         rasterizer->DispatchCompute();
     } catch (const VideoCommon::FireEmblemUpscale::DispatchReplaced&) {
@@ -573,13 +587,252 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
         if (logged.insert(error.what()).second) {
             LOG_ERROR(HW_GPU, "Native compute shader rejected: {}", error.what());
         }
-        if (std::string_view{error.what()}.find("matrix multiply") != std::string_view::npos) {
+        dispatched = false;
+        if (dlss_chain.active) {
+            ++dlss_chain.rejected;
+        } else if (std::string_view{error.what()}.find("matrix multiply") !=
+                   std::string_view::npos) {
             DescribeNativeResources(qmd);
             LOG_ERROR(HW_GPU, "Native tensor dispatch is unsupported; no validated replacement was available");
         }
+    }
+    if (dlss_chain.output_pass) {
+        return FinishDlssEvaluation() || dispatched;
+    }
+    return dispatched;
+}
+
+namespace {
+constexpr u32 DLSS_NETWORK_CLEAN_EVALUATIONS = 8;
+/// Health checks in a row the network must pass before it is shown (about a second: a network that
+/// goes bad does so within its first few evaluations), and fail to be dropped.
+constexpr u32 DLSS_NETWORK_GOOD_CHECKS = 30;
+constexpr u32 DLSS_NETWORK_BAD_CHECKS = 10;
+/// A check fails when more than this percentage of its blocks is mismatched (working networks:
+/// at most 0.2% on Fortune's Weave's title and Kunlun Base; frozen ones: 6-10%), or when any output
+/// sample is NaN or infinite.
+constexpr u32 DLSS_CHECK_MISMATCH_PERCENT = 3;
+} // Anonymous namespace
+
+bool KeplerCompute::ProcessFireEmblemDlss(u64 native_key) {
+    using namespace VideoCommon::FireEmblemUpscale;
+    if (native_key == PrepassProgramKey) {
+        CaptureFireEmblemJitter();
+        dlss_chain.active = true;
+        dlss_chain.rejected = 0;
+        dlss_chain.dispatches = 0;
+        dlss_chain.pending.clear();
+    }
+    if (!dlss_chain.active) {
         return false;
     }
-    return true;
+    dlss_chain.pending.insert(native_key);
+    dlss_chain.output_pass = native_key == OutputProgramKey;
+    const bool replacement = dlss_chain.failure != VideoCore::GameDlssReason::None ||
+                             GameDlssBlocker() != VideoCore::GameDlssReason::None;
+    if (dlss_chain.output_pass) {
+        return replacement && FinishDlssEvaluation();
+    }
+    return dlss_chain.failure != VideoCore::GameDlssReason::None &&
+           native_key != PrepassProgramKey &&
+           dlss_chain.programs.contains(native_key);
+}
+
+// The game's own DLSS network (its translated programs) is shown once every pass of an
+// evaluation has run several times in a row and its output has passed several health checks in
+// a row. Until then, when any pass can't run, and for the rest of the session once the network
+// fails its checks, the replacement upscale draws over the output pass's result. The setting
+// "Use the game's own DLSS" defaults off; an explicit native override enables it, while fsr/dlss
+// overrides keep the replacement. The network's image sizes are fixed by the game, so it is used
+// only without resolution scaling; its matrix multiplies need shaders 32 threads wide.
+VideoCore::GameDlssReason KeplerCompute::GameDlssBlocker() const {
+    using VideoCore::GameDlssReason;
+    static const char* const option = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
+    const bool forced_replacement = option && VideoCommon::FireEmblemUpscale::UseReplacement(
+        VideoCommon::FireEmblemUpscale::ProgramId,
+        VideoCommon::FireEmblemUpscale::OutputProgramKey, option);
+    const bool forced_native = option && !forced_replacement;
+    if (forced_replacement ||
+        (!forced_native && !Settings::values.game_dlss_network.GetValue())) {
+        return GameDlssReason::TurnedOff;
+    }
+    // NVIDIA DLSS, when turned on and running, comes first.
+    if (rasterizer->UsesNvidiaDlss()) {
+        return GameDlssReason::NvidiaDlss;
+    }
+    const auto& scale = Settings::values.resolution_info;
+    if (scale.up_scale != 1 || scale.down_shift != 0) {
+        return GameDlssReason::ResolutionScaling;
+    }
+    if (!rasterizer->SupportsGameDlssNetwork()) {
+        return GameDlssReason::Unsupported;
+    }
+    return GameDlssReason::None;
+}
+
+// Checks the network's output against its input (on the GPU; the result arrives a few frames
+// later) and drops the network for the session after DLSS_NETWORK_BAD_CHECKS failed checks in a
+// row: a network that produces NaN, freezes on an old image or draws garbage would otherwise stay
+// on screen.
+void KeplerCompute::CheckDlssNetwork() {
+    dlss_chain.checked = rasterizer->CanProbeGameDlssOutput();
+    if (!dlss_chain.checked) {
+        return;
+    }
+    const auto& cbuf = launch_description.const_buffer_config[0];
+    const GPUVAddr cbuf_address = (GPUVAddr{cbuf.address_high} << 32) | cbuf.address_low;
+    if (!(launch_description.const_buffer_enable_mask & 1) || cbuf.size.Value() < 0x34c ||
+        !memory_manager.IsFullyMappedRange(cbuf_address, 0x34c)) {
+        return;
+    }
+    const auto surface = [&](u32 offset) -> std::optional<Fermi2D::Surface> {
+        const u32 tic_index = memory_manager.Read<u32>(cbuf_address + offset) & 0xfffff;
+        if (tic_index > regs.tic.limit || !memory_manager.IsFullyMappedRange(
+                regs.tic.Address() + u64{tic_index} * sizeof(Texture::TICEntry),
+                sizeof(Texture::TICEntry))) {
+            return std::nullopt;
+        }
+        const auto tic = GetTICEntry(tic_index);
+        using RTFormat = Tegra::RenderTargetFormat;
+        Fermi2D::Surface result{};
+        switch (tic.format) {
+        case Texture::TextureFormat::B10G11R11:
+            result.format = RTFormat::B10G11R11_FLOAT;
+            break;
+        case Texture::TextureFormat::R16G16B16A16:
+            result.format = RTFormat::R16G16B16A16_FLOAT;
+            break;
+        case Texture::TextureFormat::A8B8G8R8:
+            result.format = RTFormat::A8B8G8R8_UNORM;
+            break;
+        case Texture::TextureFormat::A2B10G10R10:
+            result.format = RTFormat::A2B10G10R10_UNORM;
+            break;
+        default:
+            return std::nullopt;
+        }
+        if (tic.Address() == 0 || !tic.IsBlockLinear()) {
+            return std::nullopt;
+        }
+        result.linear = Fermi2D::MemoryLayout::BlockLinear;
+        result.block_width.Assign(tic.block_width);
+        result.block_height.Assign(tic.block_height);
+        result.block_depth.Assign(tic.block_depth);
+        result.depth = 1;
+        result.width = tic.Width();
+        result.height = tic.Height();
+        result.addr_upper = static_cast<u32>(tic.Address() >> 32);
+        result.addr_lower = static_cast<u32>(tic.Address());
+        return result;
+    };
+    const auto input = surface(0x328);
+    const auto output = surface(0x348);
+    if (!input || !output) {
+        return;
+    }
+    const auto probe = rasterizer->ProbeGameDlssOutput(*input, *output);
+    if (!probe) {
+        return;
+    }
+    const bool invalid = probe->invalid_samples != 0;
+    const bool mismatched = probe->mismatched * 100 > probe->blocks * DLSS_CHECK_MISMATCH_PERCENT;
+    if (!invalid && !mismatched) {
+        ++dlss_chain.good_checks;
+        dlss_chain.bad_checks = 0;
+        return;
+    }
+    dlss_chain.good_checks = 0;
+    if (++dlss_chain.bad_checks < DLSS_NETWORK_BAD_CHECKS) {
+        return;
+    }
+    dlss_chain.failure = invalid ? VideoCore::GameDlssReason::InvalidOutput
+                                 : VideoCore::GameDlssReason::OutputMismatch;
+    LOG_WARNING(HW_GPU,
+                "Game DLSS network: {} in {} checks in a row (last: {}/{} blocks mismatched, worst "
+                "{:.3f}, {} invalid samples); the replacement upscale draws the output from now on",
+                VideoCore::GameDlssReasonText(dlss_chain.failure), dlss_chain.bad_checks,
+                probe->mismatched, probe->blocks, probe->worst, probe->invalid_samples);
+}
+
+// Tells the Graphics tab what draws the game's DLSS evaluation, when that changes.
+void KeplerCompute::UpdateGameDlssStatus(bool complete, VideoCore::GameDlssReason blocker) {
+    using VideoCore::GameDlssReason;
+    using VideoCore::GameDlssState;
+    VideoCore::GameDlssStatus shown{.state = GameDlssState::Checking};
+    if (dlss_chain.native) {
+        shown.state = GameDlssState::Network;
+    } else if (dlss_chain.failure != GameDlssReason::None) {
+        shown = {.state = GameDlssState::Replacement, .reason = dlss_chain.failure};
+    } else if (blocker != GameDlssReason::None) {
+        shown = {.state = GameDlssState::Replacement, .reason = blocker};
+    } else if (!complete) {
+        shown = {.state = GameDlssState::Replacement,
+                 .reason = GameDlssReason::PassesCannotRun,
+                 .rejected_passes = dlss_chain.rejected};
+    }
+    if (shown.state == dlss_chain.status.state && shown.reason == dlss_chain.status.reason &&
+        shown.rejected_passes == dlss_chain.status.rejected_passes) {
+        return;
+    }
+    // A failed check was logged as it happened; the network's start is logged above.
+    if (shown.state == GameDlssState::Checking) {
+        LOG_INFO(HW_GPU, "Game DLSS network: checking its output; the replacement upscale draws "
+                         "meanwhile");
+    } else if (shown.reason == GameDlssReason::PassesCannotRun) {
+        LOG_INFO(HW_GPU,
+                 "Game DLSS network: {} pass(es) can't run, the replacement upscale "
+                 "draws the output",
+                 shown.rejected_passes);
+    } else if (shown.state == GameDlssState::Replacement && shown.reason != dlss_chain.failure) {
+        LOG_INFO(HW_GPU, "Game DLSS network: {}, the replacement upscale draws the output",
+                 VideoCore::GameDlssReasonText(shown.reason));
+    }
+    dlss_chain.status = shown;
+    VideoCore::SetGameDlssStatus(shown);
+}
+
+// Ends this frame's DLSS evaluation at its output pass: either the network's own result stays,
+// or the replacement upscale draws over it. Returns whether the replacement ran.
+bool KeplerCompute::FinishDlssEvaluation() {
+    dlss_chain.active = false;
+    dlss_chain.output_pass = false;
+    dlss_chain.programs.insert(dlss_chain.pending.begin(), dlss_chain.pending.end());
+    dlss_chain.pending.clear();
+    const bool complete = dlss_chain.rejected == 0;
+    dlss_chain.clean_evaluations = complete ? dlss_chain.clean_evaluations + 1 : 0;
+    ++dlss_chain.evaluations;
+    using VideoCore::GameDlssReason;
+    const GameDlssReason blocker = GameDlssBlocker();
+    const bool can_show =
+        blocker == GameDlssReason::None && dlss_chain.failure == GameDlssReason::None;
+    // Checked before the replacement upscale draws over the output. Checks start over whenever
+    // the network can't run.
+    if (complete && can_show) {
+        CheckDlssNetwork();
+    } else {
+        dlss_chain.good_checks = 0;
+        dlss_chain.bad_checks = 0;
+    }
+    bool native = complete && can_show && dlss_chain.failure == GameDlssReason::None;
+    if (!dlss_chain.native) {
+        native = native && dlss_chain.clean_evaluations >= DLSS_NETWORK_CLEAN_EVALUATIONS &&
+                 (!dlss_chain.checked || dlss_chain.good_checks >= DLSS_NETWORK_GOOD_CHECKS);
+    }
+    if (native != dlss_chain.native) {
+        dlss_chain.native = native;
+        if (native) {
+            LOG_INFO(HW_GPU, "Game DLSS network: every pass runs{}, its own output is shown",
+                     dlss_chain.checked ? " and its output checks out" : "");
+        }
+    }
+    UpdateGameDlssStatus(complete, blocker);
+    if (native) {
+        dlss_motion_vectors.reset();
+        dlss_depth.reset();
+        (void)fe_upscale_jitter.Take();
+        return false;
+    }
+    return TryFireEmblemUpscale();
 }
 
 // Logs the images a rejected program's handles (constant bank 0, bytes 0x80-0x11c) point to, so a
