@@ -240,17 +240,30 @@ TEST_CASE("Logged Pokopia SHF register pressure identifies the register shift op
     CHECK_FALSE(LowerToMaxwell(std::array{invalid, Exit}));
 }
 
-TEST_CASE("Logged Pokopia masked dependency barrier stays rejected without a safety proof",
+TEST_CASE("Logged Pokopia masked dependency barrier fences shared memory and rejects unknown modes",
           "[video_core][ampere][logged_numeric]") {
     constexpr Instruction wait{{0x0000791a, 0x0000800e, 0, 0x000fce00}};
-    const auto rejected = LowerToMaxwell(std::array{wait, Exit});
+    for (const u32 mask : {0x800eU, 0x8000U}) {
+        auto supported = wait;
+        supported.words[1] = mask;
+        const auto ordered = LowerToMaxwell(std::array{supported, Exit});
+        REQUIRE(ordered);
+        REQUIRE(ordered.instructions.size() == 2);
+        CHECK(ordered.instructions.front() == 0xef98000000070000ULL);
+        CHECK(ordered.instructions.back() == 0xe30000000007000fULL);
+    }
+    for (u32 bit = 15; bit < 32; ++bit) {
+        auto invalid = wait;
+        invalid.words[1] ^= 1U << bit;
+        const auto rejected = LowerToMaxwell(std::array{invalid, Exit});
+        REQUIRE_FALSE(rejected);
+        CHECK(rejected.error == "native dependency barrier mode");
+        CHECK(rejected.instructions.empty());
+        CHECK(rejected.error_offset == 0);
+    }
+    auto invalid = wait;
+    invalid.words[2] = 1;
+    const auto rejected = LowerToMaxwell(std::array{invalid, Exit});
     REQUIRE_FALSE(rejected);
     CHECK(rejected.error == "native dependency barrier mode");
-    CHECK(rejected.instructions.empty());
-    CHECK(rejected.error_offset == 0);
-    auto supported = wait;
-    supported.words[1] = 0x8000;
-    const auto ordered = LowerToMaxwell(std::array{supported, Exit});
-    REQUIRE(ordered);
-    CHECK(ordered.instructions.front() == 0xef98000000070000ULL);
 }

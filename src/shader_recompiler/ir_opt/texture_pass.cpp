@@ -1094,6 +1094,8 @@ private:
     ImageDescriptors& image_descriptors;
 };
 
+// Expects the sample's descriptor to be assigned: the size query reads the same texture (and
+// the same element of a descriptor array).
 void PatchImageSampleImplicitLod(IR::Block& block, IR::Inst& inst) {
     IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
     const auto info{inst.Flags<IR::TextureInstInfo>()};
@@ -1239,6 +1241,7 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
             if (flags.type != TextureType::Color2D) {
                 break;
             }
+            // Normalized once the descriptor is known (below).
             is_rect_sample = ReadTextureTypeCached(env, cbuf) == TextureType::Color2DRect;
             break;
         case IR::Opcode::ImageFetch:
