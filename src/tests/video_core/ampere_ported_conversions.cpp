@@ -80,7 +80,16 @@ TEST_CASE("Ampere byte F2I rejects other widths, rounding, modifiers and registe
                            0x0021e900U, 0x0061e100U, 0x0821e100U}) {
         auto invalid = code;
         invalid[0].words[2] = mode;
-        REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(invalid)));
+        const auto lowered = LowerToMaxwell(invalid);
+        if (mode == 0x0021e900U) {
+            REQUIRE(lowered);
+            REQUIRE(lowered.instructions.size() == 2);
+            CHECK(lowered.instructions.front() == 0x5cb0118000371915ULL);
+            invalid[0].words[2] |= 1;
+            REQUIRE_FALSE(LowerToMaxwell(invalid));
+        } else {
+            REQUIRE_FALSE(lowered);
+        }
     }
     for (const u32 source : {0x10003U}) {
         auto invalid = code;
@@ -161,7 +170,13 @@ TEST_CASE("Ampere ceiling F2I rejects non-NTZ, other widths and unknown modifier
     }
     auto invalid = code;
     invalid[0].words[1] = 0x40000002;
-    REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(invalid)));
+    const auto absolute = LowerToMaxwell(invalid);
+    REQUIRE(absolute);
+    REQUIRE(absolute.instructions.size() == LowerToMaxwell(code).instructions.size() + 2);
+    CHECK(absolute.instructions[0] == 0x5c980780002700f9ULL);
+    CHECK(absolute.instructions[1] == 0x0407fffffff7f9f9ULL);
+    invalid[0].words[1] |= 1U << 31;
+    REQUIRE_FALSE(LowerToMaxwell(invalid));
     invalid = code;
     invalid[0].words[3] |= 1;
     REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(invalid)));

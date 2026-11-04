@@ -387,6 +387,8 @@ std::optional<StorageBufferAddr> Track(const IR::Value& value, const Bias* bias)
         }
         return storage_buffer;
     }};
+    // A pointer loaded from memory is a new address, not an offset into the buffer that supplied
+    // it. Do not follow that load back to its own constant-buffer descriptor.
     const auto stop_at_memory = [](IR::Value operand) {
         if (!operand.IsImmediate() && IsGlobalMemory(*operand.InstRecursive())) {
             return IR::Value{u32{0}};

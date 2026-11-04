@@ -169,9 +169,10 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
         operand(64, 2);
         break;
     case 0x388:
-    case 0x984: {
+    case 0x984:
+    case 0x988: {
         const u32 width = input.Bits(73, 3), count = width == 6 ? 4 : width == 5 ? 2 : 1;
-        operand(opcode == 0x388 ? 32 : 16, count);
+        operand(opcode == 0x984 ? 16 : 32, count);
         operand(24);
         break;
     }

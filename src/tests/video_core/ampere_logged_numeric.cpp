@@ -248,9 +248,14 @@ TEST_CASE("Logged Pokopia masked dependency barrier fences shared memory and rej
         supported.words[1] = mask;
         const auto ordered = LowerToMaxwell(std::array{supported, Exit});
         REQUIRE(ordered);
-        REQUIRE(ordered.instructions.size() == 2);
-        CHECK(ordered.instructions.front() == 0xef98000000070000ULL);
+        REQUIRE(ordered.instructions.size() == 1);
         CHECK(ordered.instructions.back() == 0xe30000000007000fULL);
+        const Instruction copy{{0x02067fae, 0, 0x0f901c08, 0}};
+        const auto copying = LowerToMaxwell(std::array{copy, supported, Exit});
+        REQUIRE(copying);
+        CHECK(copying.instructions[copying.source_instruction_offsets[1]] ==
+              0xef98000000070000ULL);
+        CHECK(copying.source_instruction_offsets[2] == copying.source_instruction_offsets[1] + 1);
     }
     for (u32 bit = 15; bit < 32; ++bit) {
         auto invalid = wait;

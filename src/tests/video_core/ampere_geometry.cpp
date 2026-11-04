@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -13,7 +14,6 @@
 namespace {
 using Shader::Ampere::Instruction;
 using Shader::Ampere::LowerToMaxwell;
-
 constexpr Instruction EXIT{{0x0000794d, 0, 0x03800000, 0}};
 
 bool Contains(const Shader::Ampere::LoweredProgram& lowered, u64 instruction) {
@@ -39,6 +39,68 @@ constexpr std::array<Instruction, 16> GEOMETRY_PROGRAM{{
     {{0x00007957, 0, 0, 0}},
     EXIT,
 }};
+} // namespace
+
+TEST_CASE("Ampere geometry program counter uses the native address", "[video_core][ampere]") {
+    const Instruction nop{{0x00007918, 0, 0, 0}};
+    const Instruction lepc{{0x0014734e, 0, 0, 0}};
+    const std::array code{nop, lepc, EXIT};
+    REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(code)));
+    REQUIRE_FALSE(LowerToMaxwell(code, true));
+    const auto result = LowerToMaxwell(code, {.geometry = true,
+                                            .native_code_address = 0x00000012fffffff0ULL});
+    REQUIRE(static_cast<bool>(result));
+    REQUIRE(result.instructions.size() == 4);
+    REQUIRE((result.instructions[1] & 0xff) == 20);
+    REQUIRE(((result.instructions[1] >> 20) & 0xffffffffULL) == 0);
+    REQUIRE((result.instructions[2] & 0xff) == 21);
+    REQUIRE(((result.instructions[2] >> 20) & 0xffffffffULL) == 0x13);
+
+    Instruction unsupported = lepc;
+    unsupported.words[1] = 1;
+    REQUIRE_FALSE(LowerToMaxwell(std::array{nop, unsupported, EXIT},
+                                 {.geometry = true, .native_code_address = 0x00000012fffffff0ULL}));
+    unsupported = lepc;
+    unsupported.words[0] = (unsupported.words[0] & ~0xff0000U) | (245U << 16);
+    REQUIRE_FALSE(LowerToMaxwell(std::array{nop, unsupported, EXIT},
+                                 {.geometry = true, .native_code_address = 0x00000012fffffff0ULL}));
+}
+
+TEST_CASE("Ampere geometry stage map and exit setup are stage specific", "[video_core][ampere]") {
+    const Instruction map_read{{0x05127923, 0, 0, 0}};
+    const Instruction exit_setup{{0x03007357, 0, 0, 0}};
+    auto code = GEOMETRY_PROGRAM;
+    code[9] = map_read;
+    REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(code)));
+    const auto result = LowerToMaxwell(code, true);
+    REQUIRE(static_cast<bool>(result));
+    const u64 map = result.instructions[result.source_instruction_offsets[9]];
+    REQUIRE((map & 0xff) == 18);
+    REQUIRE(((map >> 20) & 0xff) == 5);
+    REQUIRE_FALSE(LowerToMaxwell(std::array{map_read, exit_setup, EXIT}, true));
+
+    Instruction unsupported = exit_setup;
+    unsupported.words[1] = 1;
+    REQUIRE_FALSE(LowerToMaxwell(std::array{unsupported, EXIT}, true));
+}
+
+TEST_CASE("Ampere F2I supports 16-bit truncation", "[video_core][ampere]") {
+    for (const bool is_signed : {false, true}) {
+        const Instruction convert{{0x00067305, 9, 0x0021e800U | (is_signed ? 0x100U : 0), 0}};
+        const auto result = LowerToMaxwell(std::array{convert, EXIT});
+        REQUIRE(static_cast<bool>(result));
+        const auto word = std::ranges::find_if(result.instructions, [](u64 value) {
+            return (value & 0xfff0000000000000ULL) == 0x5cb0000000000000ULL;
+        });
+        REQUIRE(word != result.instructions.end());
+        REQUIRE(((*word >> 8) & 3) == 1);
+        REQUIRE(((*word >> 12) & 1) == static_cast<u64>(is_signed));
+        REQUIRE(((*word >> 39) & 3) == 3);
+        REQUIRE(((*word >> 44) & 1) == 1);
+    }
+    const Instruction unsupported{{0x00067305, 9, 0x0021e801, 0}};
+    REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(std::array{unsupported, EXIT})));
+}
 
 TEST_CASE("Ampere geometry programs lower their output instructions", "[video_core][ampere]") {
     const auto lowered = LowerToMaxwell(GEOMETRY_PROGRAM, true);
@@ -133,5 +195,3 @@ TEST_CASE("SPIR-V geometry stream zero needs no geometry streams capability",
     REQUIRE(ends == 1);
     REQUIRE(geometry == 1);
 }
-
-} // namespace

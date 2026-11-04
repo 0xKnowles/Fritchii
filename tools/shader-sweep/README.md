@@ -24,7 +24,7 @@ regression programs. `spirv-val` is required when `BUILD_TESTING` is enabled.
 
 ## Inputs
 
-Compile one extracted v46, v47 or v48 serialized environment record:
+Compile one extracted v46, v47, v48 or v49 serialized environment record:
 
 ```sh
 shader-sweep --environment shader.env --cache-version 47 --output shader.spv

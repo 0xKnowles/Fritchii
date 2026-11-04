@@ -5,8 +5,9 @@
 
 namespace Shader::Backend {
 
+// nvn_buffer_used is indexed by the guest slot, not the position in the compact descriptor list.
 [[nodiscard]] inline bool UsesNvnStorageDescriptor(const Info& info,
-                                                   const StorageBufferDescriptor& descriptor) {
+                                                    const StorageBufferDescriptor& descriptor) {
     constexpr u32 descriptor_size = 0x10;
     if (descriptor.cbuf_index != 0 || descriptor.cbuf_offset < info.nvn_buffer_base) {
         return false;

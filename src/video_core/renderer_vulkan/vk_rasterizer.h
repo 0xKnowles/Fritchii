@@ -181,12 +181,12 @@ private:
     void CaptureIndirectTrace();
     void CollectIndirectTrace();
     void TraceDrawFailure(std::string_view reason);
+    bool TryNx2IndirectReset(bool is_indexed, u32 instance_count);
 
     void FlushWork();
 
     void TraceRenderState(bool is_indexed, const char* outcome, const Framebuffer* framebuffer);
 
-    bool TryNativeIndirectReset(bool is_indexed, u32 instance_count);
     /// Records the copies of the command list pages the work just recorded wrote and submits, so
     /// the GPU makes them now (BufferCache::Nx2CopyListPages).
     void SubmitNx2ListCopies();

@@ -94,12 +94,22 @@ TEST_CASE("Ampere DEPBAR.LE preserves shared visibility for SB0 wait lists", "[v
         const auto lowered = LowerToMaxwell(code);
         INFO(lowered.error);
         REQUIRE(static_cast<bool>(lowered));
-        const bool shared_wait = (word & 0x7000U) == 0;
-        REQUIRE(lowered.instructions.size() == (shared_wait ? 2 : 1));
-        if (shared_wait) {
-            REQUIRE(lowered.instructions.front() == 0xef98000000070000ULL);
-        }
+        REQUIRE(lowered.instructions.size() == 1);
         REQUIRE(lowered.instructions.back() == 0xe30000000007000fULL);
+        const Instruction copy{{0x02067fae, 0, 0x0f901c08, 0}};
+        const auto copying = LowerToMaxwell(std::array{copy, code[0], Exit});
+        INFO(copying.error);
+        REQUIRE(copying);
+        const bool shared_wait = (word & 0x7000U) == 0;
+        REQUIRE(std::count(copying.instructions.begin(), copying.instructions.end(),
+                           0xef98000000070000ULL) == (shared_wait ? 1 : 0));
+        REQUIRE(copying.source_instruction_offsets[2] - copying.source_instruction_offsets[1] ==
+                (shared_wait ? 1 : 0));
+        if (shared_wait) {
+            REQUIRE(copying.instructions[copying.source_instruction_offsets[1]] ==
+                    0xef98000000070000ULL);
+        }
+        REQUIRE(copying.instructions.back() == 0xe30000000007000fULL);
     }
 }
 

@@ -111,8 +111,21 @@ TEST_CASE("Ampere geometry index conversion retains U16 truncation and FTZ",
     REQUIRE(((word >> 39) & 3) == 3);
     REQUIRE(((word >> 44) & 1) == 1);
     for (const u32 bit : {0U, 8U, 13U, 18U, 22U, 27U}) {
+        CAPTURE(bit);
         auto invalid = convert;
         invalid.words[2] ^= 1U << bit;
-        REQUIRE_FALSE(LowerToMaxwell(std::array{invalid, Exit}, true));
+        const auto modified = LowerToMaxwell(std::array{invalid, Exit}, true);
+        if (bit == 8) {
+            REQUIRE(modified);
+            REQUIRE(modified.instructions.size() == 2);
+            CHECK(modified.instructions.front() ==
+                  (0x5cb0000000070002ULL | (1ULL << 8) | (2ULL << 10) |
+                   (1ULL << 12) | (2ULL << 20) | (3ULL << 39) | (1ULL << 44)));
+            CHECK(modified.instructions.back() == 0xe30000000007000fULL);
+            invalid.words[2] |= 1;
+            REQUIRE_FALSE(LowerToMaxwell(std::array{invalid, Exit}, true));
+        } else {
+            REQUIRE_FALSE(modified);
+        }
     }
 }

@@ -488,8 +488,12 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
                                    : stage == Shader::Stage::TessellationEval
                                        ? Shader::Ampere::TessellationStage::Evaluation
                                        : Shader::Ampere::TessellationStage::None;
-    auto lowered = Shader::Ampere::LowerToMaxwell(native, geometry_stage, true, verified_traps,
-                                                 tessellation_stage);
+    auto lowered = Shader::Ampere::LowerToMaxwell(
+        native, {.geometry = geometry_stage,
+                 .tensor = true,
+                 .native_code_address = program_base + native_header_size,
+                 .verified_traps = verified_traps,
+                 .tessellation_stage = tessellation_stage});
     // EDEN_NX2_REJECT=<hex address>,...: treat these programs as rejected (to find which newly
     // lowered program changes a game's behaviour without rebuilding).
     if (static const std::string reject_list = [] {
@@ -626,6 +630,11 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
     texture_bound = maxwell3d->regs.bindless_texture_const_buffer_slot;
     const auto& regs{maxwell3d->regs};
     const bool native{maxwell3d->GetNativeMacroEngine().native_turing};
+    static const bool geometry_enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_EXPERIMENTAL_GEOMETRY");
+        return !value || std::string_view{value} != "0";
+    }();
+    const bool geometry{native && program == Maxwell::ShaderType::Geometry && geometry_enabled};
     // Task and mesh programs: the task in the vertex slot, its mesh program in the tessellation
     // slot (without a task, the mesh program is in the vertex slot).
     const bool mesh_slot{native && regs.IsMeshEnabled() &&
@@ -637,7 +646,7 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
              program == Maxwell::ShaderType::Tessellation) &&
             sph.common0.shader_type == static_cast<u32>(program);
         if (program != Maxwell::ShaderType::VertexB && program != Maxwell::ShaderType::Pixel &&
-            program != Maxwell::ShaderType::Geometry && !mesh_slot && !tessellation) {
+            !geometry && !mesh_slot && !tessellation) {
             if (const char* directory = std::getenv("EDEN_NX2_SHADER_DUMP"); directory &&
                 gpu_memory->IsFullyMappedRange(program_base, 128)) {
                 constexpr u32 MaxCaptureInstructions = 4096;
@@ -743,9 +752,10 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
         mesh_registers = {regs.reg_array[Maxwell::MeshShaderA], regs.reg_array[Maxwell::MeshShaderB],
                           regs.reg_array[Maxwell::MeshInitShader]};
         if (stage == Shader::Stage::Mesh && regs.IsShaderConfigEnabled(Maxwell::ShaderType::Geometry)) {
-            const auto& geometry{regs.pipelines[static_cast<size_t>(Maxwell::ShaderType::Geometry)]};
-            const GPUVAddr address{(static_cast<u64>(geometry.reserved[0] & 0xff) << 32) |
-                                   geometry.reserved[1]};
+            const auto& geometry_pipeline{
+                regs.pipelines[static_cast<size_t>(Maxwell::ShaderType::Geometry)]};
+            const GPUVAddr address{(static_cast<u64>(geometry_pipeline.reserved[0] & 0xff) << 32) |
+                                   geometry_pipeline.reserved[1]};
             gpu_memory->ReadBlock(address, &mesh_primitive_header, sizeof(mesh_primitive_header));
         }
     }
@@ -760,8 +770,7 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
                      static_cast<u32>(regs.tessellation.params.output_primitives.Value()),
                      regs.patch_vertices);
         }
-        InitializeNativeCode(std::move(lowered_native_), 128,
-                             program == Maxwell::ShaderType::Geometry);
+        InitializeNativeCode(std::move(lowered_native_), 128, geometry);
     }
     const u64 local_size{sph.LocalMemorySize()};
     ASSERT(local_size <= (std::numeric_limits<u32>::max)());

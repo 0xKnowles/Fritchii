@@ -354,6 +354,12 @@ struct HalfIR {
                 visitor.F2I_reg(word);
             else if ((word >> 48) == 0x5cb8)
                 visitor.I2F_reg(word);
+            else if ((word >> 48) == 0x5c60)
+                visitor.FMNMX_reg(word);
+            else if ((word >> 48) == 0x5c98)
+                visitor.MOV_reg(word);
+            else if ((word >> 58) == 1)
+                visitor.LOP32I(word);
             else if ((word >> 56) == 1)
                 visitor.MOV32I(word);
             else if ((word & 0xff80000000000000ULL) == 0x5800000000000000ULL)
@@ -434,12 +440,22 @@ struct HalfIR {
             return f(0) > f(1);
         case IR::Opcode::FPOrdLessThan32:
             return f(0) < f(1);
+        case IR::Opcode::FPOrdGreaterThanEqual32:
+            return f(0) >= f(1);
+        case IR::Opcode::FPMin32:
+            return fp(std::fmin(f(0), f(1)));
+        case IR::Opcode::FPMax32:
+            return fp(std::fmax(f(0), f(1)));
         case IR::Opcode::FPAbs32:
             return fp(std::abs(f(0)));
         case IR::Opcode::FPNeg32:
             return fp(-f(0));
         case IR::Opcode::FPFloor32:
             return fp(std::floor(f(0)));
+        case IR::Opcode::FPCeil32:
+            return fp(std::ceil(f(0)));
+        case IR::Opcode::FPTrunc32:
+            return fp(std::trunc(f(0)));
         case IR::Opcode::FPTrunc16:
             return half_fp(std::trunc(f(0)));
         case IR::Opcode::FPRoundEven16: {
@@ -514,6 +530,66 @@ struct HalfIR {
     }
 };
 } // namespace
+
+TEST_CASE("Ampere F2I signed byte clamps to the byte range", "[video_core][ampere]") {
+    const Instruction convert{{0x00097305, 5, 0x0021e100, 0}};
+    const auto lowered = LowerToMaxwell(std::array{convert, Exit});
+    REQUIRE(lowered);
+    HalfIR translation{lowered.instructions};
+    for (const auto& [input, expected] : {
+             std::pair{0.0f, 0U}, std::pair{-0.0f, 0U}, std::pair{1.9f, 1U},
+             std::pair{-1.9f, 0xffffffffU}, std::pair{127.9f, 127U},
+             std::pair{-127.9f, 0xffffff81U}, std::pair{128.0f, 127U},
+             std::pair{-128.9f, 0xffffff80U}, std::pair{65536.0f, 127U},
+             std::pair{-65536.0f, 0xffffff80U},
+             std::pair{std::numeric_limits<f32>::infinity(), 127U},
+             std::pair{-std::numeric_limits<f32>::infinity(), 0xffffff80U},
+             std::pair{std::numeric_limits<f32>::quiet_NaN(), 0U}}) {
+        CAPTURE(input);
+        CHECK(translation.Run(std::bit_cast<u32>(input), 5, 9) == expected);
+    }
+}
+
+TEST_CASE("Ampere signed sixteen-bit F2I truncates and saturates numerically",
+          "[video_core][ampere]") {
+    const Instruction convert{{0x00157305, 3, 0x0021e900, 0}};
+    const auto lowered = LowerToMaxwell(std::array{convert, Exit});
+    REQUIRE(lowered);
+    HalfIR translation{lowered.instructions};
+    for (const auto& [input, expected] : {
+             std::pair{0.0f, 0U}, std::pair{1.9f, 1U}, std::pair{-1.9f, 0xffffffffU},
+             std::pair{32766.9f, 32766U}, std::pair{32767.9f, 32767U},
+             std::pair{32768.0f, 32767U}, std::pair{-32767.9f, 0xffff8001U},
+             std::pair{-32768.9f, 0xffff8000U},
+             std::pair{std::numeric_limits<f32>::infinity(), 32767U},
+             std::pair{-std::numeric_limits<f32>::infinity(), 0xffff8000U}}) {
+        CAPTURE(input);
+        CHECK(translation.Run(std::bit_cast<u32>(input), 3, 21) == expected);
+    }
+}
+
+TEST_CASE("Ampere register-absolute F2I applies absolute before rounding and saturation",
+          "[video_core][ampere]") {
+    const Instruction ceiling{{0x00097305, 0x40000005, 0x0020b000, 0}};
+    const Instruction nearest_short{{0x00097305, 0x40000005, 0x00212800, 0}};
+    const auto ceil_code = LowerToMaxwell(std::array{ceiling, Exit});
+    const auto short_code = LowerToMaxwell(std::array{nearest_short, Exit});
+    REQUIRE(ceil_code);
+    REQUIRE(short_code);
+    HalfIR ceil_translation{ceil_code.instructions};
+    HalfIR short_translation{short_code.instructions};
+    for (const auto& values : {
+             std::array{0.0f, 0.0f, 0.0f}, std::array{-0.0f, 0.0f, 0.0f},
+             std::array{-1.25f, 2.0f, 1.0f}, std::array{-1.5f, 2.0f, 2.0f},
+             std::array{-2.5f, 3.0f, 2.0f}, std::array{2.5f, 3.0f, 2.0f},
+             std::array{-65535.25f, 65536.0f, 65535.0f},
+             std::array{-65536.0f, 65536.0f, 65535.0f}}) {
+        CAPTURE(values[0]);
+        const u32 input = std::bit_cast<u32>(values[0]);
+        CHECK(ceil_translation.Run(input, 5, 9) == static_cast<u32>(values[1]));
+        CHECK(short_translation.Run(input, 5, 9) == static_cast<u32>(values[2]));
+    }
+}
 
 TEST_CASE("Fast Fusion logged high registers preserve uniform mirrors and borrowed quartets",
           "[video_core][ampere][fast_fusion_logged]") {
@@ -1565,8 +1641,12 @@ TEST_CASE("Fast Fusion logged opcode support keeps nearby unsupported modes reje
     const Instruction masked_wait{{0x0000791a, 0x00008001, 0, 0}};
     const auto ordered = LowerToMaxwell(std::array{masked_wait, Exit});
     REQUIRE(ordered);
-    REQUIRE(ordered.instructions.size() == 2);
-    CHECK(ordered.instructions.front() == 0xef98000000070000ULL);
+    REQUIRE(ordered.instructions.size() == 1);
+    CHECK(ordered.instructions.front() == 0xe30000000007000fULL);
+    const auto copying = LowerToMaxwell(std::array{LoggedCopy, masked_wait, Exit});
+    REQUIRE(copying);
+    CHECK(copying.instructions[copying.source_instruction_offsets[1]] == 0xef98000000070000ULL);
+    CHECK(copying.source_instruction_offsets[2] == copying.source_instruction_offsets[1] + 1);
     auto invalid_wait = masked_wait;
     invalid_wait.words[1] |= 1U << 16;
     CHECK_FALSE(LowerToMaxwell(std::array{invalid_wait, Exit}));

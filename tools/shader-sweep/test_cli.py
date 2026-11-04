@@ -150,7 +150,7 @@ class CliTests(unittest.TestCase):
         self.run_cli(source, "--format", "native-header", "--stage", "fragment", "--output", self.output, code=2)
 
     def test_both_cache_versions_all_stages(self):
-        for version in (46, 47, 48):
+        for version in (46, 47, 48, 49):
             for stage, name in enumerate(STAGES):
                 with self.subTest(version=version, stage=name):
                     capture = self.write("shader.env", environment(version, stage))
@@ -192,7 +192,7 @@ class CliTests(unittest.TestCase):
             source = self.write("native.bin", data)
             self.run_cli(source, "--lower-only", self.output, code=2)
         capture = self.write("shader.env", environment(46, 5))
-        self.run_cli("--environment", capture, "--cache-version", 49, "--output", self.output, code=2)
+        self.run_cli("--environment", capture, "--cache-version", 50, "--output", self.output, code=2)
         source = self.write("native.bin", bytes(16))
         result = self.run_cli(source, "--lower-only", self.output, code=1)
         self.assertEqual(result["phase"], "lower")
