@@ -71,6 +71,7 @@
 #include "core/hle/service/nvdrv/nvdrv_interface.h"
 #include "core/hle/service/nx2_stub_interface.h"
 #include "core/hle/service/nx2_image_layout.h"
+#include "core/hle/service/nx2_present_pacer.h"
 #include "core/hle/service/sm/sm.h"
 #include "core/hle/service/server_manager.h"
 #include "core/hle/service/service.h"
@@ -1700,6 +1701,9 @@ private:
     void PresentClientBuffer(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
         ++m_presents;
+        if (Common::DkbFrameTrace::Enabled()) {
+            m_vsync->trace_present.store(m_presents, std::memory_order_relaxed);
+        }
         Core::g_nx2_present_count.fetch_add(1, std::memory_order_relaxed);
         if (m_presents <= 4 || (m_presents % 600) == 0) {
             LOG_INFO(Service, "nx2:vi2 229 present #{} token={:#x} slot={} image={}", m_presents,
@@ -1825,7 +1829,7 @@ private:
     // The console flips one frame per 60 Hz vblank and keeps the rest queued, so a game can't
     // present faster than that. Every slot is reported free here: hold each present until the
     // next vblank instead (title 4 ran at up to 160 fps, its timing and audio with it).
-    std::chrono::steady_clock::time_point m_next_vblank{};
+    Nx2PresentPacer m_present_pacer;
     u32 m_swap_word{};
 
     struct FrameTrace {
@@ -1880,17 +1884,16 @@ private:
             m_frame_trace.target_ms = std::chrono::duration<double, std::milli>(interval).count();
         }
         const auto now = std::chrono::steady_clock::now();
-        if (now > m_next_vblank + interval) {
-            // Running slower than the swap interval: show at once and don't bank the lost time.
-            m_next_vblank = now;
-            if (trace) {
-                m_frame_trace.deadline_reset = true;
-            }
-        } else if (now < m_next_vblank) {
+        const auto pacing = m_present_pacer.Advance(now, interval);
+        if (trace) {
+            m_frame_trace.deadline_reset = pacing.reset;
+        }
+        if (now < pacing.deadline) {
             // Sleep this service thread in the guest kernel. It runs on guest core 3, and a host
             // sleep held that core for the whole wait: game threads scheduled there ran only
             // between presents (Fortune's Weave's loader read one RomFS block per frame).
-            const auto wait = std::chrono::duration_cast<std::chrono::nanoseconds>(m_next_vblank - now);
+            const auto wait =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(pacing.deadline - now);
             const auto sleep_start = trace ? std::chrono::steady_clock::now()
                                            : std::chrono::steady_clock::time_point{};
             static_cast<void>(Kernel::GetCurrentThread(kernel).Sleep(
@@ -1902,7 +1905,6 @@ private:
                     std::chrono::steady_clock::now() - sleep_start).count();
             }
         }
-        m_next_vblank += interval;
     }
 
     /// Waits until the fence is reached. With `unless_gpu_waits`, gives up after a few ms once a
@@ -2331,16 +2333,6 @@ private:
 
     void StartVsyncTimer() {
         if (!m_vsync_timer) {
-            m_vsync_timer = Core::Timing::CreateEvent(
-                "nx2:vi2 vsync",
-                [vsync_state = m_vsync, &kernel = system.Kernel()](
-                    s64, std::chrono::nanoseconds) -> std::optional<std::chrono::nanoseconds> {
-                    std::scoped_lock lk{vsync_state->mutex};
-                    for (auto* vsync : vsync_state->events) {
-                        vsync->Signal(kernel);
-                    }
-                    return std::nullopt;
-                });
             // EDEN_NX2_VSYNC_HZ=<rate> (experiment): the game starts frames on this event, so a
             // frame that misses a 60 Hz tick idles until the next one.
             static const std::chrono::nanoseconds VblankInterval{[] {
@@ -2348,6 +2340,47 @@ private:
                 const long long hz = text ? (std::max)(std::strtoll(text, nullptr, 10), 1LL) : 60LL;
                 return 1'000'000'000LL / hz;
             }()};
+            m_vsync_timer = Core::Timing::CreateEvent(
+                "nx2:vi2 vsync",
+                [vsync_state = m_vsync, &kernel = system.Kernel()](
+                    s64 scheduled,
+                    std::chrono::nanoseconds late) -> std::optional<std::chrono::nanoseconds> {
+                    std::scoped_lock lk{vsync_state->mutex};
+                    for (auto* vsync : vsync_state->events) {
+                        vsync->Signal(kernel);
+                    }
+                    if (Common::DkbFrameTrace::Enabled()) {
+                        const s64 observed = scheduled + late.count();
+                        ++vsync_state->trace_callbacks;
+                        vsync_state->trace_late_callbacks +=
+                            VblankInterval.count() > 0 && late >= VblankInterval;
+                        vsync_state->trace_max_late =
+                            (std::max)(vsync_state->trace_max_late, late.count());
+                        if (vsync_state->trace_last_callback) {
+                            const s64 gap = observed - *vsync_state->trace_last_callback;
+                            vsync_state->trace_min_gap = vsync_state->trace_min_gap
+                                ? (std::min)(*vsync_state->trace_min_gap, gap) : gap;
+                        }
+                        vsync_state->trace_last_callback = observed;
+                        if (vsync_state->trace_rate.Ready(std::chrono::steady_clock::now())) {
+                            LOG_INFO(Service,
+                                     "DKB vsync present={} callbacks={} bound_events={} interval_ns={} "
+                                     "late_callbacks={} max_late_ns={} min_gap_ns={} "
+                                     "observed_global_ns={} guest_ticks={}",
+                                     vsync_state->trace_present.load(std::memory_order_relaxed),
+                                     vsync_state->trace_callbacks, vsync_state->events.size(),
+                                     VblankInterval.count(), vsync_state->trace_late_callbacks,
+                                     vsync_state->trace_max_late,
+                                     vsync_state->trace_min_gap.value_or(-1), observed,
+                                     kernel.System().CoreTiming().GetClockTicks());
+                            vsync_state->trace_callbacks = 0;
+                            vsync_state->trace_late_callbacks = 0;
+                            vsync_state->trace_max_late = 0;
+                            vsync_state->trace_min_gap.reset();
+                        }
+                    }
+                    return std::nullopt;
+                });
             system.CoreTiming().ScheduleLoopingEvent(VblankInterval, VblankInterval, m_vsync_timer);
         }
     }
@@ -2360,6 +2393,11 @@ private:
     struct VsyncState {
         std::mutex mutex;
         std::vector<Kernel::KEvent*> events;
+        Common::DkbFrameTrace::RateLimit trace_rate;
+        std::optional<s64> trace_last_callback, trace_min_gap;
+        s64 trace_max_late{};
+        u64 trace_callbacks{}, trace_late_callbacks{};
+        std::atomic<u64> trace_present{};
     };
     std::shared_ptr<VsyncState> m_vsync = std::make_shared<VsyncState>();
     std::shared_ptr<Core::Timing::EventType> m_vsync_timer;
