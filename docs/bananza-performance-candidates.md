@@ -1,5 +1,9 @@
 # Bananza performance candidates
 
+This is the historical audit of the first trace. The later profile and upstream
+integration supersede its port-selection status; see
+[post-profile fixes and upstream coverage](bananza-profile-fixes.md).
+
 No performance PR is selected until Nx2Profile zones identify a relevant cost.
 The frame trace supports investigating CPU-side delays, but it does not identify
 a hot path or prove an FPS improvement. Bulk-porting these PRs is not justified.
