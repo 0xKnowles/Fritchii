@@ -159,7 +159,7 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
             operand(64, 2);
         break;
     case 0x83b:
-        operand(16, input.Bits(72, 2) == 1 ? 2 : 4);
+        operand(16, 1U << input.Bits(72, 2));
         operand(24);
         break;
     case 0x23c:
