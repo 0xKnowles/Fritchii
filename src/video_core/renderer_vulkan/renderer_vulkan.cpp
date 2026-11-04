@@ -271,6 +271,11 @@ void RendererVulkan::Report() const {
     LOG_INFO(Render_Vulkan, "Device: {}", model_name);
     LOG_INFO(Render_Vulkan, "Vulkan: {}", api_version);
     LOG_INFO(Render_Vulkan, "Available VRAM: {:.2f} GiB", available_vram);
+    LOG_DEBUG(Render_Vulkan,
+              "Render trace capabilities: geometry_shader={} transform_feedback={} "
+              "geometry_streams={} mesh_shader={}",
+              device.GetPhysical().GetFeatures().geometryShader, device.IsExtTransformFeedbackSupported(),
+              device.AreTransformFeedbackGeometryStreamsSupported(), device.IsExtMeshShaderSupported());
 }
 
 vk::Buffer RendererVulkan::RenderToBuffer(std::span<const Tegra::FramebufferConfig> framebuffers,

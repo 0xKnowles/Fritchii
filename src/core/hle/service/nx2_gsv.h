@@ -1969,8 +1969,9 @@ private:
         if (shown != m_shown_layout) {
             m_shown_layout = shown;
             LOG_INFO(Service,
-                     "nx2:vi2 composite image {} layout {}x{}, drawn area {:#x}, crop {}x{}",
-                     image_id, layout.width, layout.height, shown_size, crop_width, crop_height);
+                     "nx2:vi2 composite image {} layout {}x{}, drawn area {:#x}, crop {}x{}, docked={}",
+                     image_id, layout.width, layout.height, shown_size, crop_width, crop_height,
+                     Settings::IsDockedMode());
         }
         std::vector<Tegra::FramebufferConfig> layers{Tegra::FramebufferConfig{
             .address = *device,
@@ -2143,6 +2144,9 @@ private:
         IPC::ResponseBuilder rb{ctx, 4};
         rb.Push(result.raw);
         rb.Push(mode);
+        LOG_DEBUG(Service_VI,
+                  "nx2:vi2 max resolution: name={:#x} docked={} result={:#x} mode={}",
+                  name, Settings::IsDockedMode(), result.raw, mode);
     }
 
     // Must be < 8; nn::vi::detail::LayerHistory creates 7 timestamp recorders per layer.
