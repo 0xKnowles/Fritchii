@@ -1281,9 +1281,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
 
 namespace {
 // Pipelines built on the GPU thread at run time (shader translation; the driver compile is on
-// workers): every one over 2 ms is logged, and the total every 10 s, to tell how much of the
-// stutter on new content is translation.
-void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_point begin) {
+// workers): the first 400 over 2 ms and every one over 100 ms are logged, and the total every
+// 10 s, to tell how much of the stutter on new content is translation.
+void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_point begin,
+                           const std::string& shaders) {
     static std::chrono::steady_clock::duration total{};
     static u32 count{}, logged{};
     static auto window = std::chrono::steady_clock::now();
@@ -1292,9 +1293,13 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
     total += elapsed;
     ++count;
     const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
-    if (elapsed > std::chrono::milliseconds{2} && logged < 400) {
+    // Slow builds are always logged with their shaders, to find the programs that are slow to
+    // translate.
+    if (elapsed > std::chrono::milliseconds{100} ||
+        (elapsed > std::chrono::milliseconds{2} && logged < 400)) {
         ++logged;
-        LOG_INFO(Render_Vulkan, "{} pipeline built on the GPU thread in {:.1f} ms", kind, ms(elapsed));
+        LOG_INFO(Render_Vulkan, "{} pipeline built on the GPU thread in {:.1f} ms: {}", kind,
+                 ms(elapsed), shaders);
     }
     if (now - window > std::chrono::seconds{10}) {
         LOG_INFO(Render_Vulkan, "Runtime pipelines in the last 10 s: {} built, {:.1f} ms on the GPU thread",
@@ -1309,7 +1314,13 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     const auto begin = std::chrono::steady_clock::now();
     SCOPE_EXIT {
-        ReportRuntimePipeline("Graphics", begin);
+        std::string shaders = fmt::format("pipeline={:016x}", graphics_key.Hash());
+        for (size_t stage = 0; stage < graphics_key.unique_hashes.size(); ++stage) {
+            if (graphics_key.unique_hashes[stage] != 0) {
+                shaders += fmt::format(" s{}:{:016x}", stage, graphics_key.unique_hashes[stage]);
+            }
+        }
+        ReportRuntimePipeline("Graphics", begin, shaders);
     };
     GraphicsEnvironments environments;
     GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
@@ -1350,7 +1361,11 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     const ComputePipelineCacheKey& key, const ShaderInfo* shader) {
     const auto begin = std::chrono::steady_clock::now();
     SCOPE_EXIT {
-        ReportRuntimePipeline("Compute", begin);
+        ReportRuntimePipeline("Compute", begin,
+                              fmt::format("pipeline={:016x} s6:{:016x} address={:#x}", key.Hash(),
+                                          key.unique_hash,
+                                          kepler_compute->regs.code_loc.Address() +
+                                              kepler_compute->launch_description.program_start));
     };
     const GPUVAddr program_base{kepler_compute->regs.code_loc.Address()};
     const auto& qmd{kepler_compute->launch_description};

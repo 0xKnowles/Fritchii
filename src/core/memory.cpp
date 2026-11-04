@@ -863,11 +863,32 @@ struct Memory::Impl {
         return true;
     }
 
+    /// A rasterizer-cached page whose host pointer is outside the emulated physical memory has no
+    /// device address to flush or invalidate (its lookup used to read far out of bounds).
+    void ReportForeignPointer(VAddr v_address, const u8* p) const {
+        static std::atomic<u32> reported{};
+        if (reported.fetch_add(1, std::memory_order_relaxed) >= 16) {
+            return;
+        }
+        const auto raw =
+            current_page_table->entries[(v_address & 0xffffffffffffULL) >> YUZU_PAGEBITS].Raw();
+        LOG_ERROR(HW_Memory,
+                  "Rasterizer access at {:#x}: host pointer {} is outside the emulated physical "
+                  "memory at {} (page type {}, block {})",
+                  v_address, fmt::ptr(p),
+                  fmt::ptr(system.DeviceMemory().buffer.BackingBasePointer()),
+                  static_cast<u32>(raw.type), static_cast<u32>(raw.block));
+    }
+
     void HandleRasterizerDownload(VAddr v_address, size_t size) {
         const auto* p = GetPointerImpl(
             v_address, []() {}, []() {});
         if (!gpu_device_memory) [[unlikely]] {
             gpu_device_memory = &system.Host1x().MemoryManager();
+        }
+        if (!gpu_device_memory->IsPhysicalPointer(p)) [[unlikely]] {
+            ReportForeignPointer(v_address, p);
+            return;
         }
         const size_t core = system.GetCurrentHostThreadID();
         if (core >= Core::Hardware::NUM_CPU_CORES) {
@@ -908,6 +929,10 @@ struct Memory::Impl {
                                      sys_core); // any other calls threads go to syscore.
         if (!gpu_device_memory) [[unlikely]] {
             gpu_device_memory = &system.Host1x().MemoryManager();
+        }
+        if (!gpu_device_memory->IsPhysicalPointer(p)) [[unlikely]] {
+            ReportForeignPointer(v_address, p);
+            return;
         }
         // Guard on sys_core;
         if (core == sys_core) [[unlikely]] {

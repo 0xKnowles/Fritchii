@@ -129,6 +129,15 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
                     .pipelineStatistics = 0,
                 });
                 trace_submissions.resize(TraceMaxSubmissions);
+                trace_work_pool = device.GetLogical().CreateQueryPool({
+                    .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                    .pNext = nullptr,
+                    .flags = 0,
+                    .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                    .queryCount = TraceMaxWork * 2,
+                    .pipelineStatistics = 0,
+                });
+                trace_work_items.resize(TraceMaxWork);
             } catch (const vk::Exception& error) {
                 LOG_WARNING(Render_Vulkan, "DKB gpu_timestamp unavailable: {}", error.what());
             }
@@ -596,6 +605,71 @@ void Scheduler::TraceComputePipeline(u64 hash) {
     });
 }
 
+void Scheduler::ReportWorkTimes() {
+    const u32 count = trace_work_count;
+    trace_work_count = 0;
+    if (count == 0) {
+        return;
+    }
+    struct Result {
+        u64 timestamp;
+        u64 available;
+    };
+    std::vector<Result> results(count * 2);
+    const auto result = device.GetLogical().GetQueryResults(
+        *trace_work_pool, 0, count * 2, results.size() * sizeof(Result), results.data(),
+        sizeof(Result), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    if (result != VK_SUCCESS) {
+        return;
+    }
+    struct Totals {
+        double total_ms{};
+        double max_ms{};
+        u32 count{};
+        std::array<u32, 3> max_size{};
+    };
+    std::map<std::pair<u64, u64>, Totals> by_shaders;
+    double total_ms{};
+    for (u32 i = 0; i < count; ++i) {
+        if (results[i * 2].available == 0 || results[i * 2 + 1].available == 0) {
+            continue;
+        }
+        const double ms = static_cast<double>(Common::DkbFrameTrace::TimestampDelta(
+                              results[i * 2].timestamp, results[i * 2 + 1].timestamp,
+                              trace_timestamp_bits)) *
+                          trace_timestamp_period / 1e6;
+        const WorkTrace& item = trace_work_items[i];
+        Totals& totals = by_shaders[{item.hash, item.fragment_hash}];
+        totals.total_ms += ms;
+        ++totals.count;
+        if (ms > totals.max_ms) {
+            totals.max_ms = ms;
+            totals.max_size = item.size;
+        }
+        total_ms += ms;
+    }
+    std::vector<std::pair<std::pair<u64, u64>, Totals>> sorted(by_shaders.begin(),
+                                                               by_shaders.end());
+    std::ranges::sort(sorted, std::greater<>{},
+                      [](const auto& entry) { return entry.second.total_ms; });
+    if (sorted.size() > 8) {
+        sorted.resize(8);
+    }
+    std::string slowest;
+    for (const auto& [shaders, totals] : sorted) {
+        const auto& [hash, fragment_hash] = shaders;
+        slowest += fragment_hash == 0
+                       ? fmt::format(" s6:{:016x}", hash)
+                       : fmt::format(" s1:{:016x}+s5:{:016x}", hash, fragment_hash);
+        slowest += fmt::format("={:.3f}ms/{}x(max {:.3f}ms size {}x{}x{})", totals.total_ms,
+                               totals.count, totals.max_ms, totals.max_size[0],
+                               totals.max_size[1], totals.max_size[2]);
+    }
+    LOG_INFO(Render_Vulkan,
+             "DKB gpu_work renderer_frame={} timed={} timed_sum_ms={:.3f} slowest:{}",
+             trace_sample_frame, count, total_ms, slowest);
+}
+
 void Scheduler::TraceGpuSubmission() {
     if (trace_gpu_pending) {
         master_semaphore->Refresh();
@@ -664,6 +738,7 @@ void Scheduler::TraceGpuSubmission() {
                      trace_sample_frame, work.tick, duration_ms, work.draw_attempts,
                      work.dispatch_attempts, shaders, work.untracked_uses);
         }
+        ReportWorkTimes();
         trace_gpu_tick = 0;
         trace_gpu_count = 0;
         trace_gpu_skipped = 0;
@@ -674,6 +749,10 @@ void Scheduler::TraceGpuSubmission() {
         return;
     }
     current_upload_cmdbuf.ResetQueryPool(*trace_query_pool, trace_gpu_count * 2, 2);
+    if (trace_gpu_count == 0 && trace_work_pool) {
+        // Draws are timed inside render passes, where queries cannot be reset.
+        current_upload_cmdbuf.ResetQueryPool(*trace_work_pool, 0, TraceMaxWork * 2);
+    }
     current_upload_cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, *trace_query_pool,
                                         trace_gpu_count * 2);
     trace_gpu_recording = true;

@@ -79,6 +79,7 @@ private:
     bool done{};
     bool truncated{};
     std::filesystem::path directory;
+    std::filesystem::path trigger_file;
     u64 trigger_frame{~0ULL};
     double trigger_seconds{};
     std::chrono::steady_clock::time_point start;

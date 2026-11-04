@@ -188,7 +188,11 @@ FrameDump::FrameDump(MemoryAllocator& memory_allocator_, Scheduler& scheduler_)
     start = std::chrono::steady_clock::now();
     const char* const at = std::getenv("EDEN_NX2_FRAME_DUMP_AT");
     const std::string_view value = at ? at : "60";
-    if (value.ends_with('f')) {
+    if (value == "file") {
+        // Captures once <dir>/capture.now exists, so a frame can be picked while playing.
+        trigger_file = directory / "capture.now";
+        trigger_seconds = std::numeric_limits<double>::infinity();
+    } else if (value.ends_with('f')) {
         trigger_frame = std::strtoull(value.data(), nullptr, 10);
         trigger_seconds = std::numeric_limits<double>::infinity();
     } else {
@@ -496,10 +500,12 @@ void FrameDump::TickFrame() {
     }
     const double elapsed =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-    if (frame < trigger_frame && elapsed < trigger_seconds) {
+    std::error_code error;
+    if (frame < trigger_frame && elapsed < trigger_seconds &&
+        (trigger_file.empty() || frame % 30 != 0 ||
+         !std::filesystem::exists(trigger_file, error))) {
         return;
     }
-    std::error_code error;
     std::filesystem::create_directories(directory, error);
     manifest.open(directory / "manifest.jsonl", std::ios::trunc);
     if (!manifest) {

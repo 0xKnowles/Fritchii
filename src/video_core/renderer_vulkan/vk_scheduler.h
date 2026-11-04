@@ -81,6 +81,21 @@ public:
     void MarkFrameEnd(u64 frame);
     void TraceGraphicsPipeline(const std::array<u64, 6>& hashes);
     void TraceComputePipeline(u64 hash);
+    /// Worker thread, inside a recorded command: timestamps one draw or dispatch of a sampled
+    /// submission. A draw passes its vertex and fragment hashes, a dispatch its compute hash.
+    template <typename Func>
+    void TraceGpuWork(vk::CommandBuffer cmdbuf, u64 hash, u64 fragment_hash,
+                      std::array<u32, 3> size, Func&& work) {
+        if (!trace_gpu_recording || !trace_work_pool || trace_work_count == TraceMaxWork) {
+            work();
+            return;
+        }
+        const u32 query = trace_work_count * 2;
+        trace_work_items[trace_work_count++] = {hash, fragment_hash, size};
+        cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *trace_work_pool, query);
+        work();
+        cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *trace_work_pool, query + 1);
+    }
 
     /// Sends currently recorded work to the worker thread.
     void DispatchWork();
@@ -393,6 +408,7 @@ private:
     void AllocateWorkerCommandBuffer();
 
     void TraceGpuSubmission();
+    void ReportWorkTimes();
     void TraceShader(u64 hash, u32 stage);
 
     u64 SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore);
@@ -429,6 +445,16 @@ private:
     };
     SubmissionTrace trace_work;
     std::vector<SubmissionTrace> trace_submissions;
+    static constexpr u32 TraceMaxWork = 4096;
+    struct WorkTrace {
+        u64 hash{};
+        u64 fragment_hash{};
+        /// Dispatch grid, or vertex and instance counts of a draw; zero when indirect.
+        std::array<u32, 3> size{};
+    };
+    vk::QueryPool trace_work_pool;
+    std::vector<WorkTrace> trace_work_items;
+    u32 trace_work_count{};
     Common::DkbFrameTrace::RateLimit trace_gpu_rate;
     u64 trace_gpu_tick{};
     u64 trace_frame_end{};
