@@ -58,5 +58,12 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         find_package(Python3 REQUIRED COMPONENTS Interpreter)
         add_test(NAME shader-sweep-cli
             COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_cli.py" $<TARGET_FILE:shader-sweep>)
+        find_program(SPIRV_VAL_EXECUTABLE spirv-val REQUIRED)
+        add_test(NAME shader-sweep-captured
+            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_captured.py"
+                    $<TARGET_FILE:shader-sweep> --spirv-val "${SPIRV_VAL_EXECUTABLE}")
+        add_test(NAME shader-sweep-cache-parser
+            COMMAND Python3::Interpreter -m unittest discover
+                    -s "${REPOSITORY_ROOT}/tools/nx2" -p test_shader_sweep.py)
     endif()
 endif()

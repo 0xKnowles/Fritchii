@@ -19,11 +19,12 @@ ctest --test-dir build/shader-sweep --output-on-failure
 
 CMake 3.24 or newer is required. The standalone configuration downloads pinned fmt,
 SPIRV-Headers, sirit, and ZBIC sources. It does not require system SPIRV-Headers.
-The Python tests generate their own shader fixtures and use `spirv-val` when installed.
+The tests include synthetic CLI cases, parser bounds checks, and three small captured
+regression programs. `spirv-val` is required when `BUILD_TESTING` is enabled.
 
 ## Inputs
 
-Compile one extracted v46 or v47 serialized environment record:
+Compile one extracted v46, v47 or v48 serialized environment record:
 
 ```sh
 shader-sweep --environment shader.env --cache-version 47 --output shader.spv

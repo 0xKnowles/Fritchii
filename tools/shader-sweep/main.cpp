@@ -109,7 +109,7 @@ public:
         const u64 type_count = reader.Read<u64>();
         const u64 format_count = reader.Read<u64>();
         const u64 cbuf_count = reader.Read<u64>();
-        const u64 pointer_count = version == 47 ? reader.Read<u64>() : 0;
+        const u64 pointer_count = version >= 47 ? reader.Read<u64>() : 0;
         const u64 replacement_count = reader.Read<u64>();
         if (size % 8 || !size || size > reader.Remaining()) {
             throw std::runtime_error("Invalid environment code size");
@@ -529,7 +529,7 @@ int main(int argc, char** argv) {
                 std::cout << "shader-sweep [INPUT] [--stage "
                              "vertex|tess-control|tess-eval|geometry|fragment|compute]\n"
                              "  [--format instructions|native-header] [--environment FILE "
-                             "--cache-version 46|47]\n"
+                             "--cache-version 46|47|48]\n"
                              "  [--pipeline-key FILE] (--output SPV | --lower-only WORDS)\n";
                 return 0;
             }
@@ -551,9 +551,9 @@ int main(int argc, char** argv) {
             else if (arg == "--pipeline-key")
                 pipeline_key = value;
             else if (arg == "--cache-version") {
-                if (value != "46" && value != "47")
-                    throw std::runtime_error("Expected cache version 46 or 47");
-                version = value == "46" ? 46 : 47;
+                if (value != "46" && value != "47" && value != "48")
+                    throw std::runtime_error("Expected cache version 46, 47 or 48");
+                version = static_cast<u32>(std::stoul(value));
             } else if (arg == "--output" || arg == "--lower-only") {
                 if (!output.empty())
                     throw std::runtime_error("Only one output mode is permitted");

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay native shader captures and v46/v47 pipeline caches without a GPU."""
+"""Replay native shader captures and v46/v47/v48 pipeline caches without a GPU."""
 
 import argparse
 from collections import Counter, defaultdict
@@ -40,7 +40,7 @@ def parse_cache(data):
     if len(data) < 12 or data[:8] != b"yuzucach":
         raise CacheError("not a serialized shader-environment cache")
     version, = struct.unpack_from("<I", data, 8)
-    if version not in (46, 47):
+    if version not in (46, 47, 48):
         raise CacheError(f"unsupported cache version {version}")
     cursor = 12
     entry = 0
@@ -54,13 +54,13 @@ def parse_cache(data):
         environments = []
         for index in range(count):
             begin = cursor
-            header = struct.Struct("<" + "Q" * (6 if version == 47 else 5) + "7I")
+            header = struct.Struct("<" + "Q" * (6 if version >= 47 else 5) + "7I")
             if cursor + header.size > len(data):
                 raise CacheError(f"truncated environment header at {cursor}")
             fields = header.unpack_from(data, cursor)
             sizes, params = fields[:-7], fields[-7:]
             code_size, textures, formats, constants = sizes[:4]
-            pointers, replacements = sizes[4:] if version == 47 else (0, sizes[4])
+            pointers, replacements = sizes[4:] if version >= 47 else (0, sizes[4])
             local, bound, start, low, high, viewport, stage = params
             if stage >= len(STAGES) or code_size > 64 * 1024 * 1024 or code_size % 8:
                 raise CacheError(f"invalid stage/code size at {cursor}")

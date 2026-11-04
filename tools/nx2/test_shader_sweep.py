@@ -10,11 +10,11 @@ import shader_sweep as sweep
 def environment(version, stage):
     code = bytes(88)
     counts = [len(code), 1, 1, 1]
-    if version == 47:
+    if version >= 47:
         counts.append(1)
     counts.append(1)
     header = struct.pack("<" + "Q" * len(counts) + "7I", *counts, 0, 2, 0, 0, 80, 1, stage)
-    context = bytes(8 + 8 + 12 + (9 if version == 47 else 0) + 12)
+    context = bytes(8 + 8 + 12 + (9 if version >= 47 else 0) + 12)
     tail = bytes(16 if stage == 5 else 80 + (32 if stage == 3 else 0))
     return header + code + context + tail
 
@@ -30,7 +30,7 @@ def pipeline_cache(version):
 
 class CacheTests(unittest.TestCase):
     def test_both_versions_preserve_records_and_stage(self):
-        for version in (46, 47):
+        for version in (46, 47, 48):
             records = list(sweep.parse_cache(pipeline_cache(version)))
             self.assertEqual([r["stage"] for r in records], ["vertex", "geometry", "fragment", "compute"])
             for record, stage in zip(records, (0, 3, 4, 5)):
@@ -45,7 +45,7 @@ class CacheTests(unittest.TestCase):
                 list(sweep.parse_cache(data[:length]))
 
     def test_unknown_version_and_environment_count_rejected(self):
-        for data in (b"yuzucach" + struct.pack("<I", 48),
+        for data in (b"yuzucach" + struct.pack("<I", 49),
                      b"yuzucach" + struct.pack("<II", 47, 7)):
             with self.assertRaises(sweep.CacheError):
                 list(sweep.parse_cache(data))

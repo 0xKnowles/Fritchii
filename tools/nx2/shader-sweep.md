@@ -38,9 +38,9 @@ new lowering no longer produces the exact bytes stored in the older cache.
 
 ## Inputs and coverage
 
-The loader reads little-endian `yuzucach` Vulkan caches, fork versions 46 and 47. It verifies each
+The loader reads little-endian `yuzucach` Vulkan caches, fork versions 46, 47 and 48. It verifies each
 record boundary and rejects unknown versions or truncated input. Version 47 includes captured
-storage-pointer classifications; version 46 does not. Graphics keys are the 1,056-byte layout
+storage-pointer classifications; version 48 retains that layout and version 46 omits them. Graphics keys are the 1,056-byte layout
 from these versions; compute keys contain 24 bytes. Driver pipeline blobs and `vulkan_used`
 indexes do not contain replayable shader environments and are not treated as shader inputs.
 
@@ -78,7 +78,7 @@ stage, not missing headers or resource data; full compilation still reports that
 python3 -m unittest discover -s tools/nx2 -p test_shader_sweep.py -v
 ```
 
-Keep bulk game captures and generated modules outside the repository. The two small regression
+Keep bulk game captures and generated modules outside the repository. The small regression
 environments in `tools/shader-sweep/fixtures` preserve captured programs that exposed backend
 defects. Each records its source cache hash and byte offset. Run them with:
 

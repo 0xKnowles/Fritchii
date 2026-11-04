@@ -34,7 +34,7 @@ def environment(version, stage, instructions=(MAXWELL_EXIT,), formats=()):
             code += bytes(8)
         code += struct.pack("<Q", instruction)
     counts = [len(code), 0, len(formats), 0, 0]
-    if version == 47:
+    if version >= 47:
         counts.append(0)
     record = struct.pack("<" + "Q" * len(counts), *counts)
     record += struct.pack("<7I", 0, 2, 80 if stage == 5 else 0, 0, len(code) - 8, 1, stage)
@@ -150,7 +150,7 @@ class CliTests(unittest.TestCase):
         self.run_cli(source, "--format", "native-header", "--stage", "fragment", "--output", self.output, code=2)
 
     def test_both_cache_versions_all_stages(self):
-        for version in (46, 47):
+        for version in (46, 47, 48):
             for stage, name in enumerate(STAGES):
                 with self.subTest(version=version, stage=name):
                     capture = self.write("shader.env", environment(version, stage))
@@ -168,7 +168,7 @@ class CliTests(unittest.TestCase):
         self.validate()
 
     def test_surface_pixel_format_outside_shader_enum(self):
-        for version in (46, 47):
+        for version in (46, 47, 48):
             with self.subTest(version=version):
                 capture = self.write("shader.env", environment(version, 5, formats=((0, 111),)))
                 self.run_cli("--environment", capture, "--cache-version", version, "--output", self.output)
@@ -192,7 +192,7 @@ class CliTests(unittest.TestCase):
             source = self.write("native.bin", data)
             self.run_cli(source, "--lower-only", self.output, code=2)
         capture = self.write("shader.env", environment(46, 5))
-        self.run_cli("--environment", capture, "--cache-version", 48, "--output", self.output, code=2)
+        self.run_cli("--environment", capture, "--cache-version", 49, "--output", self.output, code=2)
         source = self.write("native.bin", bytes(16))
         result = self.run_cli(source, "--lower-only", self.output, code=1)
         self.assertEqual(result["phase"], "lower")
