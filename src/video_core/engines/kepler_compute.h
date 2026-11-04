@@ -245,8 +245,8 @@ public:
     }
 
     bool IsNativeMode() const { return native_mode; }
-    bool ProcessFireEmblemDlss(u64 native_key);
-    void TraceDlssContract(u64 native_key);
+    bool ProcessGameDlss(u64 program_id, u64 native_key);
+    void TraceDlssContract(u64 native_key, bool warn_unvalidated = true);
 
     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
     /// the front instead of CallMethod for native compute engines: runs their macros and macro
@@ -272,7 +272,7 @@ private:
     void ProcessNativeReportSemaphore(u32 argument);
     void DescribeNativeResources(const NativeQmdScheduler::Descriptor& qmd);
     void RememberDlssMotionVectors();
-    bool TryFireEmblemUpscale();
+    bool TryFireEmblemUpscale(bool allow_history = true);
     void CaptureFireEmblemJitter();
     bool FinishDlssEvaluation();
     void CheckDlssNetwork();
@@ -283,6 +283,7 @@ private:
     /// the game's own network output is shown instead of the replacement upscale.
     struct DlssChain {
         bool active{};
+        bool spatial_only{};
         bool output_pass{};
         u32 rejected{};
         u32 clean_evaluations{};

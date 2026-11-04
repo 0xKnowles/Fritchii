@@ -257,8 +257,7 @@ const ShaderInfo* ShaderCache::ComputeShader() {
         kepler_compute->TraceDlssContract(shader->lowered_native->native_program_key);
     }
     if (kepler_compute->IsNativeMode() && shader->lowered_native &&
-        program_id == FireEmblemUpscale::ProgramId &&
-        kepler_compute->ProcessFireEmblemDlss(shader->lowered_native->native_program_key)) {
+        kepler_compute->ProcessGameDlss(program_id, shader->lowered_native->native_program_key)) {
         throw FireEmblemUpscale::DispatchReplaced{};
     }
     return shader;

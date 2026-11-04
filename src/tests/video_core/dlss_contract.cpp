@@ -8,6 +8,25 @@
 
 namespace DC = VideoCommon::DlssContract;
 
+TEST_CASE("Spatial cutscene replacement decodes sRGB into float without temporal history",
+          "[dlss_contract]") {
+    using VideoCore::Surface::PixelFormat;
+    REQUIRE(DC::ValidColorFormats(PixelFormat::A8B8G8R8_SRGB,
+                                  PixelFormat::R16G16B16A16_FLOAT, false));
+    REQUIRE_FALSE(DC::ValidColorFormats(PixelFormat::A8B8G8R8_SRGB,
+                                        PixelFormat::R16G16B16A16_FLOAT, true));
+    for (const bool history : {false, true}) {
+        REQUIRE(DC::ValidColorFormats(PixelFormat::B10G11R11_FLOAT,
+                                      PixelFormat::B10G11R11_FLOAT, history));
+        REQUIRE_FALSE(DC::ValidColorFormats(PixelFormat::A8B8G8R8_UNORM,
+                                            PixelFormat::R16G16B16A16_FLOAT, history));
+        REQUIRE_FALSE(DC::ValidColorFormats(PixelFormat::A8B8G8R8_SRGB,
+                                            PixelFormat::A8B8G8R8_SRGB, history));
+        REQUIRE_FALSE(DC::ValidColorFormats(PixelFormat::R16G16B16A16_FLOAT,
+                                            PixelFormat::A8B8G8R8_SRGB, history));
+    }
+}
+
 TEST_CASE("DLSS recording restores inputs before each evaluation failure returns", "[dlss_contract]") {
     using Result = VideoCommon::DlssEvaluationResult;
     for (const auto failure : {Result::Succeeded, Result::OptionsFailed, Result::TokenFailed,
