@@ -21,6 +21,7 @@
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 
 #include "common/assert.h"
+#include "common/dkb_frame_trace.h"
 #include "shader_recompiler/exception.h"
 #include "common/logging.h"
 #include "common/scope_exit.h"
@@ -247,7 +248,11 @@ RasterizerVulkan::~RasterizerVulkan() {
 }
 
 template <typename Func>
-void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_indirect) {
+
+    if (Common::DkbFrameTrace::Enabled()) {
+        ++trace_draws;
+    }
 
     SCOPE_EXIT {
         gpu.TickWork();
@@ -274,6 +279,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     }
 
     const auto report_failure = [&](std::string_view reason) {
+        TraceDrawFailure(reason);
         static std::set<std::tuple<u64, u64, std::string_view>> seen;
         const auto& regs = maxwell3d->regs;
         const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
@@ -336,6 +342,16 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
                   "Render trace pipeline: frame={} draw={} hashes={:016x} dynamic_vertex_input={}",
                   render_trace_frame, render_trace_draws, fmt::join(pipeline->ShaderHashes(), ","),
                   pipeline->HasDynamicVertexInput());
+    }
+
+    if (is_indirect && !mesh_draw && Common::DkbFrameTrace::Enabled()) {
+        static const bool readback = [] {
+            const char* value = std::getenv("EDEN_DKB_INDIRECT_READBACK");
+            return value && std::string_view{value} == "1";
+        }();
+        if (readback) {
+            CaptureIndirectTrace();
+        }
     }
 
     {
@@ -486,7 +502,7 @@ bool RasterizerVulkan::TryNativeIndirectReset(bool is_indexed, u32 instance_coun
         return false;
     }
     const auto& cbuf = maxwell3d->state.shader_stages[0].const_buffers[0];
-    if (!cbuf.enabled || cbuf.size < 0x118) {
+    if (!cbuf.enabled || cbuf.size < 0x120) {
         return false;
     }
     const GPUVAddr program =
@@ -501,23 +517,36 @@ bool RasterizerVulkan::TryNativeIndirectReset(bool is_indexed, u32 instance_coun
     }
     FlushWork();
     gpu_memory->FlushCaching();
-    if (!gpu_memory->IsFullyMappedRange(cbuf.address + 0x110, sizeof(u64))) {
+    const auto in_gpu_range = [this](u64 address, size_t size) {
+        return size != 0 && address <= (std::numeric_limits<u64>::max)() - size &&
+               gpu_memory->IsWithinGPUAddressRange(address) &&
+               gpu_memory->IsWithinGPUAddressRange(address + size - 1);
+    };
+    if (!in_gpu_range(cbuf.address, 0x120) ||
+        !gpu_memory->IsFullyMappedRange(cbuf.address + 0x110, 16)) {
         return false;
     }
-    u64 list{};
-    gpu_memory->ReadBlock(cbuf.address + 0x110, &list, sizeof(list));
-    const auto range = Reset::GetListRange(list, draw.vertex_buffer.first, draw.vertex_buffer.count);
-    if (!range || !gpu_memory->IsFullyMappedRange(range->address, range->bytes)) {
+    std::array<u64, 2> descriptor{};
+    gpu_memory->ReadBlock(cbuf.address + 0x110, descriptor.data(), sizeof(descriptor));
+    const auto range = Reset::GetListRange(descriptor[0], static_cast<u32>(descriptor[1]),
+                                          draw.vertex_buffer.first, draw.vertex_buffer.count);
+    if (!range || !in_gpu_range(range->address, range->bytes) ||
+        !gpu_memory->IsFullyMappedRange(range->address, range->bytes)) {
         return false;
     }
     std::vector<u64> pointers(draw.vertex_buffer.count);
     // Safe reads observe earlier GPU writes to the pointer list before the CPU stand-in runs.
     gpu_memory->ReadBlock(range->address, pointers.data(), range->bytes);
     for (const u64 pointer : pointers) {
-        if (!pointer || pointer > (std::numeric_limits<u64>::max)() - sizeof(Reset::Record) ||
+        if (!pointer || !in_gpu_range(pointer, sizeof(Reset::Record)) ||
             !gpu_memory->IsFullyMappedRange(pointer, sizeof(Reset::Record)) ||
             (pointer < range->address + range->bytes &&
              pointer + sizeof(Reset::Record) > range->address)) {
+            return false;
+        }
+        const auto segments = gpu_memory->GetSubmappedRange(pointer, sizeof(Reset::Record));
+        if (segments.size() != 1 || segments[0].first != pointer ||
+            segments[0].second != sizeof(Reset::Record)) {
             return false;
         }
     }
@@ -662,6 +691,11 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                       draw_params.base_instance, mesh_draw);
         }
 
+        if (Common::DkbFrameTrace::Enabled() &&
+            (draw_params.num_vertices == 0 || (!mesh_draw && draw_params.num_instances == 0))) {
+            ++trace_zero_direct;
+        }
+
         if (mesh_draw) {
             scheduler.Record([groups = draw_params.num_vertices](vk::CommandBuffer cmdbuf) {
                 cmdbuf.DrawMeshTasksEXT(groups, 1, 1);
@@ -698,6 +732,9 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
 void RasterizerVulkan::DrawIndirect() {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     const auto& params = maxwell3d->draw_manager.indirect_state;
+    if (Common::DkbFrameTrace::Enabled()) {
+        ++trace_indirect;
+    }
     buffer_cache.SetDrawIndirect(&params);
     PrepareDraw(params.is_indexed, [this, &params] {
         if (VideoCommon::RenderTrace::SampleFrame(render_trace_frame) && render_trace_draws <= 2048) {
@@ -709,6 +746,7 @@ void RasterizerVulkan::DrawIndirect() {
                       params.stride, params.include_count, params.is_byte_count, mesh_draw);
         }
         if (mesh_draw) {
+            TraceDrawFailure("indirect task/mesh unsupported");
             // Indirect task/mesh draws would need vkCmdDrawMeshTasksIndirectEXT's layout.
             static bool logged{};
             if (!std::exchange(logged, true)) {
@@ -766,8 +804,158 @@ void RasterizerVulkan::DrawIndirect() {
                 params.is_indexed ? "vkCmdDrawIndexedIndirect" : "vkCmdDrawIndirect",
                 log_params, VK_SUCCESS);
         }
-    });
+    }, true);
     buffer_cache.SetDrawIndirect(nullptr);
+}
+
+void RasterizerVulkan::TraceDrawFailure(std::string_view reason) {
+    if (!Common::DkbFrameTrace::Enabled()) {
+        return;
+    }
+    ++trace_skipped;
+    if (trace_failure_details++ >= 4) {
+        return;
+    }
+    const auto& regs = maxwell3d->regs;
+    std::array<GPUVAddr, 6> stages{};
+    for (size_t i = 0; i < stages.size(); ++i) {
+        if (regs.IsShaderConfigEnabled(i)) {
+            stages[i] = maxwell3d->GetNativeMacroEngine().native_turing
+                            ? (u64{regs.pipelines[i].reserved[0] & 0xff} << 32) |
+                                  regs.pipelines[i].reserved[1]
+                            : regs.program_region.Address() + regs.pipelines[i].offset;
+        }
+    }
+    LOG_INFO(Render_Vulkan,
+             "DKB draw skipped frame={} reason={} stages[0..5]={:#x} rt0={:#x} {}x{}",
+             trace_frame, reason, fmt::join(stages, ","), regs.rt[0].Address(),
+             regs.rt[0].width, regs.rt[0].height);
+}
+
+void RasterizerVulkan::CaptureIndirectTrace() {
+    if (!trace_sample_frame || trace_captures >= 4) {
+        return;
+    }
+    ++trace_captures;
+    const auto slot = std::find_if(indirect_traces.begin(), indirect_traces.end(),
+                                   [](const auto& trace) { return !trace.pending; });
+    if (slot == indirect_traces.end()) {
+        ++trace_capture_dropped;
+        return;
+    }
+    const auto& params = maxwell3d->draw_manager.indirect_state;
+    const auto [commands, command_offset] = buffer_cache.GetDrawIndirectBuffer();
+    const u32 max_draws = static_cast<u32>(params.max_draw_counts);
+    std::array<VkBufferCopy, 8> copies{};
+    u32 sampled{};
+    const u64 command_bytes = params.is_byte_count ? 4 : 8;
+    const u64 available = command_offset <= commands->SizeBytes()
+                              ? std::min<u64>(params.buffer_size,
+                                              commands->SizeBytes() - command_offset)
+                              : 0;
+    const u32 limit = params.is_byte_count ? 1 : std::min(max_draws, 8U);
+    for (u32 i = 0; i < limit; ++i) {
+        if (available < command_bytes || (i && params.stride > (available - command_bytes) / i)) {
+            break;
+        }
+        const u64 offset = command_offset + i * params.stride;
+        copies[sampled++] = VkBufferCopy{offset, i * 8ULL, command_bytes};
+    }
+    VkBuffer count_buffer{};
+    VkBufferCopy count_copy{};
+    if (params.include_count && !params.is_byte_count) {
+        const auto [count, offset] = buffer_cache.GetDrawIndirectCount();
+        if (offset > count->SizeBytes() || sizeof(u32) > count->SizeBytes() - offset) {
+            ++trace_capture_dropped;
+            return;
+        }
+        count_buffer = count->Handle();
+        count_copy = VkBufferCopy{offset, 64, sizeof(u32)};
+    }
+    if (!sampled && !count_buffer) {
+        LOG_INFO(Render_Vulkan, "DKB indirect frame={} address={:#x} max_draws={} sampled=0",
+                 trace_frame, params.indirect_start_address, max_draws);
+        return;
+    }
+    if (!slot->readback) {
+        slot->readback = memory_allocator.CreateBuffer(
+            VkBufferCreateInfo{
+                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                .size = 68,
+                .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            },
+            MemoryUsage::Download);
+    }
+    slot->frame = trace_frame;
+    slot->address = params.indirect_start_address;
+    slot->count_address = params.count_start_address;
+    slot->max_draws = max_draws;
+    slot->sampled_commands = sampled;
+    slot->include_count = count_buffer != VK_NULL_HANDLE;
+    slot->byte_count = params.is_byte_count;
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record([source = commands->Handle(), destination = *slot->readback, copies, sampled,
+                      count_buffer, count_copy](vk::CommandBuffer cmdbuf) {
+        const VkMemoryBarrier before{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               0, before);
+        if (sampled) {
+            cmdbuf.CopyBuffer(source, destination, vk::Span(copies.data(), sampled));
+        }
+        if (count_buffer) {
+            cmdbuf.CopyBuffer(count_buffer, destination, count_copy);
+        }
+        const VkMemoryBarrier after{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+                               0, after);
+    });
+    slot->tick = scheduler.CurrentTick();
+    slot->pending = true;
+    scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
+    scheduler.NoteRenderPassStores();
+}
+
+void RasterizerVulkan::CollectIndirectTrace() {
+    for (auto& trace : indirect_traces) {
+        if (!trace.pending || !scheduler.IsFree(trace.tick)) {
+            continue;
+        }
+        trace.readback.Invalidate();
+        std::array<u32, 17> words{};
+        std::memcpy(words.data(), trace.readback.Mapped().data(), sizeof(words));
+        if (trace.byte_count) {
+            LOG_INFO(Render_Vulkan, "DKB indirect frame={} address={:#x} gpu_byte_count={}",
+                     trace.frame, trace.address, words[0]);
+        } else {
+            const u32 count = trace.include_count ? words[16] : trace.max_draws;
+            const u32 requested_draws = std::min(count, trace.max_draws);
+            const u32 sampled = std::min(requested_draws, trace.sampled_commands);
+            u32 zero_commands{};
+            std::string commands;
+            for (u32 i = 0; i < sampled; ++i) {
+                zero_commands += words[2 * i] == 0 || words[2 * i + 1] == 0;
+                commands += fmt::format("{}{}x{}", i ? "," : "", words[2 * i], words[2 * i + 1]);
+            }
+            LOG_INFO(Render_Vulkan,
+                     "DKB indirect frame={} address={:#x} count_address={:#x} draw_count={} "
+                     "count_source={} max_draws={} requested_draws={} sampled={} zero_commands={} "
+                     "vertices_or_indices_x_instances=[{}] conditional_execution=unobserved",
+                     trace.frame, trace.address, trace.count_address, count,
+                     trace.include_count ? "gpu" : "command-parameter",
+                     trace.max_draws, requested_draws, sampled, zero_commands, commands);
+        }
+        trace.pending = false;
+    }
 }
 
 void RasterizerVulkan::DrawTexture() {
@@ -1178,6 +1366,13 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
     if (addr == 0 || size == 0) {
         return;
     }
+    if (True(which & (VideoCommon::CacheType::TextureCache | VideoCommon::CacheType::BufferCache))) {
+        // CPU writes into GPU-written memory are only collected when they happen. Apply them
+        // first, or the download writes the stale GPU copy over them: the Yoshi demo writes a
+        // native program over memory a compute pass had bound as a written texel buffer, and its
+        // title menu or background read as zeros once the shader cache's read flushed it.
+        gpu.InvalidateGPUCache();
+    }
     if (True(which & VideoCommon::CacheType::TextureCache)) {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.DownloadMemory(addr, size);
@@ -1490,6 +1685,56 @@ void RasterizerVulkan::TickFrame() {
     ++render_trace_frame;
     render_trace_draws = 0;
     render_trace_clears = 0;
+    if (Common::DkbFrameTrace::Enabled()) {
+        CollectIndirectTrace();
+        const auto now = std::chrono::steady_clock::now();
+        if (trace_cpu_rate.Ready(now)) {
+            auto snapshot = Common::DkbCpuTrace::ReadSnapshot();
+            if (trace_cpu_snapshot && trace_frame > trace_cpu_frame) {
+                const u64 frames = trace_frame - trace_cpu_frame;
+                std::string roles;
+                for (size_t i = 0; i < Common::DkbCpuTrace::RoleCount; ++i) {
+                    const auto name = Common::DkbCpuTrace::RoleNames[i];
+                    const auto delta = Common::DkbCpuTrace::CpuTimeDelta(
+                        trace_cpu_snapshot->threads[i], snapshot.threads[i]);
+                    if (delta) {
+                        const double cpu_ms = static_cast<double>(*delta) / 1e6;
+                        roles += fmt::format(" {}_cpu_ms={:.3f} {}_cpu_ms_per_frame={:.3f}",
+                                             name, cpu_ms, name, cpu_ms / frames);
+                    } else {
+                        roles += fmt::format(" {}={}", name,
+                                             snapshot.threads[i].active ? "unavailable" : "inactive");
+                    }
+                }
+                LOG_INFO(Render_Vulkan,
+                         "DKB cpu through_frame={} frames={} window_wall_ms={:.3f}{}",
+                         trace_frame, frames,
+                         std::chrono::duration<double, std::milli>(
+                             snapshot.wall_time - trace_cpu_snapshot->wall_time).count(),
+                         roles);
+            }
+            trace_cpu_snapshot = std::move(snapshot);
+            trace_cpu_frame = trace_frame;
+        }
+        ++trace_window_frames;
+        if (trace_sample_frame) {
+            LOG_INFO(Render_Vulkan,
+                     "DKB draws through_frame={} frames={} attempts={} skipped={} indirect={} "
+                     "zero_direct={} capture_dropped={} attempts_per_frame={:.1f} "
+                     "zero_direct_per_frame={:.1f} (totals since previous line)",
+                     trace_frame, trace_window_frames, trace_draws, trace_skipped, trace_indirect,
+                     trace_zero_direct, trace_capture_dropped,
+                     static_cast<double>(trace_draws) / trace_window_frames,
+                     static_cast<double>(trace_zero_direct) / trace_window_frames);
+            trace_draws = trace_skipped = trace_indirect = trace_zero_direct = 0;
+            trace_window_frames = 0;
+            trace_capture_dropped = trace_failure_details = 0;
+            trace_rate.next = now + std::chrono::seconds{1};
+        }
+        ++trace_frame;
+        trace_captures = 0;
+        trace_sample_frame = trace_frame < 4 || trace_rate.Ready(now);
+    }
     ComputePipeline::TickUpscalerTrace();
     draw_counter = 0;
     pending_native_work = false;

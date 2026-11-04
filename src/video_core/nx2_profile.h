@@ -12,6 +12,7 @@
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "common/cpu_features.h"
+#include "common/thread_cpu_clock.h"
 
 // EDEN_NX2_GPU_PROFILE: time where the GPU thread spends its time. Each zone counts its own
 // (exclusive) time, nested zones excluded; every 10 s the thread logs each zone's share.
@@ -83,6 +84,7 @@ struct ThreadData {
     std::array<u64, 8> counters{}; ///< See Counter
     u64 child_ns{};    ///< Time of the zones nested in the current one
     u64 window_start{};
+    std::optional<u64> cpu_start_ns;
 };
 
 inline thread_local ThreadData t_data;
@@ -155,6 +157,7 @@ inline void Report(const char* thread_name = "GPU thread") {
     const u64 now = Now();
     if (data.window_start == 0) {
         data.window_start = now;
+        data.cpu_start_ns = Common::CurrentThreadCpuTimeNs();
         data.child_ns = 0;
         return;
     }
@@ -162,6 +165,7 @@ inline void Report(const char* thread_name = "GPU thread") {
     if (window < 10'000'000'000ULL) {
         return;
     }
+    const auto cpu_now = Common::CurrentThreadCpuTimeNs();
     // Time in no zone at all is the wall time minus the zones' totals.
     u64 zoned{};
     for (size_t i = 1; i < data.exclusive_ns.size(); ++i) {
@@ -190,9 +194,18 @@ inline void Report(const char* thread_name = "GPU thread") {
     line += fmt::format(" | acquires {:.0f} ({:.0f} waited)",
                         static_cast<double>(data.counters[6]) * 1e9 / window,
                         static_cast<double>(data.counters[7]) * 1e9 / window);
+    if (cpu_now && data.cpu_start_ns && *cpu_now >= *data.cpu_start_ns) {
+        line += fmt::format(" | host_cpu_busy_ms_per_s={:.3f} window_wall_ms={:.3f}",
+                            static_cast<double>(*cpu_now - *data.cpu_start_ns) * 1000.0 / window,
+                            static_cast<double>(window) / 1e6);
+    } else {
+        line += fmt::format(" | host_cpu_busy_ms_per_s=unavailable window_wall_ms={:.3f}",
+                            static_cast<double>(window) / 1e6);
+    }
     LOG_INFO(HW_GPU, "{} per second:{}", thread_name, line);
     data = {};
     data.window_start = now;
+    data.cpu_start_ns = cpu_now;
 }
 
 } // namespace VideoCommon::Nx2Profile

@@ -16,13 +16,27 @@ TEST_CASE("Native indirect reset requires the complete captured program", "[nati
 
 TEST_CASE("Native indirect reset list ranges never wrap or truncate", "[native_reset]") {
     namespace Reset = VideoCommon::NativeIndirectReset;
-    const auto range = Reset::GetListRange(0x1000, 7, 18);
+    constexpr u32 size = ~u32{0};
+    const auto range = Reset::GetListRange(0x1000, size, 7, 18);
     REQUIRE(range);
     REQUIRE(range->address == 0x1038);
     REQUIRE(range->bytes == 144);
-    REQUIRE_FALSE(Reset::GetListRange(0x1000, 0, 0));
-    REQUIRE_FALSE(Reset::GetListRange(0x1000, 0, (1U << 20) + 1));
-    REQUIRE_FALSE(Reset::GetListRange(~u64{0}, 0, 1));
-    REQUIRE_FALSE(Reset::GetListRange(~u64{0} - 15, 1, 1));
-    REQUIRE(Reset::GetListRange(~u64{0} - 16, 1, 1));
+    REQUIRE_FALSE(Reset::GetListRange(0x1000, size, 0, 0));
+    REQUIRE_FALSE(Reset::GetListRange(0x1000, size, 0, (1U << 20) + 1));
+    REQUIRE_FALSE(Reset::GetListRange(~u64{0}, size, 0, 1));
+    REQUIRE_FALSE(Reset::GetListRange(~u64{0} - 15, size, 1, 1));
+    REQUIRE(Reset::GetListRange(~u64{0} - 16, size, 1, 1));
+}
+
+TEST_CASE("Native indirect reset stays inside its list descriptor", "[native_reset]") {
+    namespace Reset = VideoCommon::NativeIndirectReset;
+    REQUIRE_FALSE(Reset::GetListRange(0, 16, 0, 1));
+    REQUIRE_FALSE(Reset::GetListRange(0x1000, 7, 0, 1));
+    REQUIRE_FALSE(Reset::GetListRange(0x1000, 16, 2, 1));
+    REQUIRE_FALSE(Reset::GetListRange(0x1000, 16, 1, 2));
+    REQUIRE_FALSE(Reset::GetListRange(0x1000, 16, ~u32{0}, 1));
+    const auto range = Reset::GetListRange(0x1000, 23, 1, 1);
+    REQUIRE(range);
+    REQUIRE(range->address == 0x1008);
+    REQUIRE(range->bytes == 8);
 }

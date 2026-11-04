@@ -5,6 +5,9 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 add_executable(tests
+    core/nx2_present_pacer.cpp
+    common/dkb_cpu_trace.cpp
+    common/dkb_frame_trace.cpp
     audio_core/nx2_sysmix.cpp
     audio_core/sysmix_sink.cpp
     audio_core/sysmix_test_context.h
@@ -91,6 +94,7 @@ add_executable(tests
     core/internal_network/network.cpp
     video_core/memory_tracker.cpp
     video_core/h264_packet.cpp
+    video_core/nx2_gpu_mapping.cpp
     video_core/vertex_repack.cpp
     video_core/ampere_lowering.cpp
     video_core/ampere_geometry.cpp

@@ -7,10 +7,14 @@
 #pragma once
 
 #include <array>
+#include <optional>
+#include <string_view>
 
 #include <boost/container/static_vector.hpp>
 
 #include "common/common_types.h"
+#include "common/dkb_cpu_trace.h"
+#include "common/dkb_frame_trace.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
@@ -172,7 +176,11 @@ private:
     static constexpr VkDeviceSize DEFAULT_BUFFER_SIZE = 4 * sizeof(float);
 
     template <typename Func>
-    void PrepareDraw(bool is_indexed, Func&&);
+    void PrepareDraw(bool is_indexed, Func&&, bool is_indirect = false);
+
+    void CaptureIndirectTrace();
+    void CollectIndirectTrace();
+    void TraceDrawFailure(std::string_view reason);
 
     void FlushWork();
 
@@ -258,6 +266,34 @@ private:
     u32 render_trace_clears = 0;
     bool pending_native_work{};
     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
+
+    struct IndirectTrace {
+        vk::Buffer readback;
+        u64 tick{};
+        u64 frame{};
+        GPUVAddr address{};
+        GPUVAddr count_address{};
+        u32 max_draws{};
+        u32 sampled_commands{};
+        bool pending{};
+        bool include_count{};
+        bool byte_count{};
+    };
+    std::array<IndirectTrace, 8> indirect_traces;
+    Common::DkbFrameTrace::RateLimit trace_rate;
+    Common::DkbFrameTrace::RateLimit trace_cpu_rate;
+    std::optional<Common::DkbCpuTrace::Snapshot> trace_cpu_snapshot;
+    u64 trace_cpu_frame{};
+    bool trace_sample_frame{true};
+    u64 trace_frame{};
+    u64 trace_window_frames{};
+    u64 trace_draws{};
+    u64 trace_skipped{};
+    u64 trace_indirect{};
+    u64 trace_zero_direct{};
+    u32 trace_captures{};
+    u32 trace_capture_dropped{};
+    u32 trace_failure_details{};
 };
 
 } // namespace Vulkan

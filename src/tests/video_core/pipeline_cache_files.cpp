@@ -4,10 +4,12 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <unordered_map>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include "video_core/pipeline_cache_files.h"
+#include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 
 namespace {
 
@@ -103,4 +105,41 @@ TEST_CASE("An existing versioned cache is never overwritten by a legacy one",
     CHECK(std::filesystem::exists(legacy));
     CHECK_FALSE(VideoCommon::AdoptLegacyPipelineCache(temp.path / "missing.bin", versioned,
                                                       Magic, 39));
+}
+
+TEST_CASE("Cached compute failures retain their cause and the current dispatch address",
+          "[pipeline_cache][diagnostics]") {
+    const Vulkan::ComputePipelineCacheKey key{
+        .unique_hash = 0x1234,
+        .shared_memory_size = 1024,
+        .workgroup_size = {32, 1, 1},
+    };
+    std::unordered_map<Vulkan::ComputePipelineCacheKey, Vulkan::ComputePipelineCacheEntry> cache;
+    const std::string cause =
+        "SPIR-V emission failed at IR opcode UndefU8: SPIR-V Instruction is not implemented";
+    cache[key].failure = cause;
+    for (const GPUVAddr address : {0x211ddd9000ULL, 0x21ebdfa000ULL}) {
+        const auto [entry, inserted] = cache.try_emplace(key);
+        REQUIRE_FALSE(inserted);
+        CHECK(entry->second.Get(false, address, key) == nullptr);
+        try {
+            static_cast<void>(entry->second.Get(true, address, key));
+            FAIL("Native compute failure was not propagated");
+        } catch (const Shader::RuntimeError& exception) {
+            const std::string message{exception.what()};
+            CHECK(message.find(cause) != std::string::npos);
+            CHECK(message.find(fmt::format("address={:#x}", address)) != std::string::npos);
+            CHECK(message.find(fmt::format("shader={:#016x}", key.unique_hash)) != std::string::npos);
+            CHECK(message.find(fmt::format("pipeline={:#016x}", key.Hash())) != std::string::npos);
+        }
+        CHECK(entry->second.failure == cause);
+        CHECK_FALSE(entry->second.pipeline);
+    }
+    auto other = key;
+    other.workgroup_size[0] = 64;
+    const auto [entry, inserted] = cache.try_emplace(other);
+    REQUIRE(inserted);
+    CHECK(entry->second.failure.empty());
+    CHECK(entry->second.Get(false, 0x2120633c00, other) == nullptr);
+    REQUIRE_THROWS_AS(entry->second.Get(true, 0x2120633c00, other), Shader::RuntimeError);
 }
