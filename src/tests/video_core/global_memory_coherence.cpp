@@ -489,6 +489,23 @@ TEST_CASE("Global loads do not emit unused atomic helpers", "[shader][spirv][glo
     CHECK(Instructions(code, 234).empty());
 }
 
+TEST_CASE("Global atomic routing works without descriptor aliases",
+          "[shader][spirv][global_atomic]") {
+    for (const bool native : {false, true}) {
+        GlobalAtomicProgram fixture{native};
+        fixture.profile.support_descriptor_aliasing = false;
+        const auto code = Backend::SPIRV::EmitSPIRV(fixture.profile, fixture.program);
+        const auto atomics = Instructions(code, 234);
+        REQUIRE(atomics.size() == (native ? 3 : 2));
+        const auto returns = Instructions(code, 254);
+        for (const auto& op : atomics) {
+            CHECK(std::ranges::any_of(returns, [&](const auto& returned) {
+                return returned.size() == 1 && returned[0] == op[1];
+            }));
+        }
+    }
+}
+
 TEST_CASE("Global atomic add rejects unsupported 64-bit addressing",
           "[shader][spirv][global_atomic]") {
     TestEnvironment env;
