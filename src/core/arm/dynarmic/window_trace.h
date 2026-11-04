@@ -99,17 +99,20 @@ private:
 class Sessions {
 public:
     void Reset(const Kernel::KProcess* owner, u64 base) {
-        current.store(base != 0 ? std::make_shared<Session>(owner, base, next_id.fetch_add(1))
-                                : nullptr);
+        auto session =
+            base != 0 ? std::make_shared<Session>(owner, base, next_id.fetch_add(1)) : nullptr;
+        std::scoped_lock lock{mutex};
+        current = std::move(session);
     }
 
     std::shared_ptr<Session> Find(const Kernel::KProcess* owner) const {
-        auto session = current.load();
-        return session && session->owner == owner ? session : nullptr;
+        std::scoped_lock lock{mutex};
+        return current && current->owner == owner ? current : nullptr;
     }
 
 private:
-    std::atomic<std::shared_ptr<Session>> current;
+    mutable std::mutex mutex;
+    std::shared_ptr<Session> current;
     std::atomic<u64> next_id{1};
 };
 
