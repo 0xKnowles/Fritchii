@@ -3568,7 +3568,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             // on a converged warp; the other path calls a WARPSYNC helper). Eden runs the warp's
             // threads converged there: .CONV always branches and .DIV never does.
             const u32 mode = insn.Bits(32, 2);
-            if (mode == 1 || (mode == 0 && insn.Bits(91, 1)))
+            if ((mode <= 1 && insn.Bits(91, 1)) ||
+                (mode == 1 && (insn.Bits(82, 5) || insn.Bits(92, 13))))
                 return fail(index, "native branch convergence mode");
             if (mode == 2) break;
             u64 branch_predicate = predicate;
