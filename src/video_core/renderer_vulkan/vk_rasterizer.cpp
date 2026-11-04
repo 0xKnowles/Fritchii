@@ -257,7 +257,13 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         auto& native = maxwell3d->GetNativeMacroEngine();
         if (native.native_turing && !submitted) {
             native.native_execution_failed = true;
-            LOG_DEBUG(HW_GPU, "Native graphics draw failed; refusing submission completion");
+            const auto& regs = maxwell3d->regs;
+            const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) |
+                           regs.pipelines[1].reserved[1];
+            const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) |
+                           regs.pipelines[5].reserved[1];
+            LOG_DEBUG(HW_GPU, "Native graphics draw not recorded: frame={} vs={:#x} ps={:#x}",
+                      render_trace_frame, vs, ps);
         }
     };
     namespace Profile = VideoCommon::Nx2Profile;
