@@ -1427,6 +1427,27 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 (u64{1} << 48));
             break;
         }
+        case 0x998:
+        case 0x99c: {
+            const bool store = opcode == 0x99c;
+            const u32 data = insn.Bits(store ? 32 : 16, 8);
+            const u32 coordinate = insn.Bits(24, 8), handle = insn.Bits(64, 8);
+            const u32 channels = insn.Bits(72, 4), dimension = insn.Bits(61, 3);
+            const u32 count = static_cast<u32>(std::popcount(channels));
+            const u32 reserved = uses_uniform_bank ? high_uniform_base : 246U;
+            if ((insn.words[1] & ~(store ? 0xe00000ffU : 0xe0000000U)) ||
+                (insn.words[2] & ~0xfffU) != (store ? 0x00100000U : 0x001e0000U) ||
+                (insn.words[3] & 0xc00001ffU) || dimension < 3 || dimension > 5 ||
+                channels == 0 || handle >= reserved || data + count > reserved ||
+                coordinate + (dimension >= 4 ? 3U : 2U) > reserved ||
+                (store && (dest != 0 || (channels != 1 && channels != 3 && channels != 15))) ||
+                (!store && (data % (count == 3 ? 4U : count))))
+                return fail(index, "native bindless formatted surface mode");
+            emit((store ? 0xeb20000000000000ULL : 0xeb00000000000000ULL) | predicate |
+                data | (u64{coordinate} << 8) | (u64{channels} << 20) |
+                (u64{dimension} << 33) | (u64{handle} << 39));
+            break;
+        }
         case 0xb97: { // SULD.P.2D/2D_ARRAY/3D.IGN, direct descriptor, channel mask at 72-75.
             const u32 binding = insn.Bits(54, 5), offset = insn.Bits(40, 14);
             const u32 coordinate = insn.Bits(24, 8);
