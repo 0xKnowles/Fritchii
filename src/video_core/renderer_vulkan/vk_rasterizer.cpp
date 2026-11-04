@@ -1416,13 +1416,15 @@ void RasterizerVulkan::SubmitNx2ListCopies() {
 }
 
 VideoCore::RasterizerInterface::GpuWrittenList RasterizerVulkan::ReadGpuWrittenCommandList(
-    DAddr addr, std::span<u8> out) {
+    DAddr addr, std::span<u8> out, bool past_sync) {
     // No cache lock: the front only reads the copies, under their own lock.
-    switch (buffer_cache.Nx2ReadListCopy(addr, out)) {
+    switch (buffer_cache.Nx2ReadListCopy(addr, out, past_sync)) {
     case BufferCache::Nx2ListRead::Copied:
         return GpuWrittenList::Copied;
     case BufferCache::Nx2ListRead::Synced:
         return GpuWrittenList::Synced;
+    case BufferCache::Nx2ListRead::NeedsSync:
+        return GpuWrittenList::NeedsSync;
     default:
         return GpuWrittenList::Unknown;
     }
