@@ -483,7 +483,13 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
                                                            return ReadTrapGuardConstant(bank, offset);
                                                        })))
         throw Shader::Ampere::TrapGuardError{};
-    auto lowered = Shader::Ampere::LowerToMaxwell(native, geometry_stage, true, verified_traps);
+    const auto tessellation_stage = stage == Shader::Stage::TessellationControl
+                                       ? Shader::Ampere::TessellationStage::Control
+                                   : stage == Shader::Stage::TessellationEval
+                                       ? Shader::Ampere::TessellationStage::Evaluation
+                                       : Shader::Ampere::TessellationStage::None;
+    auto lowered = Shader::Ampere::LowerToMaxwell(native, geometry_stage, true, verified_traps,
+                                                 tessellation_stage);
     // EDEN_NX2_REJECT=<hex address>,...: treat these programs as rejected (to find which newly
     // lowered program changes a game's behaviour without rebuilding).
     if (static const std::string reject_list = [] {
@@ -608,8 +614,12 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
                          (program == Maxwell::ShaderType::VertexB ||
                           program == Maxwell::ShaderType::Tessellation)};
     if (native) {
+        const bool tessellation =
+            (program == Maxwell::ShaderType::TessellationInit ||
+             program == Maxwell::ShaderType::Tessellation) &&
+            sph.common0.shader_type == static_cast<u32>(program);
         if (program != Maxwell::ShaderType::VertexB && program != Maxwell::ShaderType::Pixel &&
-            program != Maxwell::ShaderType::Geometry && !mesh_slot) {
+            program != Maxwell::ShaderType::Geometry && !mesh_slot && !tessellation) {
             if (const char* directory = std::getenv("EDEN_NX2_SHADER_DUMP"); directory &&
                 gpu_memory->IsFullyMappedRange(program_base, 128)) {
                 constexpr u32 MaxCaptureInstructions = 4096;
@@ -666,7 +676,9 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
         }
         if (std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS")) {
             const u32 native_stage = program == Maxwell::ShaderType::Pixel ? 4 :
-                                     program == Maxwell::ShaderType::Geometry ? 3 : 0;
+                                     program == Maxwell::ShaderType::Geometry ? 3 :
+                                     program == Maxwell::ShaderType::Tessellation ? 2 :
+                                     program == Maxwell::ShaderType::TessellationInit ? 1 : 0;
             const auto& table = maxwell3d->state.shader_stages[native_stage].const_buffers[1];
             if (table.enabled && table.size && table.size <= Tegra::Engines::Maxwell3D::Regs::MaxConstBufferSize) {
                 std::vector<u8> bytes(table.size);
@@ -675,8 +687,6 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
                 dump.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
             }
         }
-        InitializeNativeCode(std::move(lowered_native_), 128,
-                             program == Maxwell::ShaderType::Geometry);
     }
     gp_passthrough_mask = maxwell3d->regs.post_vtg_shader_attrib_skip_mask;
     switch (program) {
@@ -720,6 +730,10 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
                                    geometry.reserved[1]};
             gpu_memory->ReadBlock(address, &mesh_primitive_header, sizeof(mesh_primitive_header));
         }
+    }
+    if (native) {
+        InitializeNativeCode(std::move(lowered_native_), 128,
+                             program == Maxwell::ShaderType::Geometry);
     }
     const u64 local_size{sph.LocalMemorySize()};
     ASSERT(local_size <= (std::numeric_limits<u32>::max)());
