@@ -1,0 +1,229 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+import json
+from pathlib import Path
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import unittest
+
+
+BINARY = Path(sys.argv.pop(1)).resolve()
+NATIVE_EXIT = struct.pack("<4I", 0x794D, 0, 0x03800000, 0)
+MAXWELL_EXIT = 0xE30000000007000F
+STAGES = ("vertex", "tess-control", "tess-eval", "geometry", "fragment", "compute")
+
+
+def header(stage):
+    words = [0] * 20
+    words[0] = ((stage + 1) << 10) | 1
+    words[2] = 1 << 24
+    words[3] = 1 << 24
+    words[4] = 1
+    if stage == 4:
+        words[18] = 15
+    return struct.pack("<20I", *words)
+
+
+def environment(version, stage, instructions=(MAXWELL_EXIT,)):
+    code = bytearray(header(stage))
+    for instruction in instructions:
+        if len(code) % 32 == 0:
+            code += bytes(8)
+        code += struct.pack("<Q", instruction)
+    counts = [len(code), 0, 0, 0, 0]
+    if version == 47:
+        counts.append(0)
+    record = struct.pack("<" + "Q" * len(counts), *counts)
+    record += struct.pack("<7I", 0, 2, 80 if stage == 5 else 0, 0, len(code) - 8, 1, stage)
+    record += code
+    record += struct.pack("<4I", 1, 1, 1, 0) if stage == 5 else header(stage)
+    if stage == 3:
+        record += bytes(32)
+    return record
+
+
+def pipeline_key(raw1=0, color=0, attribute=None, dynamic_type=None):
+    key = bytearray(1056)
+    struct.pack_into("<II", key, 48, raw1, 7 << 1)
+    struct.pack_into("<f", key, 76, 1.0)
+    key[56] = color
+    if attribute is not None:
+        struct.pack_into("<I", key, 160, 1 | (attribute << 20))
+    if dynamic_type is not None:
+        struct.pack_into("<Q", key, 112, dynamic_type)
+    return key
+
+
+def spirv_instructions(data):
+    words = struct.unpack("<" + "I" * (len(data) // 4), data)
+    assert words[0] == 0x07230203
+    offset = 5
+    while offset < len(words):
+        size, opcode = words[offset] >> 16, words[offset] & 0xFFFF
+        assert size and offset + size <= len(words)
+        yield opcode, words[offset + 1:offset + size]
+        offset += size
+
+
+def interface_type(data, storage):
+    instructions = list(spirv_instructions(data))
+    types = {args[0]: (op, args[1:]) for op, args in instructions if op in (21, 22, 23, 32)}
+    locations = {args[0] for op, args in instructions if op == 71 and args[1:] == (30, 0)}
+    for op, args in instructions:
+        if op != 59 or args[1] not in locations or args[2] != storage:
+            continue
+        pointer = types[args[0]]
+        value = types[pointer[1][1]]
+        if value[0] == 23:
+            value = types[value[1][0]]
+        return "float" if value[0] == 22 else "signed" if value[1][1] else "unsigned"
+    return None
+
+
+class CliTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.output = self.root / "output.spv"
+
+    def write(self, name, data):
+        path = self.root / name
+        path.write_bytes(data)
+        return path
+
+    def run_cli(self, *args, code=0):
+        result = subprocess.run([str(BINARY), *map(str, args)], capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+        diagnostic = json.loads(result.stdout)
+        self.assertEqual(diagnostic["schema_version"], 1)
+        self.assertEqual(diagnostic["status"], "ok" if code == 0 else "error")
+        return diagnostic
+
+    def validate(self):
+        validator = shutil.which("spirv-val")
+        if validator:
+            result = subprocess.run([validator, "--target-env", "vulkan1.2", str(self.output)],
+                                    capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_lower_only_unknown_stage(self):
+        source = self.write("native.bin", NATIVE_EXIT)
+        result = self.run_cli(source, "--lower-only", self.output)
+        self.assertIsNone(result["stage"])
+        self.assertEqual(self.output.read_bytes(), struct.pack("<Q", MAXWELL_EXIT))
+
+    def test_instruction_only_requires_stage(self):
+        source = self.write("native.bin", NATIVE_EXIT)
+        self.run_cli(source, "--output", self.output, code=2)
+        self.assertFalse(self.output.exists())
+
+    def test_graphics_requires_header_or_environment(self):
+        source = self.write("native.bin", NATIVE_EXIT)
+        result = self.run_cli(source, "--stage", "vertex", "--output", self.output, code=1)
+        self.assertEqual(result["phase"], "context")
+        self.assertFalse(self.output.exists())
+
+    def test_compute_offline_assumptions(self):
+        source = self.write("native.bin", NATIVE_EXIT)
+        result = self.run_cli(source, "--stage", "compute", "--output", self.output)
+        self.assertTrue(any("workgroup 1x1x1" in item for item in result["assumptions"]))
+        self.validate()
+
+    def test_exact_native_header_stages(self):
+        for stage, name in enumerate(STAGES[:5]):
+            with self.subTest(stage=name):
+                source = self.write("header.bin", header(stage) + bytes(48) + NATIVE_EXIT)
+                result = self.run_cli(source, "--format", "native-header", "--output", self.output)
+                self.assertEqual(result["stage"], name)
+                models = [args[0] for op, args in spirv_instructions(self.output.read_bytes()) if op == 15]
+                self.assertEqual(models, [stage])
+                self.validate()
+
+    def test_header_stage_mismatch(self):
+        source = self.write("header.bin", header(0) + bytes(48) + NATIVE_EXIT)
+        self.run_cli(source, "--format", "native-header", "--stage", "fragment", "--output", self.output, code=2)
+
+    def test_both_cache_versions_all_stages(self):
+        for version in (46, 47):
+            for stage, name in enumerate(STAGES):
+                with self.subTest(version=version, stage=name):
+                    capture = self.write("shader.env", environment(version, stage))
+                    result = self.run_cli("--environment", capture, "--cache-version", version, "--output", self.output)
+                    self.assertEqual(result["stage"], name)
+                    models = [args[0] for op, args in spirv_instructions(self.output.read_bytes()) if op == 15]
+                    self.assertEqual(models, [stage])
+                    self.validate()
+
+    def test_raw_overlay(self):
+        capture = self.write("shader.env", environment(47, 4))
+        source = self.write("native.bin", NATIVE_EXIT)
+        result = self.run_cli(source, "--environment", capture, "--cache-version", 47, "--output", self.output)
+        self.assertEqual(result["stage"], "fragment")
+        self.validate()
+
+    def test_truncated_records_and_trailing_data(self):
+        full = environment(47, 3)
+        for size in range(len(full)):
+            capture = self.write("shader.env", full[:size])
+            self.run_cli("--environment", capture, "--cache-version", 47, "--output", self.output, code=2)
+        capture = self.write("shader.env", full + b"x")
+        self.run_cli("--environment", capture, "--cache-version", 47, "--output", self.output, code=2)
+
+    def test_invalid_lengths_versions_and_opcode(self):
+        for data in (b"", NATIVE_EXIT[:-1], NATIVE_EXIT + b"x"):
+            source = self.write("native.bin", data)
+            self.run_cli(source, "--lower-only", self.output, code=2)
+        capture = self.write("shader.env", environment(46, 5))
+        self.run_cli("--environment", capture, "--cache-version", 48, "--output", self.output, code=2)
+        source = self.write("native.bin", bytes(16))
+        result = self.run_cli(source, "--lower-only", self.output, code=1)
+        self.assertEqual(result["phase"], "lower")
+        self.assertEqual(result["error"]["offset"], 0)
+
+    def test_trap_requires_context(self):
+        source = self.write("trap.bin", struct.pack("<4I", 0x795C, 0, 0, 0) + NATIVE_EXIT)
+        result = self.run_cli(source, "--stage", "compute", "--lower-only", self.output, code=1)
+        self.assertEqual(result["phase"], "context")
+
+    def test_output_cannot_overwrite_input(self):
+        source = self.write("native.bin", NATIVE_EXIT)
+        self.run_cli(source, "--lower-only", source, code=2)
+        self.assertEqual(source.read_bytes(), NATIVE_EXIT)
+
+    def test_static_and_dynamic_vertex_types(self):
+        ald = 0xEFD8000000070000 | (255 << 8) | (128 << 20) | (255 << 39)
+        ast = 0xEFF0000000070000 | (255 << 8) | (112 << 20) | (255 << 39)
+        capture = self.write("vertex.env", environment(47, 0, (ald, ast, MAXWELL_EXIT)))
+        for dynamic in (False, True):
+            for raw, expected in ((1, "float"), (2, "signed"), (3, "unsigned")):
+                with self.subTest(dynamic=dynamic, expected=expected):
+                    key = pipeline_key(raw1=1 << 5, dynamic_type=raw) if dynamic else pipeline_key(attribute={1: 7, 2: 3, 3: 4}[raw])
+                    path = self.write("pipeline.key", key)
+                    self.run_cli("--environment", capture, "--cache-version", 47, "--pipeline-key", path, "--output", self.output)
+                    self.assertEqual(interface_type(self.output.read_bytes(), 1), expected)
+                    self.validate()
+
+    def test_fragment_attachment_types(self):
+        capture = self.write("fragment.env", environment(47, 4))
+        for color, expected in ((0xD5, "float"), (0xD8, "signed"), (0xD9, "unsigned")):
+            with self.subTest(expected=expected):
+                key = self.write("pipeline.key", pipeline_key(color=color))
+                self.run_cli("--environment", capture, "--cache-version", 47, "--pipeline-key", key, "--output", self.output)
+                self.assertEqual(interface_type(self.output.read_bytes(), 3), expected)
+                self.validate()
+
+    def test_missing_constant_value_is_context_error(self):
+        mov = 0x4C98000000070000 | (15 << 39) | (1 << 34) | (0x10 << 20)
+        ast = 0xEFF0000000070000 | (255 << 8) | (112 << 20) | (255 << 39)
+        capture = self.write("vertex.env", environment(47, 0, (mov, ast, MAXWELL_EXIT)))
+        result = self.run_cli("--environment", capture, "--cache-version", 47, "--output", self.output, code=1)
+        self.assertEqual(result["phase"], "context")
+        self.assertIn("constant buffer", result["error"]["message"])
+
+
+if __name__ == "__main__":
+    unittest.main()
