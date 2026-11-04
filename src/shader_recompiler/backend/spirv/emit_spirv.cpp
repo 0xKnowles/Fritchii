@@ -99,7 +99,7 @@ void Invoke(EmitContext& ctx, IR::Inst* inst) {
     }
 }
 
-void EmitInst(EmitContext& ctx, IR::Inst* inst) {
+void EmitInst(EmitContext& ctx, IR::Inst* inst) try {
     switch (inst->GetOpcode()) {
 #define OPCODE(name, result_type, ...)                                                             \
     case IR::Opcode::name:                                                                         \
@@ -108,6 +108,10 @@ void EmitInst(EmitContext& ctx, IR::Inst* inst) {
 #undef OPCODE
     }
     throw LogicError("Invalid opcode {}", inst->GetOpcode());
+} catch (Shader::Exception& exception) {
+    exception.Prepend(fmt::format("SPIR-V emission failed at IR opcode {}: ",
+                                  IR::NameOf(inst->GetOpcode())));
+    throw;
 }
 
 Id TypeId(const EmitContext& ctx, IR::Type type) {

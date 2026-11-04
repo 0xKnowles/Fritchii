@@ -8,6 +8,7 @@
 #include <catch2/generators/catch_generators.hpp>
 
 #include "shader_recompiler/environment.h"
+#include "shader_recompiler/backend/nvn_storage_descriptor.h"
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/ir_opt/passes.h"
@@ -173,4 +174,62 @@ TEST_CASE("Native accesses without mapped pointers are not rebased on scalars",
     ir.WriteGlobal32(Address(ir, Word(ir, 0x310), Word(ir, 0x314)), ir.Imm32(1));
     CHECK(fixture.TrackedOffsets().empty());
     CHECK(fixture.entry.back().GetOpcode() == IR::Opcode::WriteGlobal32);
+}
+
+TEST_CASE("Loaded global pointers do not inherit the source buffer descriptor",
+          "[shader][storage_buffer]") {
+    const bool native = GENERATE(false, true);
+    for (const bool add_offset : {false, true}) {
+        KernelProgram fixture;
+        fixture.env.native = native;
+        IR::IREmitter ir{fixture.entry};
+        const auto source = Address(ir, Word(ir, 0x110), Word(ir, 0x114));
+        const auto loaded = ir.LoadGlobal64(source);
+        const IR::U32 low{ir.CompositeExtract(loaded, 0)};
+        const IR::U32 high{ir.CompositeExtract(loaded, 1)};
+        ir.WriteGlobal32(Address(ir, add_offset ? IR::U32{ir.IAdd(low, ir.Imm32(16))} : low, high),
+                         ir.Imm32(1));
+
+        CHECK(fixture.TrackedOffsets() == std::vector<u32>{0x110});
+        const auto has = [&](IR::Opcode opcode) {
+            return std::ranges::any_of(fixture.entry.Instructions(), [=](const IR::Inst& inst) {
+                return inst.GetOpcode() == opcode;
+            });
+        };
+        CHECK(has(IR::Opcode::LoadStorage64));
+        CHECK(has(IR::Opcode::WriteGlobal32));
+        CHECK_FALSE(has(IR::Opcode::WriteStorage32));
+        REQUIRE(fixture.program.info.storage_buffers_descriptors.size() == 1);
+        CHECK_FALSE(fixture.program.info.storage_buffers_descriptors.front().is_written);
+    }
+}
+
+TEST_CASE("NVN fallback descriptors use guest slots rather than compact binding indices",
+          "[shader][storage_buffer]") {
+    Shader::Info info{};
+    info.nvn_buffer_base = 0x310;
+    info.nvn_buffer_used.set(3);
+    info.nvn_buffer_used.set(15);
+    const std::vector<Shader::StorageBufferDescriptor> descriptors{
+        {1, 0x340, 1, false},
+        {0, 0x340, 1, false},
+        {0, 0x400, 1, false},
+        {0, 0x330, 1, false},
+        {0, 0x341, 1, false},
+        {0, 0x410, 1, false},
+        {0, 0x300, 1, false},
+    };
+    const auto selected = [&](const auto& ordered) {
+        std::vector<u32> offsets;
+        for (const auto& descriptor : ordered) {
+            if (Shader::Backend::UsesNvnStorageDescriptor(info, descriptor)) {
+                offsets.push_back(descriptor.cbuf_offset);
+            }
+        }
+        return offsets;
+    };
+    CHECK(selected(descriptors) == std::vector<u32>{0x340, 0x400});
+    auto reversed = descriptors;
+    std::ranges::reverse(reversed);
+    CHECK(selected(reversed) == std::vector<u32>{0x400, 0x340});
 }
