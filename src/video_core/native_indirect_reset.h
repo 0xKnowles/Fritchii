@@ -31,9 +31,10 @@ struct ListRange {
     size_t bytes;
 };
 
-inline std::optional<ListRange> GetListRange(u64 list, u32 first, u32 count) {
+inline std::optional<ListRange> GetListRange(u64 list, u32 list_size, u32 first, u32 count) {
+    const u64 entries = list_size / sizeof(u64);
     // Refuse oversized draws, rather than silently resetting only a prefix.
-    if (count == 0 || count > (1U << 20)) {
+    if (!list || count == 0 || count > (1U << 20) || first > entries || count > entries - first) {
         return std::nullopt;
     }
     const u64 offset = u64{first} * sizeof(u64);

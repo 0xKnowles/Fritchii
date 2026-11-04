@@ -2248,8 +2248,8 @@ void TextureCache<P>::InvalidateScale(Image& image) {
 
 #ifndef NDEBUG
         if constexpr (ENABLE_VALIDATION) {
-            std::ranges::fill(channel_info.graphics_image_table.bound_ids, CORRUPT_ID);
-            std::ranges::fill(channel_info.compute_image_table.bound_ids, CORRUPT_ID);
+            std::ranges::fill(channel_info.graphics_image_table.LiveBoundIds(), CORRUPT_ID);
+            std::ranges::fill(channel_info.compute_image_table.LiveBoundIds(), CORRUPT_ID);
         }
 #endif
         channel_info.graphics_image_table.Invalidate();
@@ -3469,8 +3469,8 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         auto& channel_info = channel_storage[c];
 #ifndef NDEBUG
         if constexpr (ENABLE_VALIDATION) {
-            std::ranges::fill(channel_info.graphics_image_table.bound_ids, CORRUPT_ID);
-            std::ranges::fill(channel_info.compute_image_table.bound_ids, CORRUPT_ID);
+            std::ranges::fill(channel_info.graphics_image_table.LiveBoundIds(), CORRUPT_ID);
+            std::ranges::fill(channel_info.compute_image_table.LiveBoundIds(), CORRUPT_ID);
         }
 #endif
         channel_info.graphics_image_table.Invalidate();

@@ -209,6 +209,9 @@ RendererVulkan::~RendererVulkan() {
 }
 
 void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebuffers) {
+    const bool trace = Common::DkbFrameTrace::Enabled();
+    const auto entered = trace ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
     SCOPE_EXIT {
         render_window.OnFrameDisplayed();
     };
@@ -220,7 +223,11 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     }
 
     RenderScreenshot(framebuffers);
+    const auto acquiring = trace ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point{};
     Frame* frame = present_manager.GetRenderFrame();
+    const auto acquired = trace ? std::chrono::steady_clock::now()
+                                : std::chrono::steady_clock::time_point{};
 
     scheduler.RequestOutsideRenderPassOperationContext();
     blit_swapchain.DrawToFrame(device, rasterizer, frame, framebuffers,
@@ -244,15 +251,43 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     }
 #endif
 
+    if (trace) {
+        scheduler.MarkFrameEnd(++trace_frame);
+    }
     scheduler.Flush(*frame->render_ready);
 
+    const auto presenting = trace ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
     present_manager.Present(frame);
+    const auto presented = trace ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point{};
 #ifdef HAS_LSFG
     scheduler.DispatchWork();
 #endif
 
     gpu.RendererFrameEndNotify();
     rasterizer.TickFrame();
+    if (trace) {
+        const auto end = std::chrono::steady_clock::now();
+        const auto ms = [](auto duration) {
+            return std::chrono::duration<double, std::milli>(duration).count();
+        };
+        if (trace_cpu_rate.Ready(end)) {
+            LOG_INFO(Render_Vulkan,
+                     "DKB renderer renderer_frame={} host_pacing_mode={} vsync_mode={} "
+                     "cpu_frame_wall_ms={:.3f} "
+                     "cpu_composite_wall_ms={:.3f} capture_wall_ms={:.3f} "
+                     "acquire_frame_wall_ms={:.3f} record_submit_wall_ms={:.3f} "
+                     "present_call_wall_ms={:.3f} frame_end_wall_ms={:.3f}",
+                     trace_frame, static_cast<int>(Settings::values.frame_pacing_mode.GetValue()),
+                     static_cast<int>(Settings::values.vsync_mode.GetValue()),
+                     trace_last_frame == std::chrono::steady_clock::time_point{}
+                         ? -1.0 : ms(entered - trace_last_frame),
+                     ms(end - entered), ms(acquiring - entered), ms(acquired - acquiring),
+                     ms(presenting - acquired), ms(presented - presenting), ms(end - presented));
+        }
+        trace_last_frame = entered;
+    }
 }
 
 void RendererVulkan::Report() const {
