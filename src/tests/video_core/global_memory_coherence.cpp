@@ -53,6 +53,7 @@ public:
     std::array<u32, 3> WorkgroupSize() const override { return {32, 1, 1}; }
     bool HasHLEMacroState() const override { return false; }
     bool HasNativeInstructions() const override { return native; }
+    bool IsNativeProgram() const override { return native; }
     std::optional<ReplaceConstant> GetReplaceConstBuffer(u32, u32) override { return std::nullopt; }
     void Dump(u64, u64) override {}
     bool native;
@@ -90,6 +91,46 @@ std::vector<std::vector<u32>> Instructions(const std::vector<u32>& code, u32 opc
     }
     return result;
 }
+
+struct GlobalAtomicProgram : Program {
+    explicit GlobalAtomicProgram(bool native, s64 displacement = 4, bool atomic = true) {
+        TestEnvironment env{native};
+        profile.support_int64 = true;
+        profile.support_descriptor_aliasing = true;
+        profile.unified_descriptor_binding = true;
+        IR::IREmitter ir{block};
+        const auto word = [&](u32 bank, u32 offset) {
+            return ir.GetCbuf(ir.Imm32(bank), ir.Imm32(offset));
+        };
+        const u32 first = native ? 0x168 : 0x340;
+        const u32 second = native ? 0x178 : 0x400;
+        const auto lane = ir.LocalInvocationIdX();
+        const auto select_first = ir.IEqual(ir.BitwiseAnd(lane, ir.Imm32(1)), ir.Imm32(0));
+        const auto low = ir.Select(select_first, word(0, first), word(0, second));
+        const auto high = ir.Select(select_first, word(0, first + 4), word(0, second + 4));
+        const IR::U64 address{ir.IAdd(ir.PackUint2x32(ir.CompositeConstruct(low, high)),
+                                     ir.Imm64(displacement))};
+        const IR::U32 previous{atomic ? IR::U32{ir.GlobalAtomicIAdd(address, ir.Imm32(1))}
+                                     : ir.LoadGlobal32(address)};
+        const IR::U32 index{ir.IAdd(ir.IMul(ir.WorkgroupIdX(), ir.Imm32(32)), lane)};
+        const IR::U32 offset{ir.ShiftLeftLogical(index, ir.Imm32(2))};
+        if (native) {
+            const auto output = ir.PackUint2x32(ir.CompositeConstruct(
+                ir.IAdd(word(1, 0), offset), word(1, 4)));
+            ir.WriteGlobal32(output, previous);
+            HostTranslateInfo host{};
+            host.min_ssbo_alignment = 16;
+            Optimization::GlobalMemoryToStorageBufferPass(env, program, host);
+        } else {
+            block.AppendNewInst(IR::Opcode::WriteStorage32, {ir.Imm32(0), offset, previous});
+            program.info.storage_buffers_descriptors = {
+                {1, 0, 1, true}, {0, first, 1, true}, {0, second, 1, true},
+            };
+        }
+        Optimization::CollectShaderInfoPass(env, program);
+        program.info.constant_buffer_descriptors = {{0, 1}, {1, 1}};
+    }
+};
 } // namespace
 
 TEST_CASE("Native LDG cache policy reaches every global load width", "[video_core][coherence]") {
@@ -387,6 +428,109 @@ TEST_CASE("SPIR-V emission failures identify the unsupported IR opcode",
             const std::string message{exception.what()};
             CHECK(message.find(IR::NameOf(opcode)) != std::string::npos);
             CHECK(message.find("SPIR-V Instruction is not implemented") != std::string::npos);
+        }
+    }
+}
+
+TEST_CASE("Global atomic add preserves native candidate selection and atomic old values",
+          "[shader][spirv][global_atomic]") {
+    for (const bool native : {true, false}) {
+        CAPTURE(native);
+        GlobalAtomicProgram fixture{native};
+        const auto& info = fixture.program.info;
+        REQUIRE(info.native_global_bounds == native);
+        REQUIRE(info.storage_buffers_descriptors.size() == 3);
+        CHECK(std::ranges::all_of(info.storage_buffers_descriptors,
+                                  [](const auto& descriptor) { return descriptor.is_written; }));
+        if (native) {
+            CHECK(info.storage_buffers_descriptors[0].cbuf_offset == 0x168);
+            CHECK(info.storage_buffers_descriptors[1].cbuf_offset == 0x178);
+            CHECK(info.nvn_buffer_used.none());
+        } else {
+            CHECK(info.nvn_buffer_used.test(3));
+            CHECK(info.nvn_buffer_used.test(15));
+        }
+        REQUIRE(std::ranges::count_if(fixture.block.Instructions(), [](const IR::Inst& inst) {
+            return inst.GetOpcode() == IR::Opcode::GlobalAtomicIAdd32;
+        }) == 1);
+        const auto code = Backend::SPIRV::EmitSPIRV(fixture.profile, fixture.program);
+        const auto atomics = Instructions(code, 234);
+        REQUIRE(atomics.size() == (native ? 3 : 2));
+        std::map<u32, u32> constants;
+        std::map<u32, u32> pointer_bases;
+        std::map<u32, u32> bindings;
+        for (const auto& op : Instructions(code, 43)) {
+            if (op.size() == 3) constants[op[1]] = op[2];
+        }
+        for (const auto& op : Instructions(code, 65)) {
+            if (op.size() >= 3) pointer_bases[op[1]] = op[2];
+        }
+        for (const auto& op : Instructions(code, 71)) {
+            if (op.size() == 3 && op[1] == 33) bindings[op[0]] = op[2];
+        }
+        const auto returns = Instructions(code, 254);
+        std::set<u32> atomic_bindings;
+        for (const auto& op : atomics) {
+            REQUIRE(op.size() == 6);
+            CHECK(constants.at(op[3]) == 1);
+            CHECK(constants.at(op[4]) == 0);
+            CHECK(std::ranges::any_of(returns, [&](const auto& returned) {
+                return returned.size() == 1 && returned[0] == op[1];
+            }));
+            atomic_bindings.insert(bindings.at(pointer_bases.at(op[2])));
+        }
+        CHECK(atomic_bindings == (native ? std::set<u32>{2, 3, 4} : std::set<u32>{3, 4}));
+    }
+}
+
+TEST_CASE("Global loads do not emit unused atomic helpers", "[shader][spirv][global_atomic]") {
+    GlobalAtomicProgram fixture{true, 4, false};
+    const auto code = Backend::SPIRV::EmitSPIRV(fixture.profile, fixture.program);
+    CHECK(Instructions(code, 234).empty());
+}
+
+TEST_CASE("Global atomic add rejects unsupported 64-bit addressing",
+          "[shader][spirv][global_atomic]") {
+    TestEnvironment env;
+    Program fixture;
+    IR::IREmitter ir{fixture.block};
+    static_cast<void>(ir.GlobalAtomicIAdd(ir.Imm64(u64{0}), ir.Imm32(1)));
+    Optimization::CollectShaderInfoPass(env, fixture.program);
+    try {
+        static_cast<void>(Backend::SPIRV::EmitSPIRV(fixture.profile, fixture.program));
+        FAIL("Global atomic add silently ignored missing address support");
+    } catch (const Shader::NotImplementedException& exception) {
+        const std::string message{exception.what()};
+        CHECK(message.find("GlobalAtomicIAdd32") != std::string::npos);
+        CHECK(message.find("64-bit integers") != std::string::npos);
+    }
+}
+
+TEST_CASE("Global atomic add without a routable buffer remains an explicit failure",
+          "[shader][spirv][global_atomic]") {
+    for (const u32 scenario : {0U, 1U, 2U, 3U}) {
+        CAPTURE(scenario);
+        TestEnvironment env;
+        Program fixture;
+        fixture.profile.support_int64 = true;
+        fixture.profile.support_descriptor_aliasing = true;
+        IR::IREmitter ir{fixture.block};
+        static_cast<void>(ir.GlobalAtomicIAdd(ir.Imm64(u64{0x1200001000}), ir.Imm32(1)));
+        Optimization::CollectShaderInfoPass(env, fixture.program);
+        auto& info = fixture.program.info;
+        info.native_global_bounds = scenario == 1;
+        if (scenario >= 2) {
+            info.storage_buffers_descriptors = {{scenario == 2 ? 1U : 0U, 0x340, 1, true}};
+            info.nvn_buffer_used.set(scenario == 2 ? 3 : 15);
+            info.constant_buffer_descriptors = {{0, 1}, {1, 1}};
+        }
+        try {
+            static_cast<void>(Backend::SPIRV::EmitSPIRV(fixture.profile, fixture.program));
+            FAIL("Unrouteable global atomic add silently compiled as a no-op");
+        } catch (const Shader::NotImplementedException& exception) {
+            const std::string message{exception.what()};
+            CHECK(message.find("GlobalAtomicIAdd32") != std::string::npos);
+            CHECK(message.find("no routable storage buffer") != std::string::npos);
         }
     }
 }
