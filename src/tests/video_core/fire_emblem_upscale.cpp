@@ -4,6 +4,7 @@
 #include <limits>
 #include <catch2/catch_test_macros.hpp>
 #include "shader_recompiler/exception.h"
+#include "shader_recompiler/frontend/ampere/instruction.h"
 #include "video_core/fire_emblem_upscale.h"
 
 namespace {
@@ -118,4 +119,57 @@ TEST_CASE("FE invalid camera jitter clears the earlier frame", "[fe_upscale]") {
     REQUIRE_FALSE(state.Take());
     state.Capture(0x1000, 1280, 0, {});
     REQUIRE_FALSE(state.Take());
+}
+
+TEST_CASE("Star Fox spatial replacement selects only its captured output", "[starfox_upscale]") {
+    constexpr u64 program_id = 0x0400E88025B1A000ULL;
+    constexpr u64 prepass = 0xd686ca0b9fad9e6dULL;
+    constexpr u64 output = 0x7d3764ff101bec27ULL;
+    for (const char* option : {static_cast<const char*>(nullptr), "fsr", "dlss"}) {
+        REQUIRE(FE::UseReplacement(program_id, output, option));
+        REQUIRE_FALSE(FE::UseReplacement(program_id, prepass, option));
+        REQUIRE_FALSE(FE::UseReplacement(program_id, FE::OutputProgramKey, option));
+        REQUIRE_FALSE(FE::UseReplacement(FE::ProgramId, output, option));
+    }
+    for (const char* option : {"native", "0", "", "invalid"}) {
+        REQUIRE_FALSE(FE::UseReplacement(program_id, output, option));
+    }
+    for (unsigned bit = 0; bit < 64; ++bit) {
+        REQUIRE_FALSE(FE::UseReplacement(program_id, output ^ (1ULL << bit), nullptr));
+        REQUIRE_FALSE(FE::UseReplacement(program_id ^ (1ULL << bit), output, nullptr));
+    }
+    for (const u64 shader : {0x4027797e061f5eb4ULL, 0x0cbf774bc3b02cbdULL,
+                            0x4f21fa94fc963d1cULL, 0xd4b6c9a1c0035421ULL}) {
+        REQUIRE_FALSE(FE::UseReplacement(program_id, shader, nullptr));
+    }
+}
+
+TEST_CASE("Star Fox captured passes use the validated colour and jitter slots", "[starfox_upscale]") {
+    using Shader::Ampere::Instruction;
+    constexpr Instruction prepass_color{{0x020c7b66, 0x30009e1d, 0x009e0f06, 0x00014200}};
+    constexpr Instruction output_color{{0x050e7b66, 0x3000ca0e, 0x009e0f10, 0x000f4200}};
+    constexpr Instruction output_store{{0x52003b9b, 0x6000d234, 0x0010af00, 0x0007e200}};
+    constexpr Instruction secondary_store{{0x0e003b9b, 0x6000d434, 0x0010af00, 0x0001e200}};
+    constexpr Instruction jitter_x{{0x07077621, 0x00006c00, 0x00010000, 0x000fe400}};
+    constexpr Instruction jitter_y{{0x05057621, 0x00006d00, 0x00010000, 0x000fc600}};
+    for (const auto instruction : {prepass_color, output_color, output_store, secondary_store,
+                                  jitter_x, jitter_y}) {
+        REQUIRE(instruction.Bits(54, 5) == 0);
+    }
+    REQUIRE(prepass_color.Bits(40, 14) * 4 == FE::PrepassColorOffset);
+    REQUIRE(output_color.Bits(40, 14) * 4 == FE::OutputColorInputOffset);
+    REQUIRE(output_store.Bits(40, 14) * 4 == FE::OutputColorOffset);
+    REQUIRE(secondary_store.Bits(40, 14) * 4 == 0x350);
+    REQUIRE(jitter_x.Bits(38, 16) == FE::JitterOffset);
+    REQUIRE(jitter_y.Bits(38, 16) == FE::JitterOffset + sizeof(f32));
+
+    const auto starfox = FE::CapturedPasses(FE::StarFoxProgramId);
+    REQUIRE(starfox);
+    REQUIRE(starfox->prepass == 0xd686ca0b9fad9e6dULL);
+    REQUIRE(starfox->output == 0x7d3764ff101bec27ULL);
+    REQUIRE(starfox->spatial_only);
+    const auto fire_emblem = FE::CapturedPasses(FE::ProgramId);
+    REQUIRE(fire_emblem);
+    REQUIRE_FALSE(fire_emblem->spatial_only);
+    REQUIRE_FALSE(FE::CapturedPasses(0x040074A01BF12000ULL));
 }

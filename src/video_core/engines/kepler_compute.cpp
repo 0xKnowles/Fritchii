@@ -614,11 +614,19 @@ constexpr u32 DLSS_NETWORK_BAD_CHECKS = 10;
 constexpr u32 DLSS_CHECK_MISMATCH_PERCENT = 3;
 } // Anonymous namespace
 
-bool KeplerCompute::ProcessFireEmblemDlss(u64 native_key) {
+bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
     using namespace VideoCommon::FireEmblemUpscale;
-    if (native_key == PrepassProgramKey) {
+    const auto passes = CapturedPasses(program_id);
+    if (!passes) {
+        return false;
+    }
+    if (passes->spatial_only && (native_key == passes->prepass || native_key == passes->output)) {
+        TraceDlssContract(native_key, false);
+    }
+    if (native_key == passes->prepass) {
         CaptureFireEmblemJitter();
         dlss_chain.active = true;
+        dlss_chain.spatial_only = passes->spatial_only;
         dlss_chain.rejected = 0;
         dlss_chain.dispatches = 0;
         dlss_chain.pending.clear();
@@ -627,14 +635,17 @@ bool KeplerCompute::ProcessFireEmblemDlss(u64 native_key) {
         return false;
     }
     dlss_chain.pending.insert(native_key);
-    dlss_chain.output_pass = native_key == OutputProgramKey;
+    dlss_chain.output_pass = native_key == passes->output;
+    if (dlss_chain.spatial_only) {
+        return false;
+    }
     const bool replacement = dlss_chain.failure != VideoCore::GameDlssReason::None ||
                              GameDlssBlocker() != VideoCore::GameDlssReason::None;
     if (dlss_chain.output_pass) {
         return replacement && FinishDlssEvaluation();
     }
     return dlss_chain.failure != VideoCore::GameDlssReason::None &&
-           native_key != PrepassProgramKey &&
+           native_key != passes->prepass &&
            dlss_chain.programs.contains(native_key);
 }
 
@@ -796,6 +807,18 @@ void KeplerCompute::UpdateGameDlssStatus(bool complete, VideoCore::GameDlssReaso
 bool KeplerCompute::FinishDlssEvaluation() {
     dlss_chain.active = false;
     dlss_chain.output_pass = false;
+    if (dlss_chain.spatial_only) {
+        dlss_chain.pending.clear();
+        using namespace VideoCommon::FireEmblemUpscale;
+        if (UseReplacement(StarFoxProgramId, StarFoxOutputProgramKey,
+                           std::getenv("EDEN_NX2_DLSS_REPLACEMENT"))) {
+            return TryFireEmblemUpscale(false);
+        }
+        dlss_motion_vectors.reset();
+        dlss_depth.reset();
+        (void)fe_upscale_jitter.Take();
+        return false;
+    }
     dlss_chain.programs.insert(dlss_chain.pending.begin(), dlss_chain.pending.end());
     dlss_chain.pending.clear();
     const bool complete = dlss_chain.rejected == 0;
@@ -902,6 +925,7 @@ void KeplerCompute::RememberDlssMotionVectors() {
 }
 
 void KeplerCompute::CaptureFireEmblemJitter() {
+    using namespace VideoCommon::FireEmblemUpscale;
     (void)fe_upscale_jitter.Take();
     dlss_motion_vectors.reset();
     dlss_depth.reset();
@@ -911,7 +935,7 @@ void KeplerCompute::CaptureFireEmblemJitter() {
         !memory_manager.IsFullyMappedRange(address, 0x27c)) {
         return;
     }
-    const u32 index = memory_manager.Read<u32>(address + 0x278) & 0xfffff;
+    const u32 index = memory_manager.Read<u32>(address + PrepassColorOffset) & 0xfffff;
     if (index > regs.tic.limit || !memory_manager.IsFullyMappedRange(
             regs.tic.Address() + u64{index} * sizeof(Texture::TICEntry), sizeof(Texture::TICEntry))) {
         return;
@@ -921,14 +945,14 @@ void KeplerCompute::CaptureFireEmblemJitter() {
         return;
     }
     fe_upscale_jitter.Capture(color.Address(), color.Width(), color.Height(),
-        {std::bit_cast<f32>(memory_manager.Read<u32>(address + 0x1b0)),
-         std::bit_cast<f32>(memory_manager.Read<u32>(address + 0x1b4))});
+        {std::bit_cast<f32>(memory_manager.Read<u32>(address + JitterOffset)),
+         std::bit_cast<f32>(memory_manager.Read<u32>(address + JitterOffset + sizeof(f32)))});
     RememberDlssMotionVectors();
 }
 
-void KeplerCompute::TraceDlssContract(u64 native_key) {
+void KeplerCompute::TraceDlssContract(u64 native_key, bool warn_unvalidated) {
     static bool reported{};
-    if (!reported) {
+    if (warn_unvalidated && !reported) {
         reported = true;
         LOG_WARNING(HW_GPU, "Fast Fusion temporal replacement is not selected: motion, depth, jitter and reset contract is unvalidated; native dispatches retained. EDEN_NX2_DLSS_CONTRACT_TRACE enables bounded evidence capture");
     }
@@ -977,20 +1001,24 @@ void KeplerCompute::TraceDlssContract(u64 native_key) {
     }
 }
 
-bool KeplerCompute::TryFireEmblemUpscale() {
-    static const bool use_history = [] {
+bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
+    using namespace VideoCommon::FireEmblemUpscale;
+    static const bool requested_history = [] {
         const char* const option = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
         return option && (std::string_view{option} == "fsr" || std::string_view{option} == "dlss");
     }();
+    const bool use_history = allow_history && requested_history;
+    const size_t game_index = dlss_chain.spatial_only ? 1 : 0;
+    const char* const game = dlss_chain.spatial_only ? "Star Fox" : "Fire Emblem";
     const auto jitter = fe_upscale_jitter.Take();
     const auto motion = std::exchange(dlss_motion_vectors, std::nullopt);
     const auto depth = std::exchange(dlss_depth, std::nullopt);
     if (!jitter || (use_history && (!motion || !depth))) {
-        static bool reported{};
-        if (!reported) {
-            reported = true;
-            LOG_WARNING(HW_GPU, "Fire Emblem replacement lacks current inputs: jitter={} motion={} depth={} temporal={}; retaining native dispatch",
-                        jitter.has_value(), motion.has_value(), depth.has_value(), use_history);
+        static std::array<bool, 2> reported{};
+        if (!reported[game_index]) {
+            reported[game_index] = true;
+            LOG_WARNING(HW_GPU, "{} replacement lacks current inputs: jitter={} motion={} depth={} temporal={}; retaining native dispatch",
+                        game, jitter.has_value(), motion.has_value(), depth.has_value(), use_history);
         }
         return false;
     }
@@ -1008,8 +1036,8 @@ bool KeplerCompute::TryFireEmblemUpscale() {
         }
         return GetTICEntry(index);
     };
-    const auto input = image(0x328);
-    const auto output = image(0x348);
+    const auto input = image(OutputColorInputOffset);
+    const auto output = image(OutputColorOffset);
     if (!input || !output || !VideoCommon::FireEmblemUpscale::ValidPair(*input, *output) ||
         jitter->color != input->Address() || (use_history && dlss_motion_color != input->Address()) ||
         jitter->width != input->Width() || jitter->height != input->Height()) {
@@ -1035,10 +1063,12 @@ bool KeplerCompute::TryFireEmblemUpscale() {
         use_history ? surface(*motion, Tegra::RenderTargetFormat::R16G16_FLOAT) : Fermi2D::Surface{},
         use_history ? &*depth : nullptr, jitter->offset,
         use_history ? std::array{1.0f, 1.0f} : std::array{0.0f, 0.0f}, use_history);
-    static u32 logged{};
-    if (logged++ < 8) {
-        LOG_INFO(HW_GPU, "Fire Emblem DLSS replacement: {}",
-                 done ? "applied" : "unavailable; retaining native dispatch");
+    static std::array<u32, 2> logged{};
+    if (logged[game_index]++ < 8) {
+        LOG_INFO(HW_GPU, "{} DLSS replacement: {} temporal={} input={:#x} {}x{} output={:#x} {}x{} jitter={},{}",
+                 game, done ? "applied" : "unavailable; retaining native dispatch", use_history,
+                 input->Address(), input->Width(), input->Height(), output->Address(),
+                 output->Width(), output->Height(), jitter->offset[0], jitter->offset[1]);
     }
     return done;
 }

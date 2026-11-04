@@ -16,6 +16,29 @@ constexpr u64 ProgramId = 0x04007EF01F8AE000ULL;
 // NativeProgramKey of the captured DLSS final output pass, not its lowered shader hash.
 constexpr u64 OutputProgramKey = 0x14b4222bbe23abeeULL;
 constexpr u64 PrepassProgramKey = 0x4cbf6eff32525aecULL;
+constexpr u64 StarFoxProgramId = 0x0400E88025B1A000ULL;
+constexpr u64 StarFoxPrepassProgramKey = 0xd686ca0b9fad9e6dULL;
+constexpr u64 StarFoxOutputProgramKey = 0x7d3764ff101bec27ULL;
+constexpr u32 PrepassColorOffset = 0x278;
+constexpr u32 JitterOffset = 0x1b0;
+constexpr u32 OutputColorInputOffset = 0x328;
+constexpr u32 OutputColorOffset = 0x348;
+
+struct Passes {
+    u64 prepass;
+    u64 output;
+    bool spatial_only;
+};
+
+constexpr std::optional<Passes> CapturedPasses(u64 program_id) {
+    if (program_id == ProgramId) {
+        return Passes{PrepassProgramKey, OutputProgramKey, false};
+    }
+    if (program_id == StarFoxProgramId) {
+        return Passes{StarFoxPrepassProgramKey, StarFoxOutputProgramKey, true};
+    }
+    return std::nullopt;
+}
 
 struct JitterSample {
     GPUVAddr color{};
@@ -45,7 +68,8 @@ private:
 };
 
 inline bool UseReplacement(u64 program_id, u64 native_key, const char* option) {
-    return program_id == ProgramId && native_key == OutputProgramKey &&
+    const auto passes = CapturedPasses(program_id);
+    return passes && native_key == passes->output &&
            (option == nullptr || (std::string_view{option} == "fsr" || std::string_view{option} == "dlss"));
 }
 
