@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -25,7 +26,6 @@ constexpr u64 ReadOffset = 0x44;
 constexpr u64 WriteOffset = 0x1004;
 constexpr u64 PayloadOffset = 0x1040;
 constexpr u32 BlockFrames = 240;
-constexpr u32 FrameBytes = 8;
 
 u64 AlignUp(u64 value, u64 alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
@@ -104,6 +104,8 @@ struct SysmixOutput::Impl {
     u64 buffer;
     u64 size;
     u32 creation_flags;
+    AudioCore::SampleFormat format{};
+    u32 frame_bytes{};
     u32 slots{};
     u32 consumer{};
     u32 data_mode{};
@@ -112,7 +114,7 @@ struct SysmixOutput::Impl {
     bool open{};
     bool engaged{};
     bool faulted{};
-    std::array<f32, BlockFrames * 2> input{};
+    std::array<u8, BlockFrames * 2 * sizeof(f32)> input{};
     std::array<s16, BlockFrames * 2> output{};
     SysmixOutputCounters counters{};
 };
@@ -134,20 +136,29 @@ Result SysmixOutput::ValidateRegion(Kernel::KProcess& process, u64 buffer, u64 s
     R_SUCCEED();
 }
 
+bool SysmixOutput::IsFormatSupported(u32 sample_type, u32 channels, u32 rate) {
+    return (sample_type == static_cast<u32>(AudioCore::SampleFormat::PcmInt16) ||
+            sample_type == static_cast<u32>(AudioCore::SampleFormat::PcmFloat)) &&
+           channels == 2 && rate == 48000;
+}
+
 Result SysmixOutput::Open(u32 sample_type, u32 channels, u32 rate, u32 frames, u32 prefill,
                           u32 flags) {
     auto& p = *impl;
     std::scoped_lock lock{p.mutex};
     R_UNLESS(!p.open, ResultOperationFailed);
-    R_UNLESS(sample_type == 5 && channels == 2 && rate == 48000 && prefill == 0 && flags == 0,
+    R_UNLESS(IsFormatSupported(sample_type, channels, rate) && prefill == 0 && flags == 0,
              ResultNotSupported);
     R_UNLESS(frames > 0 && frames < static_cast<u32>(std::numeric_limits<s32>::max()),
              ResultInvalidArgument);
     R_TRY(ValidateRegion(*p.process, p.buffer, p.size, p.creation_flags));
     const u64 slots = u64{frames} + 1;
+    const auto format = static_cast<AudioCore::SampleFormat>(sample_type);
+    const u32 frame_bytes = channels *
+        (format == AudioCore::SampleFormat::PcmInt16 ? sizeof(s16) : sizeof(f32));
     const u64 minimum = AlignUp(0x1000 + AlignUp(0x40 + std::min<u64>(16, slots) * 8, 64) +
-                                   AlignUp(slots * FrameBytes, 64), 0x1000);
-    R_UNLESS(p.size >= minimum && PayloadOffset + slots * FrameBytes <= p.size,
+                                   AlignUp(slots * frame_bytes, 64), 0x1000);
+    R_UNLESS(p.size >= minimum && PayloadOffset + slots * frame_bytes <= p.size,
              ResultInsufficientBuffer);
     R_UNLESS(p.state_event && p.data_event, ResultOutOfSessions);
     u32 read{}, write{};
@@ -165,6 +176,8 @@ Result SysmixOutput::Open(u32 sample_type, u32 channels, u32 rate, u32 frames, u
         R_RETURN(ResultOperationFailed);
     }
     p.slots = static_cast<u32>(slots);
+    p.format = format;
+    p.frame_bytes = frame_bytes;
     p.consumer = read;
     p.faulted = false;
     p.open = true;
@@ -173,8 +186,9 @@ Result SysmixOutput::Open(u32 sample_type, u32 channels, u32 rate, u32 frames, u
     p.counters = {};
     p.state_event->Signal(p.system.Kernel());
     p.Notify(static_cast<u32>((write + slots - read) % slots));
-    LOG_INFO(Service_Audio, "sysmix stream {} host ready: F32 stereo 48000 slots={} payload={:#x}",
-             p.id, p.slots, PayloadOffset);
+    LOG_INFO(Service_Audio,
+             "sysmix stream {} host ready: sample type {} stereo 48000 slots={} payload={:#x}",
+             p.id, sample_type, p.slots, PayloadOffset);
     R_SUCCEED();
 }
 
@@ -257,10 +271,11 @@ void SysmixOutput::Pump() {
     const u32 first = std::min(taken, p.slots - read);
     const u32 second = taken - first;
     auto& memory = p.process->GetMemory();
-    if ((first && !memory.ReadBlock(p.buffer + PayloadOffset + u64{read} * FrameBytes,
-                                    p.input.data(), first * FrameBytes)) ||
-        (second && !memory.ReadBlock(p.buffer + PayloadOffset, p.input.data() + first * 2,
-                                     second * FrameBytes))) {
+    if ((first && !memory.ReadBlock(p.buffer + PayloadOffset + u64{read} * p.frame_bytes,
+                                    p.input.data(), first * p.frame_bytes)) ||
+        (second && !memory.ReadBlock(p.buffer + PayloadOffset,
+                                     p.input.data() + first * p.frame_bytes,
+                                     second * p.frame_bytes))) {
         p.Fault();
         return;
     }
@@ -271,7 +286,14 @@ void SysmixOutput::Pump() {
         bool audible{};
         for (u32 channel = 0; channel < 2; ++channel) {
             const u32 index = frame * 2 + channel;
-            const f32 value = p.input[index];
+            f32 value;
+            if (p.format == AudioCore::SampleFormat::PcmInt16) {
+                s16 sample;
+                std::memcpy(&sample, p.input.data() + index * sizeof(sample), sizeof(sample));
+                value = static_cast<f32>(sample) / 32768.0f;
+            } else {
+                std::memcpy(&value, p.input.data() + index * sizeof(value), sizeof(value));
+            }
             if (std::isfinite(value)) {
                 const auto sample = static_cast<s32>(std::clamp(value * p.gain, -1.0f, 1.0f) * 32768.0f);
                 p.output[index] = static_cast<s16>(std::clamp(sample, -32768, 32767));

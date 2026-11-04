@@ -37,6 +37,7 @@ public:
     ~SysmixOutput();
     static Result ValidateRegion(Kernel::KProcess& process, u64 buffer, u64 size,
                                  u32 creation_flags);
+    static bool IsFormatSupported(u32 sample_type, u32 channels, u32 rate);
     Result Open(u32 sample_type, u32 channels, u32 rate, u32 frames, u32 prefill, u32 flags);
     void Close();
     Result SetEngaged(bool engaged);

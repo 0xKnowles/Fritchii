@@ -35,7 +35,7 @@ TEST_CASE("sysmix validates the exact F32 ring allocation and rejects unsupporte
     Context context;
     SysmixOutput stream{context.system, *context.process, context.sink, 1, Context::Base,
                         Context::Size, 0x24};
-    REQUIRE(stream.Open(2, 2, 48000, 2048, 0, 0).IsFailure());
+    REQUIRE(stream.Open(3, 2, 48000, 2048, 0, 0).IsFailure());
     REQUIRE(stream.Open(5, 1, 48000, 2048, 0, 0).IsFailure());
     REQUIRE(stream.Open(5, 2, 44100, 2048, 0, 0).IsFailure());
     REQUIRE(stream.Open(5, 2, 48000, 2048, 1, 0).IsFailure());
@@ -77,6 +77,45 @@ TEST_CASE("sysmix copies the physical extra slot and wrap then publishes consume
     REQUIRE(std::ranges::all_of(std::span{output}.subspan(4), [](s16 value) { return value == 0; }));
     REQUIRE(context.backing[0x5048] == 0);
     REQUIRE(context.backing[0x5fff] == 0);
+}
+
+TEST_CASE("sysmix plays the Sports Resort Q15 movie ring including wrap and gain", "[sysmix]") {
+    Context context;
+    Cursor(context, 960, 1);
+    const std::array<s16, 2> last{16384, -16384};
+    const std::array<s16, 2> first{32767, -32768};
+    REQUIRE(context.Memory().WriteBlock(Context::Base + 0x1040 + 960 * 4,
+                                        last.data(), sizeof(last)));
+    REQUIRE(context.Memory().WriteBlock(Context::Base + 0x1040, first.data(), sizeof(first)));
+    SysmixOutput stream{context.system, *context.process, context.sink, 1, Context::Base,
+                        0x3000, 0x24};
+    REQUIRE(stream.Open(2, 2, 48000, 960, 0, 0).IsSuccess());
+    REQUIRE(stream.SetGain(0.5f, 0).IsSuccess());
+    REQUIRE(stream.SetDataNotification(2, 480).IsSuccess());
+    REQUIRE(stream.SetEngaged(true).IsSuccess());
+    stream.Pump();
+    REQUIRE(ReadCursor(context) == 1);
+    REQUIRE(stream.GetCounters().accepted_frames == 2);
+    REQUIRE(stream.GetCounters().nonzero_frames == 2);
+    std::array<s16, 480> output{};
+    context.sink.last->ProcessAudioOutAndRender(output, 240);
+    REQUIRE(output[0] == 8192);
+    REQUIRE(output[1] == -8192);
+    REQUIRE(output[2] == 16383);
+    REQUIRE(output[3] == -16384);
+    REQUIRE(std::ranges::all_of(std::span{output}.subspan(4), [](s16 value) { return value == 0; }));
+    REQUIRE(stream.GetDataEvent()->IsSignaled(context.system.Kernel()));
+}
+
+TEST_CASE("sysmix advertises only implemented stereo PCM formats", "[sysmix]") {
+    REQUIRE(SysmixOutput::IsFormatSupported(2, 2, 48000));
+    REQUIRE(SysmixOutput::IsFormatSupported(5, 2, 48000));
+    for (const u32 format : {0U, 1U, 3U, 4U, 6U, 258U, 261U}) {
+        REQUIRE_FALSE(SysmixOutput::IsFormatSupported(format, 2, 48000));
+    }
+    REQUIRE_FALSE(SysmixOutput::IsFormatSupported(2, 1, 48000));
+    REQUIRE_FALSE(SysmixOutput::IsFormatSupported(2, 6, 48000));
+    REQUIRE_FALSE(SysmixOutput::IsFormatSupported(2, 2, 44100));
 }
 
 TEST_CASE("sysmix mode2 event uses actual free frames even before engagement", "[sysmix]") {

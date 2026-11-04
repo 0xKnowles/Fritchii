@@ -148,9 +148,13 @@ private:
         const auto channels = rp.Pop<u32>();
         const auto rate = rp.Pop<u32>();
         const auto functionality = rp.Pop<u32>();
+        const auto result = SysmixOutput::IsFormatSupported(type, channels, rate) && functionality == 1
+                                ? ResultSuccess : ResultNotSupported;
+        LOG_DEBUG(Service_Audio,
+                  "format support: sample type {}, {} channels, {} Hz, functionality {}, result {:#x}",
+                  type, channels, rate, functionality, result.raw);
         IPC::ResponseBuilder rb{ctx, 2};
-        rb.Push(type == 5 && channels == 2 && rate == 48000 && functionality == 1
-                    ? ResultSuccess : ResultNotSupported);
+        rb.Push(result);
     }
 
     // Property block: name (0x000), u32 type (0x100, 3), u32 (0x104, 2), u32 channel count
