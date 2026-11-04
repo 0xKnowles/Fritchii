@@ -15,6 +15,10 @@ Users report game bugs with Lichii logs (`eden_log.txt`, `eden_log.txt.old`). Ea
 | 04007C6028AA8000 | Yoshi and the Mysterious Book (demo) |
 | 0400D4201C6EA000 | Mario Tennis Fever |
 | 0400E88025B1A000 | Star Fox |
+| 04007EF01F8AE000 | Fire Emblem: Fortune's Weave |
+| 0400C3F00006E000 | Mario Kart World |
+| 04008E001F098000 | Nintendo Switch Sports Resort |
+| 0400A3A01EE4C000 | Pokémon Pokopia |
 
 Add ids here when a report identifies a new game.
 
