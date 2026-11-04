@@ -32,6 +32,7 @@ Lichii is a fork of [Eglantine](https://github.com/Djihads80/Eglantine). Do not 
 - One subagent per game, all running in parallel.
 - Small research (upstream PR and issue surveys, log reading): a cheap model, DeepSeek V4.1 Flash at max reasoning when its endpoint is available.
 - Hard fixes (emulation, shaders, GPU): GPT-6 Astra at high reasoning.
+- When a GPT-6 Astra subagent can't find the cause, switch that subagent to Claude Opus 5.5 at high reasoning.
 - The main thread (Opus) orchestrates and reviews.
 
 ## Builds
