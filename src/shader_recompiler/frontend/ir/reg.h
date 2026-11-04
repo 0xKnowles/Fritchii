@@ -271,7 +271,8 @@ enum class Reg : u64 {
 static_assert(static_cast<int>(Reg::RZ) == 255);
 
 constexpr size_t NUM_USER_REGS = 255;
-// Native lowering stores high guest registers and borrowed values in separate SSA banks.
+// Native lowering keeps shadowed guest registers and borrowed scratch registers in two more banks
+// of 256 (R256-R767). Only native register copies (a MOV form Maxwell code never uses) reach them.
 constexpr size_t NUM_REGS = 768;
 
 [[nodiscard]] constexpr Reg operator+(Reg reg, int num) {

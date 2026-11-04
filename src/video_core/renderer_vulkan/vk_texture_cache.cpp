@@ -1199,12 +1199,12 @@ void UseBc3ForSwitch2OnSmallCards(const Device& device) {
     const u64 budget = device.GetDeviceMemoryBudget();
     const u64 memory = budget != 0 ? budget : device.GetDeviceLocalMemory();
     const char* keep = std::getenv("EDEN_NX2_KEEP_ASTC");
-    if (memory >= 12_GiB || (keep != nullptr && keep[0] == '1')) {
+    if (memory >= 20_GiB || (keep != nullptr && keep[0] == '1')) {
         return;
     }
     LOG_WARNING(Render_Vulkan,
                 "Switch 2 program with a {} MiB video memory budget: ASTC textures are "
-                "re-compressed to BC3 for this session (uncompressed ASTC needs a 12 GiB budget). "
+                "re-compressed to BC3 for this session (uncompressed ASTC needs a 20 GiB budget). "
                 "Set EDEN_NX2_KEEP_ASTC=1 to keep them uncompressed",
                 memory >> 20);
     Settings::SetAstcRecompressionOverride(Settings::AstcRecompression::Bc3);
@@ -1731,6 +1731,28 @@ bool TextureCacheRuntime::WantsTemporalUpscaleDepth() const {
     }
 #endif
     return !fsr3_unsupported;
+}
+
+bool TextureCacheRuntime::UsesNvidiaDlss() const {
+#ifdef EGLANTINE_STREAMLINE
+    static const bool force_fsr = [] {
+        const char* const value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
+        return value && std::string_view{value} == "fsr";
+    }();
+    return !force_fsr && !dlss_unsupported && Streamline::IsDlssAvailable();
+#else
+    return false;
+#endif
+}
+
+std::optional<VideoCore::GameDlssProbe> TextureCacheRuntime::ProbeGameDlssOutput(
+    ImageView& input, ImageView& output) {
+    if (!dlss_network_probe) {
+        dlss_network_probe = std::make_unique<DlssNetworkProbe>(
+            device, scheduler, descriptor_pool, compute_pass_descriptor_queue, memory_allocator);
+    }
+    return dlss_network_probe->Probe(input.Handle(Shader::TextureType::Color2D),
+                                     output.Handle(Shader::TextureType::Color2D));
 }
 
 bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageView& input_color,
@@ -4687,6 +4709,8 @@ void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
                                     ImageView* depth_buffer, bool is_rescaled_) {
     boost::container::small_vector<VkImageView, NUM_RT * 2 + 2> attachments;
     RenderPassKey renderpass_key{};
+    // A framebuffer can't have more layers than any of its attachments: one with more layers
+    // than a color target makes the driver write the extra layers past that image's memory.
     s32 num_layers = (std::numeric_limits<s32>::max)();
 
     is_rescaled = is_rescaled_;

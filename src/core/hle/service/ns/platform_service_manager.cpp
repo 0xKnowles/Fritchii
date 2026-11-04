@@ -210,11 +210,18 @@ void IPlatformServiceManager::GetBuiltInFontSharedMemory(HLERequestContext& ctx)
     rb.PushCopyObjects(ctx, *impl->builtin_font_memory);
 }
 
+// nn::pl::GetBuiltInFontData(BuiltInFontDataOunce*, BuiltInFontTypeOunce, bool): returns a 16-byte
+// bool that says whether the font exists and a 16-byte descriptor (u8 flags, u8 flag bit, u16,
+// u32 offset into the font shared memory, u32 size, u32). The client expects plain TrueType/OpenType
+// data there. The types are the SharedFontType values: the SDK's GetSharedFontAddress and
+// GetSharedFontSize pass their type through unchanged.
 void IPlatformServiceManager::GetBuiltInFontData(HLERequestContext& ctx) {
+    // The SDK packs the type in the first byte and the bool in the second; the two bytes after them
+    // are padding, left as whatever was on the caller's stack.
     IPC::RequestParser rp{ctx};
-    const auto request = rp.PopRaw<std::array<u8, 2>>();
-    const u8 type = request[0];
-    const bool flag = request[1] != 0;
+    const u32 args = rp.Pop<u32>();
+    const u32 type = args & 0xff;
+    const bool flag = ((args >> 8) & 1) != 0;
     const auto& regions = impl->builtin_font_regions;
     const bool found = type < regions.size();
     const FontRegion region = found ? regions[type] : EMPTY_REGION;

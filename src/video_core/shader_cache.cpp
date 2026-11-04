@@ -251,7 +251,6 @@ const ShaderInfo* ShaderCache::ComputeShader() {
     }
     // Check both warm and cold shader paths, before selecting a disk-cached pipeline.
     // EDEN_NX2_DLSS_REPLACEMENT=native retains the native network for comparisons.
-    static const char* const replacement_option = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
     if (kepler_compute->IsNativeMode() && shader->lowered_native &&
         DlssContract::IsFastFusionCandidate(program_id,
                                             shader->lowered_native->native_program_key)) {
@@ -259,13 +258,7 @@ const ShaderInfo* ShaderCache::ComputeShader() {
     }
     if (kepler_compute->IsNativeMode() && shader->lowered_native &&
         program_id == FireEmblemUpscale::ProgramId &&
-        shader->lowered_native->native_program_key == FireEmblemUpscale::PrepassProgramKey) {
-        kepler_compute->CaptureFireEmblemJitter();
-    }
-    if (kepler_compute->IsNativeMode() && shader->lowered_native &&
-        FireEmblemUpscale::UseReplacement(
-            program_id, shader->lowered_native->native_program_key, replacement_option) &&
-        kepler_compute->TryFireEmblemUpscale()) {
+        kepler_compute->ProcessFireEmblemDlss(shader->lowered_native->native_program_key)) {
         throw FireEmblemUpscale::DispatchReplaced{};
     }
     return shader;
