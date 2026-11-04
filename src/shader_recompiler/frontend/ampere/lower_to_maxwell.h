@@ -3718,7 +3718,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 const bool pending_main_branch = std::any_of(
                     relocations.begin(), relocations.end(), [&](const Relocation& relocation) {
                         return !relocation.call && relocation.target > index &&
-                               relocation.target != geometry_exit->handler / sizeof(Instruction);
+                               relocation.target !=
+                                   static_cast<s64>(geometry_exit->handler / sizeof(Instruction));
                     });
                 if (geometry_exit->has_returns && native_predicate == 7 && !main_exited && !pending_main_branch &&
                     !call_targets.empty()) {
