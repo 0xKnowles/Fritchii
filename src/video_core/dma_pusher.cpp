@@ -120,7 +120,10 @@ bool DmaPusher::Step() {
     }
 
     if (header.size > 0) {
-        if (g_nx2_ampere.load(std::memory_order_relaxed)) {
+        // EDEN_NX2_FETCH_DRAIN=1: wait for the back before every entry, as before the split
+        // overlapped the two halves again.
+        static const bool fetch_drain = std::getenv("EDEN_NX2_FETCH_DRAIN") != nullptr;
+        if (fetch_drain && g_nx2_ampere.load(std::memory_order_relaxed)) {
             VideoCommon::GpuSplit::Get().Drain();
         }
         bool gpu_written = IsGpuWrittenCommands(dma_state.dma_get,
@@ -132,19 +135,7 @@ bool DmaPusher::Step() {
             if (kepler_payload || macro_payload) {
                 const size_t words = std::min<size_t>(dma_state.method_count, header.size);
                 auto* const engine_state = subchannels[dma_state.subchannel];
-                if (g_nx2_ampere.load(std::memory_order_relaxed) && words != 0) {
-                    // Fetch synchronization above already drained the back thread. A parameter
-                    // flush must also disqualify the older submission-time snapshot.
-                    const size_t bytes = words * sizeof(u32);
-                    if (memory_manager.IsMemoryDirty(dma_state.dma_get, bytes,
-                                                     VideoCommon::CacheType::BufferCache)) {
-                        memory_manager.FlushRegion(dma_state.dma_get, bytes,
-                                                   VideoCommon::CacheType::BufferCache);
-                        gpu_written = true;
-                    }
-                }
-                if (auto& split = VideoCommon::GpuSplit::Get();
-                    split.Active() && !g_nx2_ampere.load(std::memory_order_relaxed)) {
+                if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
                     // The caches behind IsMemoryDirty belong to the split's back thread.
                     split.Defer([engine_state, memory = &memory_manager, address = GPUVAddr{dma_state.dma_get},
                                  bytes = words * sizeof(u32)] {
@@ -638,6 +629,10 @@ bool DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
     if (!IsGpuWrittenCommands(address, size)) {
         return false;
     }
+    // The caches belong to the split's back: it first runs what the front queued (the dispatch
+    // that writes these words among it). The whole pages are flushed: their next lists read
+    // guest memory until GPU work writes them again.
+    VideoCommon::GpuSplit::Get().Drain();
     const GPUVAddr first_page = address & ~GPUVAddr{0xfff};
     const GPUVAddr end_page = (address + size + 0xfff) & ~GPUVAddr{0xfff};
     if (memory_manager.IsMemoryDirty(first_page, end_page - first_page,
