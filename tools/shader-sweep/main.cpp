@@ -144,7 +144,7 @@ public:
         for (u64 i = 0; i < format_count; ++i) {
             const u32 key = reader.Read<u32>();
             const u32 value = reader.Read<u32>();
-            if (value > static_cast<u32>(Shader::TexturePixelFormat::D32_FLOAT_S8_UINT)) {
+            if (value > std::numeric_limits<u8>::max()) {
                 throw std::runtime_error("Invalid texture pixel format");
             }
             texture_formats.emplace(key, static_cast<Shader::TexturePixelFormat>(value));

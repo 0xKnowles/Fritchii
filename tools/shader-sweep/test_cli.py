@@ -27,18 +27,20 @@ def header(stage):
     return struct.pack("<20I", *words)
 
 
-def environment(version, stage, instructions=(MAXWELL_EXIT,)):
+def environment(version, stage, instructions=(MAXWELL_EXIT,), formats=()):
     code = bytearray(header(stage))
     for instruction in instructions:
         if len(code) % 32 == 0:
             code += bytes(8)
         code += struct.pack("<Q", instruction)
-    counts = [len(code), 0, 0, 0, 0]
+    counts = [len(code), 0, len(formats), 0, 0]
     if version == 47:
         counts.append(0)
     record = struct.pack("<" + "Q" * len(counts), *counts)
     record += struct.pack("<7I", 0, 2, 80 if stage == 5 else 0, 0, len(code) - 8, 1, stage)
     record += code
+    for handle, pixel_format in formats:
+        record += struct.pack("<2I", handle, pixel_format)
     record += struct.pack("<4I", 1, 1, 1, 0) if stage == 5 else header(stage)
     if stage == 3:
         record += bytes(32)
@@ -164,6 +166,18 @@ class CliTests(unittest.TestCase):
         result = self.run_cli(source, "--environment", capture, "--cache-version", 47, "--output", self.output)
         self.assertEqual(result["stage"], "fragment")
         self.validate()
+
+    def test_surface_pixel_format_outside_shader_enum(self):
+        for version in (46, 47):
+            with self.subTest(version=version):
+                capture = self.write("shader.env", environment(version, 5, formats=((0, 111),)))
+                self.run_cli("--environment", capture, "--cache-version", version, "--output", self.output)
+                self.validate()
+
+    def test_pixel_format_exceeds_serialized_domain(self):
+        capture = self.write("shader.env", environment(47, 5, formats=((0, 256),)))
+        result = self.run_cli("--environment", capture, "--cache-version", 47, "--output", self.output, code=2)
+        self.assertEqual(result["error"]["message"], "Invalid texture pixel format")
 
     def test_truncated_records_and_trailing_data(self):
         full = environment(47, 3)
