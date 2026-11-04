@@ -2656,15 +2656,18 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         case 0x322: { // AST
             const bool patch = insn.Bits(76, 1) != 0;
             const bool output = insn.Bits(79, 1) != 0;
+            const u32 address = insn.Bits(40, 10);
+            const u32 components = insn.Bits(74, 2) + 1;
+            const bool tessellation_coordinates =
+                tessellation_stage == TessellationStage::Evaluation && opcode == 0x321 &&
+                !patch && address >= 0x2f0 && address + components * 4 <= 0x2f8;
             if (insn.Bits(77, 1) || (patch && tessellation_stage == TessellationStage::None) ||
-                (output && (!patch || opcode != 0x321)) ||
+                (output && ((!patch && !tessellation_coordinates) || opcode != 0x321)) ||
                 (patch && opcode == 0x321 &&
                  output != (tessellation_stage == TessellationStage::Control)) ||
                 (patch && opcode == 0x322 && tessellation_stage != TessellationStage::Control)) {
                 return fail(index, "native indexed/patch attribute access");
             }
-            const u32 address = insn.Bits(40, 10);
-            const u32 components = insn.Bits(74, 2) + 1;
             if (address % 4 || address + components * 4 > 0x400 || insn.Bits(24, 8) != 255) {
                 return fail(index, "native attribute address or indexing");
             }

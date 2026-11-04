@@ -109,12 +109,65 @@ constexpr std::array<Instruction, 79> TennisControl{{
     {{0x0000794d, 0x00000000, 0x03800000, 0x000fea00}},
 }};
 
+constexpr std::array<u32, 5> TennisEvaluationHeaderPrefix{0x000c0c81, 0, 0, 0, 0xbd0bc000};
+
+constexpr std::array<Instruction, 47> TennisEvaluation{{
+    {{0x00007919, 0x00000000, 0x00001d00, 0x000e2800}},
+    {{0xff0c7321, 0x000018ff, 0x00001000, 0x000e6200}},
+    {{0x00017816, 0x00007772, 0x000000ff, 0x041fe400}},
+    {{0x00007816, 0x00007770, 0x000000ff, 0x000fe400}},
+    {{0x0100720c, 0x000000ff, 0x03f03070, 0x040fe400}},
+    {{0x0100780c, 0x00000001, 0x03f23070, 0x040fe200}},
+    {{0x01027224, 0x00000000, 0x078e02ff, 0x0c0fe200}},
+    {{0x0100780c, 0x00000002, 0x03f43070, 0x040fe200}},
+    {{0x01037424, 0x00000001, 0x078e0200, 0x0c0fe200}},
+    {{0x0100780c, 0x00000003, 0x03f63070, 0x040fe200}},
+    {{0x01047424, 0x00000002, 0x078e0200, 0x0c0fe200}},
+    {{0x020a7923, 0x00000000, 0x00000000, 0x000e2200}},
+    {{0x01057424, 0x00000003, 0x078e0200, 0x000fc600}},
+    {{0x030b7923, 0x00000000, 0x00000000, 0x000ea800}},
+    {{0x040d7923, 0x00000000, 0x00000000, 0x000ee800}},
+    {{0x050e7923, 0x00000000, 0x00000000, 0x000f2800}},
+    {{0x00007919, 0x00000000, 0x00000000, 0x000f6800}},
+    {{0xff007322, 0x0000800c, 0x000000ff, 0x002fe200}},
+    {{0x000a0802, 0x80000000, 0x00000f00, 0x001fc400}},
+    {{0x000b1802, 0x80000000, 0x00000f00, 0x004fc600}},
+    {{0xff037321, 0x0000700a, 0x00000000, 0x000fe200}},
+    {{0x000d2802, 0x80000000, 0x00000f00, 0x008fc600}},
+    {{0xff027321, 0x0000700b, 0x00000000, 0x000e2200}},
+    {{0x000e3802, 0x80000000, 0x00000f00, 0x010fc600}},
+    {{0xff067321, 0x0000700d, 0x00000000, 0x000fe800}},
+    {{0xff097321, 0x0000700e, 0x00000000, 0x000e6800}},
+    {{0xff057321, 0x0000780a, 0x00000000, 0x000fe800}},
+    {{0xff047321, 0x0000780b, 0x00000000, 0x000ea800}},
+    {{0xff077321, 0x0000780d, 0x00000000, 0x000fe800}},
+    {{0xff087321, 0x0000780e, 0x00000000, 0x000ee200}},
+    {{0x03027221, 0x00000002, 0x00010100, 0x001fc600}},
+    {{0xff007321, 0x0002f000, 0x00008400, 0x020e2200}},
+    {{0x06067221, 0x80000009, 0x00010000, 0x002fe200}},
+    {{0x05047221, 0x00000004, 0x00010100, 0x004fe200}},
+    {{0x07077221, 0x80000008, 0x00010000, 0x108fe200}},
+    {{0x00027223, 0x00000002, 0x00010003, 0x041fe200}},
+    {{0x00097223, 0x00000006, 0x00010009, 0x040fe200}},
+    {{0x00047223, 0x00000004, 0x00010005, 0x040fe200}},
+    {{0x00077223, 0x00000007, 0x00010008, 0x000fe200}},
+    {{0x000b7202, 0x00000001, 0x00000f00, 0x000fe200}},
+    {{0x02097221, 0x00000009, 0x00010100, 0x000fe400}},
+    {{0x04077221, 0x00000007, 0x00010100, 0x000fc400}},
+    {{0x01087223, 0x00000009, 0x00010002, 0x040fe200}},
+    {{0x00097202, 0x00000000, 0x00000f00, 0x000fe200}},
+    {{0x010a7223, 0x00000007, 0x00010004, 0x000fca00}},
+    {{0xff007322, 0x00007008, 0x00000cff, 0x000fe200}},
+    {{0x0000794d, 0x00000000, 0x03800000, 0x000fea00}},
+}};
+
 class TessellationEnvironment final : public Shader::Environment {
 public:
-    TessellationEnvironment(std::span<const u64> code_, Shader::Stage stage_) : code{code_} {
+    TessellationEnvironment(std::span<const u64> code_, Shader::Stage stage_,
+                            std::span<const u32> header = TennisHeader) : code{code_} {
         stage = stage_;
         is_proprietary_driver = true;
-        std::memcpy(&sph, TennisHeader.data(), sizeof(sph));
+        std::memcpy(&sph, header.data(), (std::min)(header.size_bytes(), sizeof(sph)));
         if (stage == Shader::Stage::TessellationEval) {
             sph.common0.shader_type.Assign(3);
         }
@@ -271,4 +324,60 @@ TEST_CASE("Native tessellation vertex handles retain only supported ISBERD map r
             REQUIRE_FALSE(LowerToMaxwell(std::array{invalid, Exit}, false, false, {}, stage));
         }
     }
+}
+
+TEST_CASE("Captured Mario Tennis Fever evaluation shader reads both tessellation coordinates",
+          "[video_core][ampere][tessellation][tennis_evaluation]") {
+    const auto lowered = LowerToMaxwell(TennisEvaluation, false, true, {}, TessellationStage::Evaluation);
+    INFO(lowered.error << " at " << lowered.error_offset);
+    REQUIRE(lowered);
+    REQUIRE(lowered.source_size == sizeof(TennisEvaluation));
+    const u64 coordinates = lowered.instructions[lowered.source_instruction_offsets[0x1f0 / 16]];
+    REQUIRE(((coordinates >> 20) & 0x3ff) == 0x2f0);
+    REQUIRE(((coordinates >> 31) & 1) == 0);
+    REQUIRE(((coordinates >> 32) & 1) == 1);
+    REQUIRE(((coordinates >> 47) & 3) == 1);
+    TessellationEnvironment env{lowered.instructions, Shader::Stage::TessellationEval,
+                               TennisEvaluationHeaderPrefix};
+    Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_pool;
+    Shader::Maxwell::Flow::CFG cfg{env, flow_pool, Shader::Maxwell::Location{0x50}};
+    Shader::ObjectPool<IR::Inst> inst_pool;
+    Shader::ObjectPool<IR::Block> block_pool;
+    auto program = Shader::Maxwell::TranslateProgram(inst_pool, block_pool, env, cfg,
+                                                     Shader::HostTranslateInfo{});
+    REQUIRE(program.info.loads[IR::Attribute::TessellationEvaluationPointU]);
+    REQUIRE(program.info.loads[IR::Attribute::TessellationEvaluationPointV]);
+    REQUIRE(program.info.stores.AllComponents(IR::Attribute::PositionX));
+    REQUIRE(program.info.stores[IR::Attribute::Generic0X]);
+    REQUIRE(program.info.uses_patches[0]);
+    REQUIRE(program.info.uses_invocation_info);
+    Shader::Profile profile{};
+    profile.supported_spirv = 0x00010300;
+    Shader::RuntimeInfo runtime{};
+    runtime.tess_primitive = Shader::TessPrimitive::Quads;
+    Shader::Backend::Bindings bindings{};
+    const auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime, program, bindings);
+    REQUIRE(spirv.size() > 5);
+    REQUIRE(spirv[0] == 0x07230203);
+}
+
+TEST_CASE("Tessellation output-coordinate loads remain confined to evaluation U and V",
+          "[video_core][ampere][tessellation][tennis_evaluation]") {
+    const Instruction coordinates{{0xff007321, 0x0002f000, 0x00008400, 0x020e2200}};
+    for (const auto stage : {TessellationStage::None, TessellationStage::Control}) {
+        REQUIRE_FALSE(LowerToMaxwell(std::array{coordinates, Exit}, false, false, {}, stage));
+    }
+    REQUIRE_FALSE(LowerToMaxwell(std::array{coordinates, Exit}, true));
+    for (const Instruction invalid : std::array{
+             Instruction{{0xff007321, 0x0002f800, 0x00008000, 0}},
+             Instruction{{0xff007321, 0x0002f000, 0x00008800, 0}},
+             Instruction{{0xff007321, 0x0002f400, 0x00008400, 0}},
+             Instruction{{0xff007321, 0x0002f000, 0x0000a400, 0}},
+             Instruction{{0x01007321, 0x0002f000, 0x00008400, 0}},
+             Instruction{{0xff007321, 0x00007000, 0x00008400, 0}},
+         }) {
+        REQUIRE_FALSE(LowerToMaxwell(std::array{invalid, Exit}, false, false, {}, TessellationStage::Evaluation));
+    }
+    const Instruction v{{0xff007321, 0x0002f400, 0x00008000, 0}};
+    REQUIRE(LowerToMaxwell(std::array{v, Exit}, false, false, {}, TessellationStage::Evaluation));
 }
