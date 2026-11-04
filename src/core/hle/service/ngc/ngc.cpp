@@ -7,14 +7,12 @@
 #include "common/string_util.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_client_session.h"
-#include "core/hle/kernel/k_event.h"
-#include "core/hle/kernel/svc_results.h"
 #include "core/hle/result.h"
 #include "core/hle/service/acc/profile_manager.h"
 #include "core/hle/service/cmif_types.h"
 #include "core/hle/service/cmif_serialization.h"
 #include "core/hle/service/ipc_helpers.h"
-#include "core/hle/service/kernel_helpers.h"
+#include "core/hle/service/ngc/guest_hid.h"
 #include "core/hle/service/ngc/ngc.h"
 #include "core/hle/service/server_manager.h"
 #include "core/hle/service/service.h"
@@ -183,10 +181,10 @@ static_assert(sizeof(SaveDataHandle) == 0x08);
 class IUserShimScopedObject final : public ServiceFramework<IUserShimScopedObject> {
 public:
     explicit IUserShimScopedObject(Core::System& system_)
-        : ServiceFramework(system_, "IUserShimScopedObject"), service_context{system_, "stpl:u"} {
+        : ServiceFramework(system_, "IUserShimScopedObject") {
         // clang-format off
         static const FunctionInfo functions[] = {
-            {300, D<&IUserShimScopedObject::GetEvent>, "GetEvent"},
+            {300, &IUserShimScopedObject::GetGuestHidSharedMemory, "GetGuestHidSharedMemory"},
             {450, nullptr, "InitializeForSaveData"},
             {451, nullptr, "FinalizeForSaveData"},
             {452, D<&IUserShimScopedObject::OpenSaveData>, "OpenSaveData"},
@@ -198,19 +196,16 @@ public:
         };
         // clang-format on
         RegisterHandlers(functions);
-        event = service_context.CreateEvent("IUserShimScopedObject:Event");
     }
 
     ~IUserShimScopedObject() override {
-        service_context.CloseEvent(event);
+        if (guest_hid_memory) {
+            guest_hid_memory->Close(kernel);
+        }
     }
 
-    // Donkey Kong Bananza asks for this right after stpl:u 0; the auto stub's reply carried no
-    // handle.
-    Result GetEvent(OutCopyHandle<Kernel::KReadableEvent> out_event) {
-        R_UNLESS(event != nullptr, Kernel::ResultOutOfResource);
-        *out_event = &event->GetReadableEvent();
-        R_SUCCEED();
+    void GetGuestHidSharedMemory(HLERequestContext& ctx) {
+        ReplyGuestHidSharedMemory(ctx, system, guest_hid_memory);
     }
 
     Result OpenSaveData(Account::Uid unk0, Out<SaveDataHandle> unk1) {
@@ -230,9 +225,12 @@ public:
     }
 
 private:
-    KernelHelpers::ServiceContext service_context;
-    Kernel::KEvent* event{};
+    Kernel::KSharedMemory* guest_hid_memory{};
 };
+
+std::shared_ptr<ServiceFrameworkBase> CreateStreamPlayUserService(Core::System& system) {
+    return std::make_shared<IUserShimScopedObject>(system);
+}
 
 class IUserService final : public ServiceFramework<IUserService> {
 public:
@@ -244,9 +242,9 @@ public:
         // clang-format on
         RegisterHandlers(functions);
     }
-    Result Cmd0(u32 unk0, OutInterface<IUserShimScopedObject> out_interface) {
+    Result Cmd0(u32 unk0, OutInterface<ServiceFrameworkBase> out_interface) {
         LOG_WARNING(Service_NGC, "stubbed");
-        *out_interface = std::make_shared<IUserShimScopedObject>(system);
+        *out_interface = CreateStreamPlayUserService(system);
         R_SUCCEED();
     }
 };

@@ -800,6 +800,7 @@ add_library(core STATIC
     hle/service/nfp/nfp_types.h
     hle/service/ngc/ngc.cpp
     hle/service/ngc/ngc.h
+    hle/service/ngc/guest_hid.h
     hle/service/nifm/nifm.cpp
     hle/service/nifm/nifm.h
     hle/service/nim/nim.cpp
