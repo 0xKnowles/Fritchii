@@ -15,6 +15,7 @@ add_executable(tests
     audio_core/sysmix_test_context.h
     video_core/ampere_starfox_test10.cpp
     video_core/ampere_yoshi_title.cpp
+    video_core/ampere_yoshi_compute.cpp
     video_core/texture_rect_descriptor.cpp
     audio_core/batch_decoder.cpp
     audio_core/hardware_audio_codec.cpp
