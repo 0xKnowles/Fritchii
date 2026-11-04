@@ -147,6 +147,8 @@ def main():
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--timeout", type=int, default=60)
     parser.add_argument("--dump-game", default="Mario Tennis Fever")
+    parser.add_argument("--native-stage", action="append", default=[], metavar="KEY=STAGE",
+                        help="stage established by a capture log for a native filename hash")
     parser.add_argument("--contexts-from", type=Path,
                         help="prior results.json preserving native/cache matches across lowering changes")
     args = parser.parse_args()
@@ -157,6 +159,12 @@ def main():
     for path in args.inputs:
         if not path.exists():
             parser.error(f"input does not exist: {path}")
+    native_stages = {}
+    for mapping in args.native_stage:
+        key, separator, stage = mapping.partition("=")
+        if not separator or not re.fullmatch(r"[0-9a-f]{16}", key) or stage not in STAGES[:6]:
+            parser.error("--native-stage requires a 16-digit lowercase hash and a graphics/compute stage")
+        native_stages[key] = stage
     compiler = str(args.compiler.resolve())
     validator = shutil.which(args.spirv_val)
     if not validator:
@@ -217,6 +225,11 @@ def main():
             stage = "compute"
         if stage is None:
             stage = header_stages.get(identity)
+        explicit_stage = native_stages.get(path.name.split("-")[0])
+        if explicit_stage:
+            if stage is not None and explicit_stage != stage:
+                parser.error(f"explicit stage conflicts with capture metadata: {path}")
+            stage = explicit_stage
         fmt = "native-header" if rejected_stage is not None else "instructions"
         lower_path = records_dir / f"{identity}.lowered"
         cmd = [compiler, str(path), "--format", fmt, "--lower-only", str(lower_path)]

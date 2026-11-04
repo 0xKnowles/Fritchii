@@ -633,8 +633,13 @@ int main(int argc, char** argv) {
                 if (!verified)
                     throw MissingContext("Native trap guards could not be verified");
             }
+            const auto tessellation = env.ShaderStage() == Stage::TessellationControl
+                                          ? Shader::Ampere::TessellationStage::Control
+                                      : env.ShaderStage() == Stage::TessellationEval
+                                          ? Shader::Ampere::TessellationStage::Evaluation
+                                          : Shader::Ampere::TessellationStage::None;
             const auto lowered = Shader::Ampere::LowerToMaxwell(
-                native, env.ShaderStage() == Stage::Geometry, true, traps);
+                native, env.ShaderStage() == Stage::Geometry, true, traps, tessellation);
             if (!lowered) {
                 diagnostic["error"] = {{"code", "lowering_failed"},
                                        {"message", lowered.error},

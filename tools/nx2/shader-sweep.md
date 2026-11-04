@@ -68,11 +68,20 @@ game. Cache game labels come from their parent title-ID directory; unknown IDs r
 as IDs. Counts are distinct compile jobs, including different captured environments and pipeline
 keys, not draw counts. Identical native files are deduplicated by content.
 
+If a capture log establishes the stage of an uncached program, pass
+`--native-stage 0123456789abcdef=tess-eval`, using its filename hash. This supplies only the
+stage, not missing headers or resource data; full compilation still reports that context gap.
+
 ## Parser tests
 
 ```sh
 python3 -m unittest discover -s tools/nx2 -p test_shader_sweep.py -v
 ```
 
-Keep game captures and generated modules outside the repository. The report records source
-paths and byte offsets so a local failure can be reproduced without committing game data.
+Keep bulk game captures and generated modules outside the repository. The two small regression
+environments in `tools/shader-sweep/fixtures` preserve captured programs that exposed backend
+defects. Each records its source cache hash and byte offset. Run them with:
+
+```sh
+python3 tools/shader-sweep/test_captured.py /path/to/shader-sweep
+```
