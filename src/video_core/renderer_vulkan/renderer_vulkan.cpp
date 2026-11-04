@@ -23,6 +23,7 @@
 #include "video_core/capture.h"
 #include "video_core/gpu.h"
 #include "video_core/present.h"
+#include "video_core/render_trace.h"
 #include "video_core/renderer_vulkan/present/util.h"
 #ifdef HAS_RESHADE
 #include "video_core/post_processing/fx_chain.h"
@@ -271,6 +272,10 @@ void RendererVulkan::Report() const {
     LOG_INFO(Render_Vulkan, "Device: {}", model_name);
     LOG_INFO(Render_Vulkan, "Vulkan: {}", api_version);
     LOG_INFO(Render_Vulkan, "Available VRAM: {:.2f} GiB", available_vram);
+    if (VideoCommon::RenderTrace::Enabled()) {
+        LOG_INFO(Render_Vulkan, "Render trace enabled: interval=600 frames, log_filter={}",
+                 Settings::values.log_filter.GetValue());
+    }
     LOG_DEBUG(Render_Vulkan,
               "Render trace capabilities: geometry_shader={} transform_feedback={} "
               "geometry_streams={} mesh_shader={}",

@@ -610,6 +610,58 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
     if (native) {
         if (program != Maxwell::ShaderType::VertexB && program != Maxwell::ShaderType::Pixel &&
             program != Maxwell::ShaderType::Geometry && !mesh_slot) {
+            if (const char* directory = std::getenv("EDEN_NX2_SHADER_DUMP"); directory &&
+                gpu_memory->IsFullyMappedRange(program_base, 128)) {
+                constexpr u32 MaxCaptureInstructions = 4096;
+                std::array<u8, 128> header{};
+                gpu_memory->ReadBlock(program_base, header.data(), header.size());
+                std::vector<Shader::Ampere::Instruction> instructions;
+                Shader::Ampere::ProgramCaptureState capture;
+                auto status = Shader::Ampere::ProgramCaptureState::Result::Continue;
+                NativeInstructionReader reader{*gpu_memory};
+                for (u32 index = 0; index < MaxCaptureInstructions; ++index) {
+                    const GPUVAddr address = program_base + header.size() + index * 16;
+                    Shader::Ampere::Instruction instruction;
+                    if (!reader.TryRead(address, instruction)) {
+                        if (!gpu_memory->IsFullyMappedRange(address, sizeof(instruction))) {
+                            break;
+                        }
+                        gpu_memory->ReadBlock(address, &instruction, sizeof(instruction));
+                    }
+                    instructions.push_back(instruction);
+                    status = capture.Observe(instruction, index);
+                    if (status != Shader::Ampere::ProgramCaptureState::Result::Continue) {
+                        break;
+                    }
+                }
+                const auto folder = std::filesystem::path{directory};
+                std::error_code error;
+                std::filesystem::create_directories(folder, error);
+                if (error) {
+                    LOG_ERROR(Shader, "Cannot create rejected shader dump directory: {}",
+                              error.message());
+                } else {
+                    const auto path = folder / fmt::format("rejected-stage-{}-{:x}.bin",
+                                                          static_cast<u32>(program), program_base);
+                    std::ofstream dump(path, std::ios::binary);
+                    dump.write(reinterpret_cast<const char*>(header.data()), header.size());
+                    dump.write(reinterpret_cast<const char*>(instructions.data()),
+                               instructions.size() * sizeof(Shader::Ampere::Instruction));
+                    dump.close();
+                    if (dump) {
+                        LOG_INFO(Shader,
+                                 "Captured rejected native stage {} at {:#x}: {} header bytes, "
+                                 "{} instructions, complete={}, invalid_target={}, path={}",
+                                 static_cast<u32>(program), program_base, header.size(),
+                                 instructions.size(),
+                                 status == Shader::Ampere::ProgramCaptureState::Result::Complete,
+                                 status == Shader::Ampere::ProgramCaptureState::Result::InvalidTarget,
+                                 path.string());
+                    } else {
+                        LOG_ERROR(Shader, "Cannot write rejected shader dump {}", path.string());
+                    }
+                }
+            }
             throw Shader::RuntimeError("Unsupported native graphics shader stage {}", static_cast<u32>(program));
         }
         if (std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS")) {
