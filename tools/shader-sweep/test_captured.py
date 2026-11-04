@@ -36,11 +36,12 @@ def main():
             key = root / "pipeline.key"
             output = root / "shader.spv"
             env.write_bytes(serialize_environment(fixture["environment"]))
-            key.write_bytes(bytes.fromhex(fixture["pipeline_key"]))
-            compiled = subprocess.run([str(args.compiler.resolve()), "--environment", str(env),
-                                       "--cache-version", str(fixture["cache_version"]),
-                                       "--pipeline-key", str(key), "--output", str(output)],
-                                      capture_output=True, text=True, timeout=30)
+            command = [str(args.compiler.resolve()), "--environment", str(env),
+                       "--cache-version", str(fixture["cache_version"]), "--output", str(output)]
+            if "pipeline_key" in fixture:
+                key.write_bytes(bytes.fromhex(fixture["pipeline_key"]))
+                command += ["--pipeline-key", str(key)]
+            compiled = subprocess.run(command, capture_output=True, text=True, timeout=30)
             if compiled.returncode:
                 raise RuntimeError(f"{path.stem}: compiler exit {compiled.returncode}\n"
                                    f"{compiled.stdout}{compiled.stderr}")

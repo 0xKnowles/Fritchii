@@ -65,6 +65,8 @@ struct StorageInfo {
     StorageWritesSet writes;
     /// Constant buffer words that step strided iterators, see CollectIteratorWords
     StorageBufferSet iterator_words;
+    /// Constant buffer pointers a global atomic uses as its address, see CollectAtomicPointers
+    StorageBufferSet atomic_pointers;
     /// Track results by the instruction the search starts from, with and without the NVN bias:
     /// accesses through the same address share them, and a search can walk thousands of
     /// instructions (the IR does not change while storage buffers are collected).
@@ -872,6 +874,34 @@ StorageBufferSet CollectIteratorWords(IR::Program& program) {
     return result;
 }
 
+/// Finds the 64-bit constant buffer pointers that are the whole address of a global atomic, apart
+/// from an immediate offset. An atomic has no global fallback, so such a pointer is a buffer even
+/// while it is unmapped.
+StorageBufferSet CollectAtomicPointers(IR::Program& program) {
+    const auto word = [](const IR::U32& value) {
+        return value.IsImmediate() ? std::nullopt : CbufWord(value.InstRecursive());
+    };
+    StorageBufferSet result;
+    for (IR::Block* const block : program.post_order_blocks) {
+        for (IR::Inst& inst : block->Instructions()) {
+            if (!IsGlobalMemoryWrite(inst) || inst.Type() == IR::Type::Void) {
+                continue;
+            }
+            const std::optional<LowAddrInfo> addr{TrackLowAddress(&inst)};
+            if (!addr) {
+                continue;
+            }
+            const std::optional<StorageBufferAddr> low{word(addr->value)};
+            if (low && Common::IsAligned(low->offset, 8) &&
+                word(addr->high) ==
+                    StorageBufferAddr{.index = low->index, .offset = low->offset + 4}) {
+                result.insert(*low);
+            }
+        }
+    }
+    return result;
+}
+
 /// Finds the 64-bit constant buffer pointer summed into an address: its low word is summed into
 /// the low half and its high word into the high half. Iterator steps and 32-bit scalars such as
 /// strides and sizes are skipped. Competing bases require the legacy nearest-word fallback.
@@ -978,8 +1008,9 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
     }
     // First try to find storage buffers in the NVN address
     const IR::U32 low_addr{low_addr_info->value};
-    std::optional<StorageBufferAddr> storage_buffer{
+    const std::optional<StorageBufferAddr> paired_pointer{
         TrackPointerAddend(*low_addr_info, info.iterator_words, conditions)};
+    std::optional<StorageBufferAddr> storage_buffer{paired_pointer};
     const bool native = env.IsNativeProgram();
     if (native && storage_buffer &&
         !env.IsCbufStorageBufferPointer(storage_buffer->index, storage_buffer->offset)) {
@@ -1012,7 +1043,14 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
         }
     }
     if (native && !storage_buffer) {
-        return;
+        // A pointer that is an atomic's address keeps its buffer while unmapped, for the atomic
+        // and every access based on it: Bananza's append counters and the records stored after
+        // them were unmapped when their pipelines were first built. The binding reads the pointer
+        // again for every dispatch.
+        if (!paired_pointer || !info.atomic_pointers.contains(*paired_pointer)) {
+            return;
+        }
+        storage_buffer = paired_pointer;
     }
     const auto cached_track = [&](const Bias* bias, auto& cache) {
         if (low_addr.IsImmediate()) {
@@ -1183,6 +1221,7 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
     TrackingConditions conditions{program};
     StorageInfo info;
     info.iterator_words = CollectIteratorWords(program);
+    info.atomic_pointers = CollectAtomicPointers(program);
     for (IR::Block* const block : program.post_order_blocks) {
         for (IR::Inst& inst : block->Instructions()) {
             if (!IsGlobalMemory(inst)) {

@@ -176,6 +176,53 @@ TEST_CASE("Native accesses without mapped pointers are not rebased on scalars",
     CHECK(fixture.entry.back().GetOpcode() == IR::Opcode::WriteGlobal32);
 }
 
+TEST_CASE("Native append counters behind unmapped pointers become storage atomics",
+          "[shader][storage_buffer][global_atomic]") {
+    // Donkey Kong Bananza's compute programs add a ballot count to the counter whose pointer is
+    // at c0[0x1d0], or at c0[0x1e0]. The counter was unmapped when the pipeline was first built.
+    for (const u32 counter : {0x1d0U, 0x1e0U}) {
+        CAPTURE(counter);
+        KernelProgram fixture;
+        fixture.env.native = true;
+        fixture.env.scalar_offsets = {counter};
+        IR::IREmitter ir{fixture.entry};
+        const IR::Value pointer{ir.GetCbuf(ir.Imm32(0), ir.Imm32(counter), 64, false)};
+        const IR::U32 low{ir.CompositeExtract(pointer, 0)};
+        const IR::U32 high{ir.CompositeExtract(pointer, 1)};
+        const IR::Value old{ir.GlobalAtomicIAdd(Address(ir, low, high), ir.Imm32(32))};
+        ir.WriteGlobal32(Address(ir, Word(ir, 0x170), Word(ir, 0x174)), IR::U32{old});
+        const IR::U32 record{ir.IAdd(low, ir.IAdd(IR::U32{old}, ir.Imm32(16)))};
+        ir.WriteGlobal32(Address(ir, record, high), ir.Imm32(1));
+
+        CHECK(fixture.TrackedOffsets() == std::vector<u32>{0x170, counter});
+        CHECK_FALSE(fixture.program.info.native_global_bounds);
+        for (const auto& descriptor : fixture.program.info.storage_buffers_descriptors) {
+            CHECK(descriptor.is_written);
+        }
+        const auto count = [&](IR::Opcode opcode) {
+            return std::ranges::count_if(fixture.entry.Instructions(), [=](const IR::Inst& inst) {
+                return inst.GetOpcode() == opcode;
+            });
+        };
+        CHECK(count(IR::Opcode::StorageAtomicIAdd32) == 1);
+        CHECK(count(IR::Opcode::GlobalAtomicIAdd32) == 0);
+        CHECK(count(IR::Opcode::WriteStorage32) == 2);
+        CHECK(count(IR::Opcode::WriteGlobal32) == 0);
+    }
+}
+
+TEST_CASE("Native atomics offset from an unmapped pointer stay global",
+          "[shader][storage_buffer][global_atomic]") {
+    KernelProgram fixture;
+    fixture.env.native = true;
+    fixture.env.scalar_offsets = {0x1d0, 0x40};
+    IR::IREmitter ir{fixture.entry};
+    const IR::U32 low{ir.IAdd(Word(ir, 0x1d0), Word(ir, 0x40))};
+    static_cast<void>(ir.GlobalAtomicIAdd(Address(ir, low, Word(ir, 0x1d4)), ir.Imm32(1)));
+    CHECK(fixture.TrackedOffsets().empty());
+    CHECK(fixture.entry.back().GetOpcode() == IR::Opcode::GlobalAtomicIAdd32);
+}
+
 TEST_CASE("Loaded global pointers do not inherit the source buffer descriptor",
           "[shader][storage_buffer]") {
     const bool native = GENERATE(false, true);
