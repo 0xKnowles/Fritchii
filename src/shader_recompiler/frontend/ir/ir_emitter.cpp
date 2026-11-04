@@ -875,28 +875,12 @@ F32 IREmitter::FPSin(const F32& value) {
     return Inst<F32>(Opcode::FPSin, value);
 }
 
-F32 IREmitter::FPTanh(const F32& value) {
-    // Adapted from Duck912's stable TANH expansion. Express it in existing IR so all
-    // backends share the same approximation. Preserve signed zero and tiny/subnormal inputs.
-    const auto bits = BitCast<U32>(value);
-    const auto absolute_bits = BitwiseAnd(bits, Imm32(0x7fffffffU));
-    const auto absolute = BitCast<F32>(absolute_bits);
-    const F32 square{FPMul(absolute, absolute)};
-    const F32 fifth{FPAdd(Imm32(2.0f / 15.0f), FPMul(square, Imm32(-17.0f / 315.0f)))};
-    const F32 third{FPAdd(Imm32(-1.0f / 3.0f), FPMul(square, fifth))};
-    const F32 polynomial{FPAdd(absolute, FPMul(FPMul(absolute, square), third))};
-    const auto exponential = FPExp2(F32{FPMul(absolute, Imm32(-2.8853900817779268f))});
-    const F32 magnitude{FPMul(FPAdd(Imm32(1.0f), FPNeg(exponential)),
-                              FPRecip(F32{FPAdd(Imm32(1.0f), exponential)}))};
-    const F32 selected{Select(ILessThan(absolute_bits, Imm32(0x3d800000U), false),
-                              polynomial, magnitude)};
-    const U32 preserved{Select(ILessThan(absolute_bits, Imm32(0x39800000U), false),
-                               absolute_bits, BitCast<U32>(selected))};
-    return BitCast<F32>(BitwiseOr(preserved, BitwiseAnd(bits, Imm32(0x80000000U))));
-}
-
 F32 IREmitter::FPExp2(const F32& value) {
     return Inst<F32>(Opcode::FPExp2, value);
+}
+
+F32 IREmitter::FPTanh(const F32& value) {
+    return Inst<F32>(Opcode::FPTanh, value);
 }
 
 F32 IREmitter::FPLog2(const F32& value) {
