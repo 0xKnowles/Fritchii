@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <thread>
@@ -355,6 +356,22 @@ Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, 
     const GPUVAddr descriptor_addr{tic_addr + index * sizeof(Tegra::Texture::TICEntry)};
     Tegra::Texture::TICEntry entry;
     gpu_memory->ReadBlock(descriptor_addr, &entry, sizeof(entry));
+    if (entry.format.Value() == Tegra::Texture::TextureFormat{} &&
+        std::getenv("EDEN_NX2_RENDER_TRACE")) {
+        static std::atomic<u32> traces{};
+        if (traces.fetch_add(1, std::memory_order_relaxed) < 64) {
+            LOG_WARNING(HW_GPU,
+                        "Zero-format shader TIC: program={:#x} stage={} handle={:#x} "
+                        "index={} limit={} descriptor={:#x} mapped={} image={:#x} "
+                        "size={}x{}x{} header={} type={} raw={:016x}/{:016x}/{:016x}/{:016x}",
+                        program_base, static_cast<u32>(stage), raw, index, tic_limit,
+                        descriptor_addr, gpu_memory->IsFullyMappedRange(descriptor_addr, sizeof(entry)),
+                        entry.Address(), entry.Width(), entry.Height(), entry.Depth(),
+                        static_cast<u32>(entry.header_version.Value()),
+                        static_cast<u32>(entry.texture_type.Value()),
+                        entry.raw[0], entry.raw[1], entry.raw[2], entry.raw[3]);
+        }
+    }
     return entry;
 }
 

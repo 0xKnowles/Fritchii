@@ -2097,6 +2097,19 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
 template <class P>
 ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config) {
     const bool native = gpu_memory->UsesNativeTiling();
+    if (native && raw_config.format.Value() == Tegra::Texture::TextureFormat{} &&
+        RenderTrace::Enabled()) {
+        static u32 traces{};
+        if (traces++ < 64) {
+            LOG_WARNING(HW_GPU,
+                        "Zero-format image TIC: image={:#x} size={}x{}x{} header={} type={} "
+                        "raw={:016x}/{:016x}/{:016x}/{:016x}",
+                        raw_config.Address(), raw_config.Width(), raw_config.Height(),
+                        raw_config.Depth(), static_cast<u32>(raw_config.header_version.Value()),
+                        static_cast<u32>(raw_config.texture_type.Value()), raw_config.raw[0],
+                        raw_config.raw[1], raw_config.raw[2], raw_config.raw[3]);
+        }
+    }
     if (native && raw_config.BaseLayer() && NativeDrawDiagnostics()) {
         static u32 texture_view_traces{};
         if (texture_view_traces++ < 8) {

@@ -9,6 +9,9 @@
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
+#include <span>
+
+#include <boost/container/small_vector.hpp>
 
 #include "common/common_types.h"
 #include "common/thread_worker.h"
@@ -58,6 +61,15 @@ public:
         return static_cast<bool>(pipeline);
     }
 
+    [[nodiscard]] u64 ShaderHash() const noexcept {
+        return shader_hash;
+    }
+
+    /// Storage images written by the last configured dispatch
+    [[nodiscard]] std::span<const VideoCommon::ImageViewId> WrittenImages() const noexcept {
+        return written_images;
+    }
+
     /// Advances the frame window of EDEN_NX2_UPSCALER_TRACE
     static void TickUpscalerTrace();
 
@@ -69,6 +81,7 @@ private:
     Shader::Info info;
     u64 shader_hash{};
     u32 num_descriptor_entries{};
+    boost::container::small_vector<VideoCommon::ImageViewId, 8> written_images;
 
     VideoCommon::ComputeUniformBufferSizes uniform_buffer_sizes{};
 

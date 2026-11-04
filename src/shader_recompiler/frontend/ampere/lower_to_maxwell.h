@@ -279,7 +279,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         if (insn.Bits(12, 4) == 15) continue; // @!PT: never executes (compiler padding)
         std::optional<u32> active_link;
         u32 active_entry = 0;
-        if (main_exited) {
+        if (main_exited && (!geometry_exit || index * sizeof(Instruction) < geometry_exit->handler)) {
             for (size_t call = 0; call < call_targets.size(); ++call) {
                 if (call_targets[call] <= index && call_targets[call] >= active_entry) {
                     active_entry = call_targets[call];
@@ -3625,7 +3625,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             if (s64{index} * 16 + 16 + relative != 0)
                 return fail(index, "native return relative base");
             emit(0xe32000000007000fULL);
-            bool complete = !computed_branch;
+            bool complete = !computed_branch && !geometry_exit;
             for (u32 target : call_targets) complete &= target <= index;
             if (complete) return finish(index);
             break;
@@ -3712,6 +3712,19 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 relocations.push_back({static_cast<u32>(result.instructions.size()),
                                        static_cast<s64>(geometry_exit->handler / sizeof(Instruction))});
                 emit(0xe24000000000000fULL | predicate);
+                const bool pending_main_branch = std::any_of(
+                    relocations.begin(), relocations.end(), [&](const Relocation& relocation) {
+                        return !relocation.call && relocation.target > index &&
+                               relocation.target != geometry_exit->handler / sizeof(Instruction);
+                    });
+                if (geometry_exit->has_returns && native_predicate == 7 && !main_exited && !pending_main_branch &&
+                    !call_targets.empty()) {
+                    for (u32 target : call_targets) {
+                        if (target <= index)
+                            return fail(index, "native call target overlaps main program");
+                    }
+                    main_exited = true;
+                }
                 break;
             }
             if (insn.Bits(84, 2)) {

@@ -240,6 +240,49 @@ TEST_CASE("Logged Pokopia SHF register pressure identifies the register shift op
     CHECK_FALSE(LowerToMaxwell(std::array{invalid, Exit}));
 }
 
+TEST_CASE("Logged Kirby FMUL preserves high guest registers across uniform mirrors",
+          "[video_core][ampere][logged_numeric][kirby]") {
+    using Shader::Ampere::NativeRegisterCopy;
+    constexpr Instruction multiply{{0x5fdc7220, 0x00000052, 0x00410000, 0x000fe200}};
+    const auto pressure = Shader::Ampere::PrepareRegisterPressure(multiply, 216);
+    REQUIRE(pressure.valid);
+    CHECK(pressure.instruction.words[0] == 0x5fd47220);
+    CHECK(pressure.instruction.words[1] == multiply.words[1]);
+    CHECK(pressure.instruction.words[2] == multiply.words[2]);
+    CHECK(pressure.instruction.words[3] == multiply.words[3]);
+    REQUIRE(pressure.prefix.size() == 8);
+    REQUIRE(pressure.suffix.size() == 8);
+
+    const Instruction uniform_marker{{0x0000fc02, 0, 0, 0}};
+    const auto lowered = LowerToMaxwell(std::array{uniform_marker, multiply, Exit});
+    INFO(lowered.error);
+    REQUIRE(lowered);
+    REQUIRE(lowered.instructions.size() == 18);
+    CHECK(std::equal(pressure.prefix.begin(), pressure.prefix.end(), lowered.instructions.begin()));
+    CHECK(std::equal(pressure.suffix.begin(), pressure.suffix.end(), lowered.instructions.begin() + 9));
+    CHECK(lowered.instructions[8] ==
+          (0x5c68000000070000ULL | 212 | (95ULL << 8) | (82ULL << 20) | (1ULL << 44)));
+    auto code = lowered.instructions;
+    code.insert(code.begin(), 0x0100000000070000ULL | 82 | (15ULL << 12) | (0x40400000ULL << 20));
+    code.insert(code.begin(), 0x0100000000070000ULL | 95 | (15ULL << 12) | (0x40000000ULL << 20));
+    code.insert(code.end() - 1, NativeRegisterCopy(0, 0, 1, 220));
+    code.insert(code.end() - 1, Store(0));
+    TranslateAndEmit(code, 0x40c00000);
+
+    for (const u32 field : {16U, 24U, 32U}) {
+        for (const u32 high : {216U, 217U, 240U, 246U, 254U}) {
+            auto instruction = multiply;
+            const u32 word = field / 32, shift = field % 32;
+            instruction.words[word] =
+                (instruction.words[word] & ~(255U << shift)) | (high << shift);
+            const auto remapped = Shader::Ampere::PrepareRegisterPressure(instruction, 216);
+            REQUIRE(remapped.valid);
+            CHECK(remapped.instruction.Bits(field, 8) < 216);
+            CHECK(LowerToMaxwell(std::array{uniform_marker, instruction, Exit}));
+        }
+    }
+}
+
 TEST_CASE("Logged Pokopia masked dependency barrier fences shared memory and rejects unknown modes",
           "[video_core][ampere][logged_numeric]") {
     constexpr Instruction wait{{0x0000791a, 0x0000800e, 0, 0x000fce00}};

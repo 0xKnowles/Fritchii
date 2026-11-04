@@ -874,9 +874,35 @@ StorageBufferSet CollectIteratorWords(IR::Program& program) {
     return result;
 }
 
-/// Finds the 64-bit constant buffer pointers that are the whole address of a global atomic, apart
-/// from an immediate offset. An atomic has no global fallback, so such a pointer is a buffer even
-/// while it is unmapped.
+/// Returns true when a condition reads a constant buffer word, as the carry out of an addition to
+/// that word does
+bool ReadsCbufWord(const IR::Value& condition, StorageBufferAddr word) {
+    std::deque<IR::Value> queue{condition};
+    std::unordered_set<const IR::Inst*> visited;
+    while (!queue.empty() && visited.size() < 64) {
+        const IR::Value value{queue.front()};
+        queue.pop_front();
+        if (value.IsImmediate()) {
+            continue;
+        }
+        const IR::Inst* const inst{value.InstRecursive()};
+        if (!visited.insert(inst).second) {
+            continue;
+        }
+        if (CbufWord(inst) == word) {
+            return true;
+        }
+        for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
+            queue.push_back(inst->Arg(arg));
+        }
+    }
+    return false;
+}
+
+/// Finds the 64-bit constant buffer pointers a global atomic's address is based on: the whole
+/// address apart from an immediate offset, or a 64-bit sum whose high half adds the pointer's high
+/// word and the carry out of its low word. An atomic has no global fallback, so such a pointer is a
+/// buffer even while it is unmapped. A 32-bit scalar added to a pointer carries nothing.
 StorageBufferSet CollectAtomicPointers(IR::Program& program) {
     const auto word = [](const IR::U32& value) {
         return value.IsImmediate() ? std::nullopt : CbufWord(value.InstRecursive());
@@ -896,7 +922,51 @@ StorageBufferSet CollectAtomicPointers(IR::Program& program) {
                 word(addr->high) ==
                     StorageBufferAddr{.index = low->index, .offset = low->offset + 4}) {
                 result.insert(*low);
+                continue;
             }
+            StorageBufferSet high_words;
+            small_vector<IR::Value, 2> carries;
+            std::vector<IR::Value> pending{addr->high};
+            std::unordered_set<const IR::Inst*> visited;
+            while (!pending.empty()) {
+                const IR::Value term{pending.back()};
+                pending.pop_back();
+                if (term.IsImmediate() || !visited.insert(term.InstRecursive()).second) {
+                    continue;
+                }
+                const IR::Inst* const term_inst{term.InstRecursive()};
+                if (const auto high_word{CbufWord(term_inst)}) {
+                    high_words.insert(*high_word);
+                    continue;
+                }
+                switch (term_inst->GetOpcode()) {
+                case IR::Opcode::IAdd32:
+                case IR::Opcode::Phi:
+                    for (size_t arg = 0; arg < term_inst->NumArgs(); ++arg) {
+                        pending.push_back(term_inst->Arg(arg));
+                    }
+                    break;
+                case IR::Opcode::SelectU32:
+                    if (term_inst->Arg(1).IsImmediate() && term_inst->Arg(2).IsImmediate()) {
+                        carries.push_back(term_inst->Arg(0));
+                    }
+                    break;
+                default:
+                    break;
+                }
+            }
+            if (carries.empty()) {
+                continue;
+            }
+            ForEachSummedWord(addr->value, [&](StorageBufferAddr pointer, u32) {
+                if (Common::IsAligned(pointer.offset, 8) &&
+                    high_words.contains({.index = pointer.index, .offset = pointer.offset + 4}) &&
+                    std::ranges::any_of(carries, [&](const IR::Value& carry) {
+                        return ReadsCbufWord(carry, pointer);
+                    })) {
+                    result.insert(pointer);
+                }
+            });
         }
     }
     return result;

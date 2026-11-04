@@ -1360,6 +1360,17 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
 
     main_pools.ReleaseContents();
     auto entry{CreateComputePipeline(main_pools, key, env, nullptr, true)};
+    if (const char* directory = std::getenv("EDEN_NX2_SHADER_DUMP");
+        directory && !entry.pipeline && env.CanBeSerialized()) {
+        const auto path = std::filesystem::path{directory} /
+                          fmt::format("failed-compute-{:016x}-v{}.env", key.unique_hash, CACHE_VERSION);
+        std::ofstream file{path, std::ios::binary};
+        if (file) {
+            env.Serialize(file);
+            LOG_INFO(Render_Vulkan, "Captured failed compute environment: {} written={}",
+                     path.string(), file.good());
+        }
+    }
     if (!entry.pipeline || pipeline_cache_filename.empty()) {
         return entry;
     }

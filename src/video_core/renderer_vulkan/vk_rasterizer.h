@@ -27,6 +27,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
+#include "video_core/renderer_vulkan/vk_frame_dump.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
@@ -228,6 +229,8 @@ private:
 
     void UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs);
 
+    void FrameDumpPass(const Framebuffer* framebuffer);
+
     Tegra::GPU& gpu;
     Tegra::MaxwellDeviceMemoryManager& device_memory;
 
@@ -253,6 +256,7 @@ private:
     PipelineCache pipeline_cache;
     AccelerateDMA accelerate_dma;
     FenceManager fence_manager;
+    FrameDump frame_dump;
 
     vk::Event wfi_event;
 

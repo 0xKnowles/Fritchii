@@ -119,6 +119,28 @@ TEST_CASE("Blit dither changes only the float color use of shared bias arithmeti
     }
 }
 
+TEST_CASE("Blit dither removes the bias from a phi of float colors",
+          "[video_core][blit_dither]") {
+    for (const bool float_operands : {true, false}) {
+        BlitProgram shader;
+        const Value bias = shader.Cbuf(17, 0x10);
+        const Value linear = shader.ColorBits();
+        const Value encoded = float_operands ? shader.ColorBits() : Value{0x3f000000U};
+        shader.block.AppendNewInst(Opcode::Phi, {});
+        IR::Inst* const phi = &shader.block.back();
+        phi->AddPhiOperand(&shader.block, linear);
+        phi->AddPhiOperand(&shader.block, encoded);
+        const Value sum = shader.Emit(Opcode::IAdd32, {Value{phi}, bias});
+        const Value color = shader.Emit(Opcode::BitCastF32U32, {sum});
+        shader.Run();
+        if (float_operands) {
+            REQUIRE(color.Inst()->Arg(0).Resolve() == Value{phi});
+        } else {
+            REQUIRE(color.Inst()->Arg(0) == sum);
+        }
+    }
+}
+
 TEST_CASE("Blit dither follows cbuf and arithmetic identities with either add order",
           "[video_core][blit_dither]") {
     BlitProgram shader;

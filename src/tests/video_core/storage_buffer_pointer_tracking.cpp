@@ -223,6 +223,66 @@ TEST_CASE("Native atomics offset from an unmapped pointer stay global",
     CHECK(fixture.entry.back().GetOpcode() == IR::Opcode::GlobalAtomicIAdd32);
 }
 
+TEST_CASE("Native atomics carried into an unmapped pointer's high word become storage atomics",
+          "[shader][storage_buffer][global_atomic]") {
+    // Kirby Air Riders compute 0x1175573eed7481a4 adds 64-bit offsets to the pointers at c0[0x40]
+    // and c1[0x0] in 32-bit halves, carrying into the high word. Both were unmapped when the
+    // pipeline was built, which left its atomics without a buffer.
+    const bool dynamic_offset = GENERATE(false, true);
+    CAPTURE(dynamic_offset);
+    KernelProgram fixture;
+    fixture.env.native = true;
+    fixture.env.scalar_offsets = {0x40};
+    IR::IREmitter ir{fixture.entry};
+    const IR::Value pointer{ir.GetCbuf(ir.Imm32(0), ir.Imm32(0x40), 64, false)};
+    const IR::U32 pointer_low{ir.CompositeExtract(pointer, 0)};
+    const IR::U32 pointer_high{ir.CompositeExtract(pointer, 1)};
+    const IR::U32 lane{ir.LocalInvocationIdX()};
+    IR::U32 low;
+    IR::U1 carry;
+    IR::U32 high{pointer_high};
+    if (dynamic_offset) {
+        low = ir.IAdd(ir.ShiftLeftLogical(lane, ir.Imm32(4)), pointer_low);
+        carry = ir.GetCarryFromOp(low);
+        high = ir.IAdd(high, ir.ShiftRightLogical(lane, ir.Imm32(28)));
+    } else {
+        low = ir.IAdd(pointer_low, ir.Imm32(0x1c));
+        carry = ir.ILessThan(low, pointer_low, false);
+    }
+    high = ir.IAdd(high, IR::U32{ir.Select(carry, ir.Imm32(1), ir.Imm32(0))});
+    const IR::U64 address{ir.IAdd(Address(ir, low, high), ir.Imm64(u64{8}))};
+    const IR::Value old{ir.GlobalAtomicIAdd(address, ir.Imm32(1))};
+    ir.WriteGlobal32(Address(ir, ir.IAdd(low, IR::U32{old}), high), ir.Imm32(1));
+
+    CHECK(fixture.TrackedOffsets() == std::vector<u32>{0x40});
+    CHECK_FALSE(fixture.program.info.native_global_bounds);
+    CHECK(fixture.program.info.storage_buffers_descriptors.front().is_written);
+    const auto count = [&](IR::Opcode opcode) {
+        return std::ranges::count_if(fixture.entry.Instructions(), [=](const IR::Inst& inst) {
+            return inst.GetOpcode() == opcode;
+        });
+    };
+    CHECK(count(IR::Opcode::StorageAtomicIAdd32) == 1);
+    CHECK(count(IR::Opcode::GlobalAtomicIAdd32) == 0);
+    CHECK(count(IR::Opcode::WriteStorage32) == 1);
+    CHECK(count(IR::Opcode::WriteGlobal32) == 0);
+}
+
+TEST_CASE("Native atomics with a carry that skips the pointer stay global",
+          "[shader][storage_buffer][global_atomic]") {
+    KernelProgram fixture;
+    fixture.env.native = true;
+    fixture.env.scalar_offsets = {0x1d0, 0x40};
+    IR::IREmitter ir{fixture.entry};
+    const IR::U32 low{ir.IAdd(Word(ir, 0x1d0), Word(ir, 0x40))};
+    const IR::U1 carry{ir.ILessThan(Word(ir, 0x40), ir.Imm32(16), false)};
+    const IR::U32 carried{ir.Select(carry, ir.Imm32(1), ir.Imm32(0))};
+    const IR::U32 high{ir.IAdd(Word(ir, 0x1d4), carried)};
+    static_cast<void>(ir.GlobalAtomicIAdd(Address(ir, low, high), ir.Imm32(1)));
+    CHECK(fixture.TrackedOffsets().empty());
+    CHECK(fixture.entry.back().GetOpcode() == IR::Opcode::GlobalAtomicIAdd32);
+}
+
 TEST_CASE("Loaded global pointers do not inherit the source buffer descriptor",
           "[shader][storage_buffer]") {
     const bool native = GENERATE(false, true);

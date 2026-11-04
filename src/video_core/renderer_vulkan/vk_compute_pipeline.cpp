@@ -425,8 +425,12 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     size_t image_index{Shader::NumDescriptors(info.texture_buffer_descriptors) +
                        Shader::NumDescriptors(info.image_buffer_descriptors) +
                        Shader::NumDescriptors(info.texture_descriptors)};
+    written_images.clear();
     for (const auto& desc : info.image_descriptors) {
         for (u32 i = 0; i < desc.count; ++i, ++image_index) {
+            if (desc.is_written) {
+                written_images.push_back(views[image_index].id);
+            }
             const auto& view{texture_cache.GetImageView(views[image_index].id)};
             if (!desc.is_byte_addressed || view.format != PixelFormat::R16_FLOAT) {
                 continue;

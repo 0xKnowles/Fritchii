@@ -149,6 +149,33 @@ class CliTests(unittest.TestCase):
         source = self.write("header.bin", header(0) + bytes(48) + NATIVE_EXIT)
         self.run_cli(source, "--format", "native-header", "--stage", "fragment", "--output", self.output, code=2)
 
+    def test_geometry_return_before_exit_handler(self):
+        instructions = (
+            (0x0000734e, 0, 0, 0),
+            (0x00037802, 0xe0, 0x00000f00, 0),
+            (0x00007210, 3, 0x07f1e0ff, 0),
+            (0xff017224, 0xff, 0x000e0401, 0),
+            (0x00007357, 0, 0, 0),
+            (0x00007802, 0, 0x00000f00, 0),
+            (0x00017802, 0, 0x00000f00, 0),
+            (0x00037802, 0, 0x00000f00, 0),
+            (0x0100720c, 0xff, 0x03f03070, 0),
+            (0x00087802, 0xb0, 0x00000f00, 0),
+            (0x00007944, 0x10, 0x03c00000, 0),
+            (0x0000794d, 0, 0x03800000, 0),
+            (0x00007324, 0xff, 0x00004000, 0),
+            (0x08007950, 0xffffff20, 0x03c3ffff, 0),
+            (0x00ff7324, 0xff, 0, 0),
+            (0x00007957, 0, 0, 0),
+            (0x0000794d, 0, 0x03800000, 0),
+        )
+        source = self.write("geometry-call.bin", header(3) + bytes(48) +
+                            b"".join(struct.pack("<4I", *op) for op in instructions))
+        self.run_cli(source, "--format", "native-header", "--output", self.output)
+        self.validate()
+        emitted = list(spirv_instructions(self.output.read_bytes()))
+        self.assertEqual(sum(op == 218 for op, _ in emitted), 1)
+
     def test_both_cache_versions_all_stages(self):
         for version in (46, 47, 48, 49):
             for stage, name in enumerate(STAGES):
