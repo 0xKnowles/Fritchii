@@ -7,11 +7,13 @@
 #pragma once
 
 #include <array>
+#include <optional>
 #include <string_view>
 
 #include <boost/container/static_vector.hpp>
 
 #include "common/common_types.h"
+#include "common/dkb_cpu_trace.h"
 #include "common/dkb_frame_trace.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/engines/maxwell_dma.h"
@@ -266,8 +268,12 @@ private:
     };
     std::array<IndirectTrace, 8> indirect_traces;
     Common::DkbFrameTrace::RateLimit trace_rate;
+    Common::DkbFrameTrace::RateLimit trace_cpu_rate;
+    std::optional<Common::DkbCpuTrace::Snapshot> trace_cpu_snapshot;
+    u64 trace_cpu_frame{};
     bool trace_sample_frame{true};
     u64 trace_frame{};
+    u64 trace_window_frames{};
     u64 trace_draws{};
     u64 trace_skipped{};
     u64 trace_indirect{};

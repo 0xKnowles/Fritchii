@@ -1,6 +1,6 @@
 # Bananza timing trace reference
 
-`EDEN_DKB_FRAME_TRACE=1` enables the `DKB frame`, `DKB renderer`, `DKB host_pace`, and
+`EDEN_DKB_FRAME_TRACE=1` enables the `DKB frame`, `DKB renderer`, `DKB cpu`, `DKB host_pace`, and
 `DKB gpu_frame` records. The value must be exactly `1`. The process caches it on first
 use. Unset, empty, `0`, and other values disable these diagnostics. The flag does not
 select a title, change a swap interval, bypass a wait, or enable a rendering workaround.
@@ -79,6 +79,66 @@ presentation path. `cpu_wait_wall_ms` covers the pre-pacing submission and GPU-t
 including the yield loop and scheduling overhead. Disabled pacing has zero requested
 sleep and only the small elapsed cost of checking the setting.
 
+## Host-thread CPU execution time
+
+`DKB cpu` reports OS-accounted CPU execution time, separate from the wall-clock scopes
+above. The Vulkan rasterizer samples registered host threads at most once per second
+at `TickFrame`. The first snapshot establishes a baseline and does not emit a window.
+`through_frame` is the rasterizer's frame counter at the end of the window. `frames`
+is the number of frame ticks since the previous snapshot. `window_wall_ms` measures
+the actual steady-clock interval, which can exceed one second if frames stall.
+
+For each role, `<role>_cpu_ms` is its user-mode plus kernel-mode CPU-time increase over
+the window. `<role>_cpu_ms_per_frame` divides that increase by `frames`. This is an
+average over the window, not the CPU execution time of a particular frame. Thread
+clock reads occur sequentially within a snapshot, so their boundaries have a small
+read-time skew. CPU execution in the window can belong to work queued for other frames.
+
+| Role | Host thread measured |
+| --- | --- |
+| `guest_core_0_host` through `guest_core_5_host` | The six multicore guest-core host threads. Includes guest JIT execution, JIT compilation, emulated kernel work, services, and other work run on those host threads. Not CPU time for individual guest threads, which can migrate between guest cores. |
+| `guest_single_core_host` | The single host CPU thread used in single-core mode. Its time cannot be split into six guest-core measurements. The multicore roles are inactive in this mode. |
+| `gpu_command` | The host GPU command-processing thread, or the front thread when the GPU split is active. |
+| `gpu_back` | The GPU split's back thread, when active. Includes engine methods, rasterizer work, and cache work executed there. |
+| `vulkan_worker` | The scheduler worker that records Vulkan commands and submits them. It is not the GPU device. |
+
+An unregistered role is `inactive`. An active role is `unavailable` if the platform
+does not support its clock, a clock read fails, the thread changed between snapshots,
+or its counter regressed. Neither state is zero CPU time. A role's generation changes
+when it is registered again, preventing a delta across thread or emulation lifetimes.
+These roles do not cover every emulator thread, such as compiler-pool, presentation,
+audio, and driver helper threads, and their sum is not total process CPU usage.
+
+Windows uses `GetThreadTimes`, adding user and kernel time and converting 100 ns units
+to nanoseconds. Registration duplicates the current thread's pseudo-handle into an
+owned real handle, so later reads from the rasterizer still measure the registered
+thread. Linux uses `pthread_getcpuclockid` at registration and `clock_gettime` at each
+snapshot. Linux-based Android uses the same implementation. Only these Windows and
+Linux paths are implemented. Other targets explicitly return unavailable.
+
+Registration and removal hold the same mutex as snapshot reads. A registration remains
+on the owning thread's stack until that thread exits its entry function. Removal occurs
+before the Windows handle closes or the Linux owner thread exits, preventing a reader
+from using an expired clock. Disabled frame tracing registers no clocks and opens no
+thread handles. There are no per-instruction, per-draw, or guest-core polling reads.
+
+OS CPU accounting excludes time spent asleep or descheduled, but counts active spinning
+and CPU work performed inside driver calls. Its accounting resolution can be coarser
+than the nanosecond representation, especially on Windows. Do not interpret small
+window-to-window changes as exact scheduling boundaries or assume that a busy thread
+is necessarily on the frame's critical path.
+
+With both `EDEN_DKB_FRAME_TRACE=1` and `EDEN_NX2_GPU_PROFILE=1`, the existing GPU-thread
+profiler supplies its exclusive wall-time subzones, including draw, pipeline lookup,
+buffer work, texture work, and waits. Those zones remain behind their existing flag
+and are not CPU-busy measurements. Its existing roughly ten-second report now also
+includes `host_cpu_busy_ms_per_s`, measured with the current thread's OS CPU clock,
+and `window_wall_ms`. The CPU value is normalized to milliseconds of CPU execution
+per second of that wall window. Unsupported or failed readings report `unavailable`.
+Use log timestamps and the printed window lengths to compare these longer windows
+with `DKB cpu`; the two reports do not share exact frame boundaries. None of the
+service, renderer, or profiler-zone wall metrics has been relabeled as CPU execution.
+
 ## GPU timestamps grouped by renderer frame
 
 `DKB gpu_frame` reports a sampled frame's GPU timeline span and sum of GPU submission
@@ -133,8 +193,9 @@ frame, unavailable results, or an unsupported device can leave no completed samp
   for the current frame. The default waits for the previous frame and also waits for
   the current one when the previous fence is behind. Trace logging does not change it.
 - `EDEN_NX2_GPU_PROFILE`, enabled by presence even with value `0`, reports host GPU-thread
-  zones and scheduler counters every 10 seconds. Its milliseconds are CPU-thread wall
-  durations, not hardware GPU timestamps.
+  zones and scheduler counters every 10 seconds. Its zone milliseconds remain CPU-thread
+  wall durations, not hardware GPU timestamps. The separate `host_cpu_busy_ms_per_s`
+  field uses OS CPU accounting.
 - The existing swap-word change logs and 600-present summaries remain unchanged.
   Their rate is separate from the opt-in trace's one-second limits.
 
@@ -146,3 +207,9 @@ runtime validation and a user's trace are still required before attributing Bana
 The focused Catch2 filter is `[dkb_frame_trace]`. The flag test also runs in separate
 processes with the variable unset and with values empty, `0`, `1`, `10`, and `true`,
 because each process caches the flag on first use.
+
+The `[dkb_cpu_trace]` tests cover clock monotonicity and positive CPU execution, reads
+from another thread, registration removal and replacement, unavailable or regressing
+counters, disabled registration, and concurrent snapshots during unregister. Enabled
+and disabled flag cases run in separate processes. They do not assert a fixed ratio
+between wall time and CPU execution under scheduler load.

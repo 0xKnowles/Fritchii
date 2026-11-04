@@ -374,3 +374,19 @@ TEST_CASE("NVN fallback does not deduplicate descriptors from different constant
     CHECK(descriptors[1].cbuf_offset == 0x310);
     CHECK(descriptors[1].is_written);
 }
+
+TEST_CASE("SPIR-V emission failures identify the unsupported IR opcode",
+          "[shader][spirv][diagnostics]") {
+    for (const IR::Opcode opcode : {IR::Opcode::UndefU8, IR::Opcode::UndefU16}) {
+        Program fixture;
+        fixture.block.AppendNewInst(opcode, {});
+        try {
+            static_cast<void>(Backend::SPIRV::EmitSPIRV(fixture.profile, fixture.program));
+            FAIL("Unsupported IR instruction unexpectedly emitted");
+        } catch (const Shader::NotImplementedException& exception) {
+            const std::string message{exception.what()};
+            CHECK(message.find(IR::NameOf(opcode)) != std::string::npos);
+            CHECK(message.find("SPIR-V Instruction is not implemented") != std::string::npos);
+        }
+    }
+}
