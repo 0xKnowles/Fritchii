@@ -513,6 +513,24 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
             dump.write(reinterpret_cast<const char*>(native.data()),
                        native.size() * sizeof(Shader::Ampere::Instruction));
         }
+        if (native_header_size != 0) {
+            auto header_path = path;
+            header_path.replace_extension(".header.bin");
+            if (!std::filesystem::exists(header_path) &&
+                gpu_memory->IsFullyMappedRange(program_base, native_header_size)) {
+                std::vector<u8> header(native_header_size);
+                gpu_memory->ReadBlock(program_base, header.data(), header.size());
+                std::ofstream dump(header_path, std::ios::binary);
+                dump.write(reinterpret_cast<const char*>(header.data()), header.size());
+                dump.close();
+                if (dump) {
+                    LOG_INFO(Shader, "Captured native shader header at {:#x}: {} bytes, path={}",
+                             program_base, header.size(), header_path.string());
+                } else {
+                    LOG_ERROR(Shader, "Cannot write native shader header {}", header_path.string());
+                }
+            }
+        }
     }
     if (!lowered) {
         if (const char* directory = std::getenv("EDEN_NATIVE_SHADER_OVERRIDE_DIR")) {
@@ -732,6 +750,16 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
         }
     }
     if (native) {
+        if (!lowered_native_ && std::getenv("EDEN_NX2_SHADER_DUMP") &&
+            (stage == Shader::Stage::TessellationControl || stage == Shader::Stage::TessellationEval)) {
+            LOG_INFO(Shader,
+                     "Native tessellation context at {:#x}: stage={} domain={} spacing={} output={} patch_vertices={}",
+                     program_base, static_cast<u32>(stage),
+                     static_cast<u32>(regs.tessellation.params.domain_type.Value()),
+                     static_cast<u32>(regs.tessellation.params.spacing.Value()),
+                     static_cast<u32>(regs.tessellation.params.output_primitives.Value()),
+                     regs.patch_vertices);
+        }
         InitializeNativeCode(std::move(lowered_native_), 128,
                              program == Maxwell::ShaderType::Geometry);
     }
