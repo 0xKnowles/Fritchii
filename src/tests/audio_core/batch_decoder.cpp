@@ -172,7 +172,7 @@ TEST_CASE("Batch Opus storage is derived from its real config and codec state",
     STATIC_REQUIRE_FALSE(std::is_copy_constructible_v<HostDecoder>);
     STATIC_REQUIRE_FALSE(std::is_move_constructible_v<HostDecoder>);
 
-    for (const auto config : {MakeConfig(1), MakeConfig(2), MakeConfig(3, true)}) {
+    for (const auto& config : {MakeConfig(1), MakeConfig(2), MakeConfig(3, true)}) {
         CAPTURE(config.channels);
         u32 bytes{};
         REQUIRE(HostDecoder::RequiredBytes(config, bytes).IsSuccess());
@@ -266,7 +266,7 @@ TEST_CASE("Batch Opus validates codec parameters and duration-derived frame limi
 
 TEST_CASE("Batch Opus matches real mono stereo and multistream decoder history",
           "[audio_core][hwacod][batch_decoder]") {
-    for (const auto config : {MakeConfig(1), MakeConfig(2), MakeConfig(3, true)}) {
+    for (const auto& config : {MakeConfig(1), MakeConfig(2), MakeConfig(3, true)}) {
         CAPTURE(config.channels);
         CodecFixture fixture{config};
         HostDecoder decoder;
@@ -284,7 +284,7 @@ TEST_CASE("Batch Opus matches real mono stereo and multistream decoder history",
 
 TEST_CASE("Interleaved batch Opus instances keep independent codec state",
           "[audio_core][hwacod][batch_decoder]") {
-    for (const auto config : {MakeConfig(1), MakeConfig(2), MakeConfig(3, true)}) {
+    for (const auto& config : {MakeConfig(1), MakeConfig(2), MakeConfig(3, true)}) {
         CAPTURE(config.channels);
         CodecFixture fixture_a{config};
         CodecFixture fixture_b{config};
@@ -305,7 +305,7 @@ TEST_CASE("Interleaved batch Opus instances keep independent codec state",
 
 TEST_CASE("Batch Opus applies reset before rejecting malformed packet framing",
           "[audio_core][hwacod][batch_decoder]") {
-    for (const auto config : {MakeConfig(1), MakeConfig(2), MakeConfig(3, true)}) {
+    for (const auto& config : {MakeConfig(1), MakeConfig(2), MakeConfig(3, true)}) {
         CAPTURE(config.channels);
         CodecFixture fixture{config};
         HostDecoder decoder;
@@ -326,7 +326,7 @@ TEST_CASE("Batch Opus applies reset before rejecting malformed packet framing",
 TEST_CASE("Batch Opus rejects framing and codec errors without crossing output bounds",
           "[audio_core][hwacod][batch_decoder]") {
     constexpr s16 Canary = 0x5A5A;
-    for (const auto config : {MakeConfig(1), MakeConfig(2), MakeConfig(3, true)}) {
+    for (const auto& config : {MakeConfig(1), MakeConfig(2), MakeConfig(3, true)}) {
         CAPTURE(config.channels);
         CodecFixture fixture{config};
         HostDecoder decoder;
@@ -373,7 +373,7 @@ TEST_CASE("Batch Opus rejects framing and codec errors without crossing output b
 
 TEST_CASE("Batch Opus enforces configured frame limits even with oversized output",
           "[audio_core][hwacod][batch_decoder]") {
-    for (const auto config : {MakeConfig(1), MakeConfig(2), MakeConfig(3, true)}) {
+    for (const auto& config : {MakeConfig(1), MakeConfig(2), MakeConfig(3, true)}) {
         CAPTURE(config.channels);
         CodecFixture fixture{config};
         const auto packet = fixture.Encode(5);

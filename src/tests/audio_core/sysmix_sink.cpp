@@ -110,7 +110,9 @@ TEST_CASE("sysmix sink publishes samples before concurrently consumed metadata",
                 }
                 continue;
             }
-            if (!std::ranges::all_of(output, [expected](s16 value) { return value == expected; })) {
+            if (!std::ranges::all_of(output, [expected](s16 value) {
+                    return static_cast<u32>(value) == expected;
+                })) {
                 mismatch = true;
             }
             ++expected;
