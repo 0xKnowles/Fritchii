@@ -18,6 +18,7 @@ using Shader::Ampere::LowerToMaxwell;
 
 constexpr Instruction Exit{{0x0000794d, 0, 0x03800000, 0}};
 constexpr Instruction CapturedI2F{{0x00027d06, 0x00000004, 0x08101000, 0x000e6200}};
+constexpr Instruction CapturedUniformLoad{{0x00047ab9, 0x01800800, 0x00000400, 0x000fe200}};
 constexpr Instruction CapturedShift{{0xff247219, 0x00000025, 0x00011444, 0x000fc600}};
 constexpr Instruction CapturedGather{{0x201c7b63, 0xb0000a2b, 0x041e0f16, 0x000f4200}};
 constexpr Instruction CapturedLut{{0x00c8781c, 0x00000000, 0x0010f010, 0x000fc400}};
@@ -122,6 +123,8 @@ struct Translation {
     Vector coordinates{}, derivatives{};
     IR::TextureInstInfo texture_info{};
     u32 handle{}, textures{};
+    std::unordered_map<u32, u32> constants;
+    u32 constant_reads{};
 
     void Run(const Shader::Ampere::LoweredProgram& lowered) {
         ConversionEnvironment env;
@@ -144,10 +147,12 @@ struct Translation {
             case Shader::Maxwell::Opcode::LOP32I: visitor.LOP32I(word); break;
             case Shader::Maxwell::Opcode::LOP_reg: visitor.LOP_reg(word); break;
             case Shader::Maxwell::Opcode::R2P_imm: visitor.R2P_imm(word); break;
+            case Shader::Maxwell::Opcode::P2R_imm: visitor.P2R_imm(word); break;
             case Shader::Maxwell::Opcode::BFE_imm: visitor.BFE_imm(word); break;
             case Shader::Maxwell::Opcode::IADD_reg: visitor.IADD_reg(word); break;
             case Shader::Maxwell::Opcode::TLD4: visitor.TLD4(word); break;
             case Shader::Maxwell::Opcode::TXD_b: visitor.TXD_b(word); break;
+            case Shader::Maxwell::Opcode::LDC: visitor.LDC(word); break;
             default: FAIL("Unexpected lowered instruction " << static_cast<u32>(opcode));
             }
             std::unordered_map<const IR::Inst*, Vector> values;
@@ -164,6 +169,12 @@ struct Translation {
                 const auto arg = [&](size_t index) { return read(inst.Arg(index))[0]; };
                 Vector result{};
                 switch (inst.GetOpcode()) {
+                case IR::Opcode::GetCbufU16:
+                    REQUIRE(arg(0) == 6);
+                    REQUIRE((arg(1) & 1) == 0);
+                    result[0] = (constants.at(arg(1) & ~3U) >> ((arg(1) & 2) * 8)) & 0xffffU;
+                    ++constant_reads;
+                    break;
                 case IR::Opcode::GetRegister:
                     result[0] = inst.Arg(0).Reg() == IR::Reg::RZ
                                     ? 0U : registers.at(static_cast<size_t>(inst.Arg(0).Reg()));
@@ -245,6 +256,82 @@ struct Translation {
     }
 };
 } // namespace
+
+TEST_CASE("Star Fox captured ULDC loads an unsigned halfword through the real translator",
+          "[video_core][ampere][starfox_uldc]") {
+    const auto lowered = LowerToMaxwell(std::array{CapturedUniformLoad, Exit});
+    INFO(lowered.error);
+    REQUIRE(lowered);
+    REQUIRE(lowered.instructions.size() == 2);
+    CHECK(lowered.instructions.front() == 0xef9200600207ffdcULL);
+    for (const u32 input : {0x12340000U, 0x12340001U, 0x12347fffU, 0x12348000U, 0x1234ffffU}) {
+        Translation translated;
+        translated.constants.emplace(0x20, input);
+        translated.registers.fill(0xdeadbeefU);
+        const auto predicates = translated.predicates;
+        translated.Run(lowered);
+        CHECK(translated.constant_reads == 1);
+        CHECK(translated.predicates == predicates);
+        for (u32 reg = 0; reg < IR::NUM_REGS; ++reg)
+            CHECK(translated.registers[reg] == (reg == 220 ? input & 0xffffU : 0xdeadbeefU));
+    }
+}
+
+TEST_CASE("Star Fox ULDC U16 preserves halfword offsets uniform destinations and predicates",
+          "[video_core][ampere][starfox_uldc]") {
+    for (const u32 offset : {0U, 2U, 0x20U, 0x22U, 0x7ffeU}) {
+        for (const u32 dest : {0U, 4U, 21U, 22U, 27U}) {
+            for (const u32 guard : {0U, 7U, 8U}) {
+                auto instruction = CapturedUniformLoad;
+                SetBits(instruction, 38, 16, offset);
+                SetBits(instruction, 16, 8, dest);
+                SetBits(instruction, 12, 4, guard);
+                const auto lowered = LowerToMaxwell(std::array{instruction, Exit});
+                INFO(lowered.error);
+                REQUIRE(lowered);
+                for (const bool enabled : {false, true}) {
+                    Translation translated;
+                    translated.constants.emplace(offset & ~3U, 0x8001fedcU);
+                    translated.registers.fill(0xdeadbeefU);
+                    translated.registers[239] = enabled ? 0x40U : 0U;
+                    const auto registers = translated.registers;
+                    const auto predicates = translated.predicates;
+                    translated.Run(lowered);
+                    const bool taken = guard == 7 || enabled != (guard == 8);
+                    const u32 target = dest < 22 ? dest + 216 : dest + 218;
+                    const u32 expected = offset & 2 ? 0x8001U : 0xfedcU;
+                    CHECK(translated.constant_reads == (taken ? 1 : 0));
+                    CHECK(translated.predicates == predicates);
+                    for (u32 reg = 0; reg < 246; ++reg)
+                        CHECK(translated.registers[reg] ==
+                              (taken && reg == target ? expected : registers[reg]));
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("Star Fox ULDC U16 rejects unrepresentable offsets and unsupported modes",
+          "[video_core][ampere][starfox_uldc]") {
+    for (const auto change : std::array{
+             std::array{38U, 16U, 1U}, std::array{38U, 16U, 0x7fffU},
+             std::array{38U, 16U, 0x8000U}, std::array{38U, 16U, 0xfffeU},
+             std::array{16U, 8U, 63U}, std::array{16U, 8U, 64U},
+             std::array{54U, 5U, 18U}, std::array{62U, 2U, 1U},
+             std::array{73U, 3U, 1U}, std::array{73U, 3U, 3U},
+             std::array{73U, 3U, 6U}, std::array{78U, 2U, 2U},
+             std::array{91U, 1U, 1U}}) {
+        auto instruction = CapturedUniformLoad;
+        SetBits(instruction, change[0], change[1], change[2]);
+        const auto lowered = LowerToMaxwell(std::array{instruction, Exit});
+        CHECK_FALSE(lowered);
+        CHECK(lowered.instructions.empty());
+    }
+    auto indexed = CapturedUniformLoad;
+    SetBits(indexed, 0, 12, 0xabb);
+    SetBits(indexed, 91, 1, 1);
+    CHECK_FALSE(LowerToMaxwell(std::array{indexed, Exit}));
+}
 
 TEST_CASE("Star Fox Test10 uniform U16 conversion reaches the real translator",
           "[video_core][ampere][starfox_test10]") {

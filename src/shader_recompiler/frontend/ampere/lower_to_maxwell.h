@@ -1079,16 +1079,18 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                  (u64{source} << 20) | (u64{15} << 39));
             break;
         }
-        case 0xab9: case 0xabb: { // ULDC U32/U64, direct or indexed.
+        case 0xab9: case 0xabb: { // ULDC, direct or indexed.
             const u32 uniform_dest = insn.Bits(16, 8), index_reg = insn.Bits(24, 8);
             const u32 width = insn.Bits(73, 3);
-            const bool byte_load = opcode == 0xab9 && width == 0;
+            const bool subword_load = opcode == 0xab9 && (width == 0 || width == 2);
+            const u32 offset = insn.Bits(38, 16);
+            const u32 alignment = width == 0 ? 1U : width == 2 ? 2U : 4U;
             const u32 target = uniform_register(uniform_dest);
             const u32 index_target = opcode == 0xabb ? uniform_register(index_reg) : 255U;
-            if (target == ~0U || target == 255 || (!byte_load && width != 4 && width != 5) ||
-                (byte_load && insn.Bits(38, 16) >= 0x8000) ||
+            if (target == ~0U || target == 255 || (!subword_load && width != 4 && width != 5) ||
+                (subword_load && offset >= 0x8000) ||
                 (width == 5 && ((uniform_dest & 1) || uniform_register(uniform_dest + 1) != target + 1)) ||
-                bank() >= 18 || (!byte_load && insn.Bits(38, 16) % 4) || insn.Bits(62, 2) ||
+                bank() >= 18 || offset % alignment || insn.Bits(62, 2) ||
                 (insn.words[2] & ~0xe00U) != (opcode == 0xab9 ? 0U : 0x08000000U) ||
                 index_target == ~0U)
                 return fail(index, "native uniform constant load mode");
@@ -1096,7 +1098,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 emit(0x4c98000000000000ULL | predicate | target | (u64{15} << 39) | cbuf());
             } else {
                 emit(0xef90000000000000ULL | predicate | target |
-                     (u64{index_target} << 8) | (u64{insn.Bits(38, 16)} << 20) |
+                     (u64{index_target} << 8) | (u64{offset} << 20) |
                      (u64{bank()} << 36) | (u64{width} << 48));
             }
             break;
