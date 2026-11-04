@@ -2,6 +2,7 @@
 
 #include <array>
 #include <initializer_list>
+#include <map>
 #include <stdexcept>
 #include <catch2/catch_test_macros.hpp>
 
@@ -18,19 +19,21 @@ class HandleEnvironment final : public Shader::Environment {
 public:
     bool integer_texture{};
     u32 format_reads{};
+    u32 expected_handle{0xabc};
+    std::map<std::pair<u32, u32>, u32> cbuf_values{{{0, 0}, 0xabc}};
 
     u64 ReadInstruction(u32) override { throw std::logic_error("Unexpected instruction read"); }
     u32 ReadCbufValue(u32 index, u32 offset) override {
-        REQUIRE(index == 0);
-        REQUIRE(offset == 0);
-        return 0xabc;
+        const auto it = cbuf_values.find({index, offset});
+        REQUIRE(it != cbuf_values.end());
+        return it->second;
     }
     Shader::TextureType ReadTextureType(u32) override { return Shader::TextureType::Color2D; }
     Shader::TexturePixelFormat ReadTexturePixelFormat(u32) override {
         return Shader::TexturePixelFormat::A8B8G8R8_UNORM;
     }
     bool IsTexturePixelFormatInteger(u32 handle) override {
-        REQUIRE(handle == 0xabc);
+        REQUIRE(handle == expected_handle);
         ++format_reads;
         return integer_texture;
     }
@@ -174,6 +177,100 @@ TEST_CASE("Computed handles do not share the static texture format cache",
         CHECK(shader.Descriptor(static_sample).is_integer);
         CHECK_FALSE(shader.Descriptor(dynamic_sample).is_integer);
         CHECK(shader.env.format_reads == 1);
+    }
+}
+
+TEST_CASE("A sampled handle keeps a storage-indexed cbuf texture with its sampler",
+          "[video_core][texture_handles]") {
+    for (const bool sampler_first : {false, true}) {
+        HandleProgram shader;
+        shader.env.cbuf_values = {{{6, 0}, 0x123}, {{2, 0x570}, 0x24000000}};
+        shader.env.expected_handle = 0x24000123;
+        const Value offset{shader.Emit(Opcode::ShiftLeftLogical32, {shader.Storage(0), Value{4U}})};
+        const Value texture{shader.Emit(Opcode::GetCbufU32, {Value{6U}, offset})};
+        const Value sampler{shader.Emit(Opcode::GetCbufU32, {Value{2U}, Value{0x570U}})};
+        auto& sample{shader.Sample(shader.Emit(Opcode::BitwiseOr32,
+                                              {sampler_first ? sampler : texture,
+                                               sampler_first ? texture : sampler}))};
+        shader.Run();
+        const auto& descriptor = shader.Descriptor(sample);
+        CHECK(descriptor.handle_program == ~0U);
+        CHECK(descriptor.count > 1);
+        CHECK(descriptor.size_shift == 4);
+        CHECK(descriptor.cbuf_index == 6);
+        CHECK(descriptor.cbuf_offset == 0);
+        CHECK(descriptor.has_secondary);
+        CHECK(descriptor.secondary_cbuf_index == 2);
+        CHECK(descriptor.secondary_cbuf_offset == 0x570);
+        CHECK(shader.program.info.handle_programs.empty());
+        REQUIRE_FALSE(sample.Arg(0).IsEmpty());
+        const auto* selection = sample.Arg(0).InstRecursive();
+        REQUIRE(selection->GetOpcode() == Opcode::UMin32);
+        const auto* index = selection->Arg(0).InstRecursive();
+        REQUIRE(index->GetOpcode() == Opcode::ShiftRightLogical32);
+        CHECK(index->Arg(0).Resolve() == offset.Resolve());
+        CHECK(index->Arg(1).U32() == 4);
+    }
+}
+
+TEST_CASE("Combining static cbuf handles keeps the static descriptor path",
+          "[video_core][texture_handles]") {
+    HandleProgram shader;
+    const Value texture{shader.Emit(Opcode::GetCbufU32, {Value{0U}, Value{0U}})};
+    const Value sampler{shader.Emit(Opcode::GetCbufU32, {Value{0U}, Value{0U}})};
+    auto& sample{shader.Sample(shader.Emit(Opcode::BitwiseOr32, {texture, sampler}))};
+    shader.Run();
+    CHECK(shader.Descriptor(sample).handle_program == ~0U);
+    CHECK(shader.Descriptor(sample).has_secondary);
+    CHECK(shader.program.info.handle_programs.empty());
+}
+
+TEST_CASE("Texture arrays reserve the final static and buffer resources",
+          "[video_core][texture_handles]") {
+    for (const u32 arrays : {1U, 2U}) {
+        HandleProgram shader;
+        const Value offset{shader.Emit(Opcode::ShiftLeftLogical32, {shader.Storage(0), Value{4U}})};
+        auto& sample{shader.Sample(shader.Emit(Opcode::GetCbufU32, {Value{0U}, offset}))};
+        shader.Run();
+        auto& info = shader.program.info;
+        const auto descriptor = info.texture_descriptors.front();
+        for (u32 i = 1; i < arrays; ++i) {
+            info.texture_descriptors.push_back(descriptor);
+        }
+        for (u32 i = 0; i < 3; ++i) {
+            auto fixed = descriptor;
+            fixed.count = 1;
+            info.texture_descriptors.push_back(fixed);
+        }
+        for (u32 i = 0; i < 5; ++i) {
+            info.constant_buffer_descriptors.push_back({.index = i, .count = 1});
+        }
+        for (u32 i = 0; i < 2; ++i) {
+            info.storage_buffers_descriptors.push_back({.count = 1});
+        }
+        Shader::HostTranslateInfo host;
+        host.ApplyDescriptorLimitPolicy();
+        host.max_per_stage_resources = 16;
+        host.max_per_stage_descriptor_sampled_images = 16;
+        host.max_descriptor_set_sampled_images = 16;
+        Shader::Optimization::LimitSampledTextureArrays(shader.program, host);
+        for (u32 i = 0; i < arrays; ++i) {
+            CHECK(info.texture_descriptors[i].count == 6 / arrays);
+        }
+        CHECK(Shader::NumDescriptors(info.texture_descriptors) == 9);
+        CHECK(sample.Arg(0).InstRecursive()->Arg(1).U32() == 6 / arrays - 1);
+        if (arrays == 2) {
+            info.texture_descriptors[0].count = 2;
+            info.texture_descriptors[1].count = 12;
+            host.max_per_stage_resources = 24;
+            host.max_per_stage_descriptor_sampled_images = 24;
+            host.max_descriptor_set_sampled_images = 24;
+            Shader::Optimization::LimitSampledTextureArrays(shader.program, host);
+            CHECK(info.texture_descriptors[0].count == 2);
+            CHECK(info.texture_descriptors[1].count == 12);
+        }
+        host.max_per_stage_resources = 10;
+        REQUIRE_THROWS(Shader::Optimization::LimitSampledTextureArrays(shader.program, host));
     }
 }
 

@@ -144,6 +144,67 @@ bias, is still kept.
 In the Kirby sweep, two of 1,038 SPIR-V modules change: this FS and its sibling `f7630c142a3b7203`,
 which uses the same VS. All results and statuses are otherwise identical.
 
+## Black characters: incomplete texture handles
+
+The owner confirmed that the white-world fix works on `26a608918e`, but characters still
+render dark. The earlier `kirby-white4` trace records fragment shader
+`16ad27bb614d3e6e-gfx-130daf4e00.bin` querying handle `0x24000000`. This selects texture
+index zero and sampler `0x240`. Its TIC is a null entry, not an unrecognized compressed format:
+`0000000000024900/0000000000600000/0000000000000000/0000000000000000`, image address zero,
+dimensions 1x1x1, format INVALID, UNORM components.
+
+The captured shader contains a depth-comparison sample whose handle is
+`c6[LoadStorage32(...) << 4] | c2[0x570]`. Static handle tracking cannot represent the first
+operand. It then searches inside the OR and incorrectly treats the sampler operand alone as
+the entire handle. That index can depend on fragment inputs, so evaluating one handle on the
+CPU for the whole draw is not correct either. The fix uses the existing shader-indexed descriptor
+arrays for zero-based cbuf tables, composes a dynamic texture table with a constant sampler,
+and keeps that sampler's cbuf offset fixed when binding each array element. Tests check both
+operand orders, the retained shader-side index, and the unchanged fully static path. An owner
+run is still needed to establish how much of the character/shadow problem this explains.
+
+Vulkan recreates SPIR-V from cached environments, then supplies the new modules and descriptor
+layout to `vkCreateGraphicsPipelines`; the application's pipeline hash does not select an old
+driver binary directly. However, old environments omit the newly needed cbuf/texture reads.
+After a cache-load failure, the old disk-key set also prevents a live recompile from replacing
+that record. Vulkan cache version 50 and OpenGL version 46 therefore start fresh versioned files,
+without deleting the previous files. Expect a cold-cache first run.
+
+The initial array cap runs before final uniform and static texture counts are known. A final
+budget check now includes those resources and any NVN storage buffers, then tightens shader-side
+index clamps when reducing array counts. A metadata-only audit of the nine incomplete cached
+environments found four over-budget cases at a synthetic 1,024-resource limit. Their final totals
+are now 1,023 or 1,024. Audits at 128 and 1,048,576 also fit all nine; at 32, one cannot fit even
+one element per array and is rejected. Missing context was substituted only for this structural
+audit. The nine shaders remain unverified with real runtime data.
+
+The `kirby-fix4` log does not establish the cause of the low frame rate. Its 636.1 ms pipeline
+summary spans 10.070 seconds and counts GPU-thread translation, not driver-worker compilation.
+Between 118 and 125 seconds the individual logged builds total 2,121.1 ms. The last logged
+build is at 124.556 seconds; the log continues to 157.936 seconds. Profile another run with
+`EDEN_NX2_GPU_PROFILE=1 EDEN_DKB_FRAME_TRACE=1`; exclude the deliberate frame-dump stall from
+performance measurements.
+
+### Sustained GPU stalls
+
+The next capture contains multi-second GPU work after the frame dump. Renderer frame 5221
+records 3,809.697 ms of submission execution across a 3,835.030 ms span. Frame 5231 records
+5,823.947 ms across 7,608.752 ms. These timestamps establish expensive submitted GPU work,
+but do not identify the shader responsible. The captured present image is a sky transition,
+so it cannot verify the remaining black characters or broken shadows.
+
+For another performance capture, keep the shader cache and enable
+`EDEN_NX2_GPU_PROFILE=1 EDEN_DKB_FRAME_TRACE=1`. Do not enable a frame dump in the measured
+interval. The profile adds `writer wait`, `list submit wait` and `list GPU wait` zones to
+separate front command-list readback waits from command parsing. Existing GPU timestamp
+samples also report up to four submissions taking at least 10 ms as `DKB gpu_submission`.
+Each line includes the submission tick, draw and dispatch attempts, and up to 32 distinct
+stage/hash pairs. Stages 0 through 5 match the graphics pipeline key; stage 6 is compute.
+`untracked_uses` counts shader uses omitted after the list fills. Attempts can include work
+skipped because its pipeline was not bound. Transfer and emulator-internal work are not
+attributed to guest shader hashes. The duration belongs to the whole submission, not to
+each listed shader. This adds no GPU timestamp queries beyond the existing frame trace.
+
 ## Frame dump
 
 The logs show every shader building, so the next step needs pixels. `EDEN_NX2_FRAME_DUMP` reads

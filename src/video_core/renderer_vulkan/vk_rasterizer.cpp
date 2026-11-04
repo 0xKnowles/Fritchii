@@ -465,6 +465,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
     {
         Profile::Scope scope{Profile::Zone::DrawRecord};
+        scheduler.TraceGraphicsPipeline(pipeline->ShaderHashes());
         draw_func();
     }
     submitted = true;
@@ -1328,6 +1329,7 @@ void RasterizerVulkan::DispatchCompute() {
         const auto [buffer, offset] =
             buffer_cache.ObtainBuffer(*indirect_address, 12, sync_info, post_op);
         scheduler.RequestOutsideRenderPassOperationContext();
+        scheduler.TraceComputePipeline(pipeline->ShaderHash());
         scheduler.Record([pipeline, indirect_buffer = buffer->Handle(),
                           indirect_offset = offset](vk::CommandBuffer cmdbuf) {
             if (!pipeline->IsBound()) {
@@ -1352,6 +1354,7 @@ void RasterizerVulkan::DispatchCompute() {
     };
     scheduler.Record([](vk::CommandBuffer cmdbuf) { cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                0, READ_BARRIER); });
+    scheduler.TraceComputePipeline(pipeline->ShaderHash());
     scheduler.Record([pipeline, dim, byte_addressed_shadow](vk::CommandBuffer cmdbuf) {
         if (!pipeline->IsBound()) {
             return;

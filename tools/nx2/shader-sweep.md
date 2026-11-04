@@ -38,10 +38,12 @@ new lowering no longer produces the exact bytes stored in the older cache.
 
 ## Inputs and coverage
 
-The loader reads little-endian `yuzucach` Vulkan caches, fork versions 46, 47, 48 and 49. It verifies each
+The loader reads little-endian `yuzucach` Vulkan caches, fork versions 46 through 50. It verifies each
 record boundary and rejects unknown versions or truncated input. Version 47 includes captured
-storage-pointer classifications; versions 48 and 49 retain that layout and version 46 omits them.
-Version 49 invalidates pipelines after tessellation patch-size clamping; the serialized layout is unchanged.
+storage-pointer classifications; versions 48 through 50 retain that layout and version 46 omits them.
+Version 49 invalidates pipelines after tessellation patch-size clamping. Version 50 captures the
+additional texture-table context needed by dynamic texture/static sampler composition. Neither
+changes the serialized layout.
 Graphics keys are the 1,056-byte layout
 from these versions; compute keys contain 24 bytes. Driver pipeline blobs and `vulkan_used`
 indexes do not contain replayable shader environments and are not treated as shader inputs.

@@ -30,7 +30,7 @@ def pipeline_cache(version):
 
 class CacheTests(unittest.TestCase):
     def test_both_versions_preserve_records_and_stage(self):
-        for version in (46, 47, 48, 49):
+        for version in (46, 47, 48, 49, 50):
             records = list(sweep.parse_cache(pipeline_cache(version)))
             self.assertEqual([r["stage"] for r in records], ["vertex", "geometry", "fragment", "compute"])
             for record, stage in zip(records, (0, 3, 4, 5)):
@@ -45,7 +45,7 @@ class CacheTests(unittest.TestCase):
                 list(sweep.parse_cache(data[:length]))
 
     def test_unknown_version_and_environment_count_rejected(self):
-        for data in (b"yuzucach" + struct.pack("<I", 50),
+        for data in (b"yuzucach" + struct.pack("<I", 51),
                      b"yuzucach" + struct.pack("<II", 47, 7)):
             with self.assertRaises(sweep.CacheError):
                 list(sweep.parse_cache(data))

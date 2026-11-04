@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <cmath>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -75,6 +77,9 @@ private:
 u32 EvaluateShift(IR::Value value) {
     value = value.Resolve();
     if (value.IsImmediate()) {
+        if (value.Type() == IR::Type::F32) {
+            return std::bit_cast<u32>(value.F32());
+        }
         return value.Type() == IR::Type::U1 ? u32{value.U1()} : value.U32();
     }
     const auto& inst = *value.Inst();
@@ -82,6 +87,13 @@ u32 EvaluateShift(IR::Value value) {
     switch (inst.GetOpcode()) {
     case IR::Opcode::Identity:
         return arg(0);
+    case IR::Opcode::BitCastU32F32:
+    case IR::Opcode::BitCastF32U32:
+        return arg(0);
+    case IR::Opcode::FPFma32:
+        return std::bit_cast<u32>(std::fma(std::bit_cast<float>(arg(0)),
+                                         std::bit_cast<float>(arg(1)),
+                                         std::bit_cast<float>(arg(2))));
     case IR::Opcode::BitwiseAnd32:
         return arg(0) & arg(1);
     case IR::Opcode::ULessThan:
@@ -280,6 +292,119 @@ TEST_CASE("Logged Kirby FMUL preserves high guest registers across uniform mirro
             CHECK(remapped.instruction.Bits(field, 8) < 216);
             CHECK(LowerToMaxwell(std::array{uniform_marker, instruction, Exit}));
         }
+    }
+}
+
+TEST_CASE("Logged Kirby global loads preserve high destinations across uniform mirrors",
+          "[video_core][ampere][logged_numeric][kirby]") {
+    constexpr std::array loads{
+        Instruction{{0x46fa7381, 0x00003000, 0x001e8900, 0x00013400}},
+        Instruction{{0x70ec7381, 0x00006c00, 0x001e8900, 0x00012800}},
+        Instruction{{0x72ef7381, 0x00006c00, 0x001e8900, 0x00012800}},
+    };
+    for (const auto& load : loads) {
+        const auto pressure = Shader::Ampere::PrepareRegisterPressure(load, 216);
+        REQUIRE(pressure.valid);
+        CHECK(pressure.instruction.Bits(16, 8) == 212 + load.Bits(16, 8) % 4);
+        CHECK(pressure.instruction.Bits(24, 8) == load.Bits(24, 8));
+        CHECK(pressure.instruction.words[1] == load.words[1]);
+        CHECK(pressure.instruction.words[2] == load.words[2]);
+        REQUIRE(pressure.prefix.size() == 8);
+        REQUIRE(pressure.suffix.size() == 8);
+        const Instruction uniform_marker{{0x0000fc02, 0, 0, 0}};
+        const auto lowered = LowerToMaxwell(std::array{uniform_marker, load, Exit});
+        INFO(lowered.error);
+        REQUIRE(lowered);
+        REQUIRE(lowered.instructions.size() == 18);
+        CHECK(std::equal(pressure.prefix.begin(), pressure.prefix.end(), lowered.instructions.begin()));
+        CHECK(std::equal(pressure.suffix.begin(), pressure.suffix.end(), lowered.instructions.begin() + 9));
+        CHECK(lowered.instructions[8] ==
+              (0xeed0000000070000ULL | pressure.instruction.Bits(16, 8) |
+               (u64{load.Bits(24, 8)} << 8) | (u64{load.Bits(40, 24)} << 20) |
+               (1ULL << 45) | (4ULL << 48)));
+    }
+}
+
+TEST_CASE("Captured Kirby high-register ALU and memory operands preserve encoding fields",
+          "[video_core][ampere][logged_numeric][kirby]") {
+    struct Fixture {
+        Instruction instruction;
+        std::vector<u32> fields;
+    };
+    const std::array fixtures{
+        Fixture{{{0x8ee87221, 0x0000005a, 0x00010000, 0x000fe200}}, {16, 24, 32}},
+        Fixture{{{0x21db7820, 0x42fe0000, 0x00410000, 0x000fc600}}, {16, 24}},
+        Fixture{{{0xdb507421, 0x3f800000, 0x00010000, 0x042fe200}}, {16, 24}},
+        Fixture{{{0xde4f7421, 0x3f800000, 0x00010000, 0x042fe200}}, {16, 24}},
+        Fixture{{{0x00f97919, 0x00000000, 0x00002100, 0x000e2200}}, {16}},
+        Fixture{{{0xe3bd7823, 0x3c8efa35, 0x000100b1, 0x000fe400}}, {16, 24, 64}},
+        Fixture{{{0xdc00780b, 0x42fe0000, 0x03f5e000, 0x000fc800}}, {24}},
+        Fixture{{{0xdce57223, 0x0000008f, 0x0001004e, 0x000fe200}}, {16, 24, 32, 64}},
+        Fixture{{{0x21217208, 0x000000dc, 0x05000000, 0x000fe200}}, {16, 24, 32}},
+        Fixture{{{0xfb2ec981, 0x00000006, 0x081ea900, 0x00012200}}, {16, 24}},
+        Fixture{{{0xe3e37981, 0x0000000c, 0x081e8900, 0x000f2200}}, {16, 24}},
+        Fixture{{{0xe4e47817, 0x00000001, 0x07800200, 0x000fe200}}, {16, 24}},
+        Fixture{{{0xfa00920b, 0x000000ff, 0x03f1c000, 0x000fe400}}, {24, 32}},
+        Fixture{{{0x00307245, 0x000000e4, 0x00201000, 0x000fe200}}, {16, 32}},
+        Fixture{{{0x39007986, 0x000000fa, 0x0810a906, 0x0001e200}}, {24, 32}},
+        Fixture{{{0x86000386, 0x000000fa, 0x0010a900, 0x0005e200}}, {24, 32}},
+    };
+    for (const auto& fixture : fixtures) {
+        const auto& instruction = fixture.instruction;
+        CAPTURE(instruction.words);
+        const auto pressure = Shader::Ampere::PrepareRegisterPressure(instruction, 216);
+        REQUIRE(pressure.valid);
+        std::array<u32, 4> masks{};
+        for (const u32 field : fixture.fields) {
+            masks[field / 32] |= 255U << (field % 32);
+            const u32 original = instruction.Bits(field, 8);
+            if (original >= 216 && original != 255) {
+                CHECK(pressure.instruction.Bits(field, 8) < 216);
+            } else {
+                CHECK(pressure.instruction.Bits(field, 8) == original);
+            }
+        }
+        for (u32 word = 0; word < 4; ++word) {
+            CHECK((pressure.instruction.words[word] & ~masks[word]) ==
+                  (instruction.words[word] & ~masks[word]));
+        }
+        const Instruction uniform_marker{{0x0000fc02, 0, 0, 0}};
+        const auto lowered = LowerToMaxwell(std::array{uniform_marker, instruction, Exit});
+        INFO(lowered.error);
+        REQUIRE(lowered);
+    }
+}
+
+TEST_CASE("Captured Kirby shadowed floating arithmetic preserves values",
+          "[video_core][ampere][logged_numeric][kirby]") {
+    struct Fixture {
+        Instruction instruction;
+        std::vector<u32> sources;
+        float expected;
+    };
+    const std::array fixtures{
+        Fixture{{{0x8ee87221, 0x0000005a, 0x00010000, 0x000fe200}}, {142, 90}, 4.0f},
+        Fixture{{{0x21db7820, 0x42fe0000, 0x00410000, 0x000fc600}}, {33}, 254.0f},
+        Fixture{{{0xdb507421, 0x3f800000, 0x00010000, 0x042fe200}}, {219}, 3.0f},
+        Fixture{{{0xdce57223, 0x0000008f, 0x0001004e, 0x000fe200}}, {220, 143, 78}, 6.0f},
+        Fixture{{{0xe3bd7823, 0x3c8efa35, 0x000100b1, 0x000fe400}}, {227, 177},
+                2.0f * std::bit_cast<float>(0x3c8efa35U) + 2.0f},
+    };
+    for (const auto& fixture : fixtures) {
+        const Instruction uniform_marker{{0x0000fc02, 0, 0, 0}};
+        const auto lowered = LowerToMaxwell(std::array{uniform_marker, fixture.instruction, Exit});
+        REQUIRE(lowered);
+        std::vector<u64> code{0x0100000000070000ULL | (15ULL << 12) | (0x40000000ULL << 20)};
+        for (const u32 source : fixture.sources) {
+            code.push_back(Shader::Ampere::NativeRegisterCopy(source >= 216 ? 1 : 0, source, 0, 0));
+        }
+        code.insert(code.end(), lowered.instructions.begin(), lowered.instructions.end() - 1);
+        const u32 destination = fixture.instruction.Bits(16, 8);
+        code.push_back(Shader::Ampere::NativeRegisterCopy(0, 0, destination >= 216 ? 1 : 0,
+                                                       destination));
+        code.push_back(Store(0));
+        code.push_back(lowered.instructions.back());
+        TranslateAndEmit(code, std::bit_cast<u32>(fixture.expected));
     }
 }
 

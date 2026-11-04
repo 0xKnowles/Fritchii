@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "video_core/buffer_cache/buffer_cache_base.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vertex_repack.h"
 
@@ -466,10 +467,14 @@ void BufferCacheRuntime::WaitSubmittedTick(u64 tick) {
     // back for it rather than waiting for the back's next submission. If the back has stopped,
     // nothing else uses the scheduler and Wait submits it.
     if (!scheduler.IsSubmitted(tick) && VideoCommon::GpuSplit::Get().Active() &&
-        !VideoCommon::GpuSplit::OnBackThread() && !scheduler.WaitSubmitted(tick)) {
-        scheduler.Wait(tick);
-        return;
+        !VideoCommon::GpuSplit::OnBackThread()) {
+        VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::ListSubmitWait};
+        if (!scheduler.WaitSubmitted(tick)) {
+            scheduler.Wait(tick);
+            return;
+        }
     }
+    VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::ListGpuWait};
     master.Wait(tick);
 }
 

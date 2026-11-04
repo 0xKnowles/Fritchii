@@ -806,10 +806,12 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
         if (lhs->has_secondary || rhs->has_secondary) {
             return std::nullopt;
         }
-        if (lhs->count > 1 || rhs->count > 1) {
+        if (lhs->count > 1 && rhs->count > 1) {
             return std::nullopt;
         }
-        if (lhs->shift_left > 0 || lhs->index > rhs->index || lhs->offset > rhs->offset) {
+        if (rhs->count > 1 ||
+            (lhs->count == 1 &&
+             (lhs->shift_left > 0 || lhs->index > rhs->index || lhs->offset > rhs->offset))) {
             std::swap(lhs, rhs);
         }
         return ConstBufferAddr{
@@ -819,8 +821,8 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
             .secondary_index = rhs->index,
             .secondary_offset = rhs->offset,
             .secondary_shift_left = rhs->shift_left,
-            .dynamic_offset = {},
-            .count = 1,
+            .dynamic_offset = lhs->dynamic_offset,
+            .count = lhs->count,
             .has_secondary = true,
         };
     }
@@ -889,18 +891,19 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
         };
     }
     IR::Inst* const offset_inst{offset.InstRecursive()};
-    if (offset_inst->GetOpcode() != IR::Opcode::IAdd32) {
-        return std::nullopt;
-    }
     u32 base_offset{};
-    IR::U32 dynamic_offset;
-    if (offset_inst->Arg(0).IsImmediate()) {
-        base_offset = offset_inst->Arg(0).U32();
-        dynamic_offset = IR::U32{offset_inst->Arg(1)};
-    } else if (offset_inst->Arg(1).IsImmediate()) {
-        base_offset = offset_inst->Arg(1).U32();
-        dynamic_offset = IR::U32{offset_inst->Arg(0)};
-    } else {
+    IR::U32 dynamic_offset{offset};
+    if (offset_inst->GetOpcode() == IR::Opcode::IAdd32) {
+        if (offset_inst->Arg(0).IsImmediate()) {
+            base_offset = offset_inst->Arg(0).U32();
+            dynamic_offset = IR::U32{offset_inst->Arg(1)};
+        } else if (offset_inst->Arg(1).IsImmediate()) {
+            base_offset = offset_inst->Arg(1).U32();
+            dynamic_offset = IR::U32{offset_inst->Arg(0)};
+        } else {
+            return std::nullopt;
+        }
+    } else if (offset_inst->GetOpcode() != IR::Opcode::ShiftLeftLogical32) {
         return std::nullopt;
     }
     auto const size_shift = DynamicDescriptorSizeShift(dynamic_offset);
@@ -1405,6 +1408,69 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
             if (IsPixelFormatSNorm(pixel_format)) {
                 PatchTexelFetch(*texture_inst.block, *texture_inst.inst, pixel_format);
             }
+        }
+    }
+}
+
+void LimitSampledTextureArrays(IR::Program& program, const HostTranslateInfo& host_info) {
+    auto& info = program.info;
+    const u32 arrays = static_cast<u32>(std::ranges::count_if(
+        info.texture_descriptors, [](const auto& desc) { return desc.count > 1; }));
+    if (arrays == 0) {
+        return;
+    }
+    const u32 buffers_and_images = NumDescriptors(info.constant_buffer_descriptors) +
+                                   NumDescriptors(info.storage_buffers_descriptors) +
+                                   NumDescriptors(info.image_descriptors) +
+                                   NumDescriptors(info.image_buffer_descriptors);
+    const u32 original_sampled = NumDescriptors(info.texture_descriptors) +
+                                 NumDescriptors(info.texture_buffer_descriptors);
+    if (original_sampled <= host_info.max_per_stage_descriptor_sampled_images &&
+        original_sampled <= host_info.max_descriptor_set_sampled_images &&
+        original_sampled + buffers_and_images <= host_info.max_per_stage_resources) {
+        return;
+    }
+    const u32 cap = DynamicSampledTextureCap(info, host_info, arrays);
+    for (auto& desc : info.texture_descriptors) {
+        desc.count = std::min(desc.count, cap);
+    }
+    const u32 sampled = NumDescriptors(info.texture_descriptors) +
+                        NumDescriptors(info.texture_buffer_descriptors);
+    const u32 resources = sampled + buffers_and_images;
+    if (sampled > host_info.max_per_stage_descriptor_sampled_images ||
+        sampled > host_info.max_descriptor_set_sampled_images ||
+        resources > host_info.max_per_stage_resources) {
+        throw NotImplementedException("Texture arrays exceed descriptor limits: sampled={}, resources={}",
+                                      sampled, resources);
+    }
+    for (IR::Block* const block : program.post_order_blocks) {
+        for (IR::Inst& inst : block->Instructions()) {
+            switch (inst.GetOpcode()) {
+            case IR::Opcode::ImageSampleImplicitLod:
+            case IR::Opcode::ImageSampleExplicitLod:
+            case IR::Opcode::ImageSampleDrefImplicitLod:
+            case IR::Opcode::ImageSampleDrefExplicitLod:
+            case IR::Opcode::ImageGather:
+            case IR::Opcode::ImageGatherDref:
+            case IR::Opcode::ImageFetch:
+            case IR::Opcode::ImageQueryDimensions:
+            case IR::Opcode::ImageQueryLod:
+            case IR::Opcode::ImageGradient:
+                break;
+            default:
+                continue;
+            }
+            const auto flags = inst.Flags<IR::TextureInstInfo>();
+            if (flags.type == TextureType::Buffer || inst.Arg(0).IsEmpty()) {
+                continue;
+            }
+            const u32 count = info.texture_descriptors[flags.descriptor_index].count;
+            if (count == 1) {
+                inst.SetArg(0, IR::Value{});
+                continue;
+            }
+            IR::IREmitter ir{*block, IR::Block::InstructionList::s_iterator_to(inst)};
+            inst.SetArg(0, ir.UMin(IR::U32{inst.Arg(0)}, ir.Imm32(count - 1)));
         }
     }
 }

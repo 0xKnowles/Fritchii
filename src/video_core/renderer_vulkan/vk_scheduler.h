@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -15,6 +16,7 @@
 #include <utility>
 #include <queue>
 #include <source_location>
+#include <vector>
 
 #include "common/alignment.h"
 #include "common/common_types.h"
@@ -77,6 +79,8 @@ public:
     void WaitWorker();
 
     void MarkFrameEnd(u64 frame);
+    void TraceGraphicsPipeline(const std::array<u64, 6>& hashes);
+    void TraceComputePipeline(u64 hash);
 
     /// Sends currently recorded work to the worker thread.
     void DispatchWork();
@@ -389,6 +393,7 @@ private:
     void AllocateWorkerCommandBuffer();
 
     void TraceGpuSubmission();
+    void TraceShader(u64 hash, u32 stage);
 
     u64 SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore);
 
@@ -410,6 +415,20 @@ private:
 
     vk::QueryPool trace_query_pool;
     static constexpr u32 TraceMaxSubmissions = 512;
+    struct SubmissionTrace {
+        struct ShaderUse {
+            u64 hash{};
+            u32 stage{};
+        };
+        u64 tick{};
+        u32 draw_attempts{};
+        u32 dispatch_attempts{};
+        u32 num_shaders{};
+        u32 untracked_uses{};
+        std::array<ShaderUse, 32> shaders{};
+    };
+    SubmissionTrace trace_work;
+    std::vector<SubmissionTrace> trace_submissions;
     Common::DkbFrameTrace::RateLimit trace_gpu_rate;
     u64 trace_gpu_tick{};
     u64 trace_frame_end{};
