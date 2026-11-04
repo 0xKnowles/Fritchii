@@ -85,7 +85,7 @@ inline bool StarFoxColor(const Tegra::Texture::TICEntry& image,
                          Tegra::Texture::TextureFormat format,
                          Tegra::Texture::ComponentType component, bool srgb) {
     using namespace Tegra::Texture;
-    return PlainImage(image) && image.format == format && image.srgb_conversion == srgb &&
+    return PlainImage(image) && image.format == format && (image.srgb_conversion != 0) == srgb &&
            image.r_type == component && image.g_type == component &&
            image.b_type == component && image.a_type == component &&
            image.x_source == SwizzleSource::R && image.y_source == SwizzleSource::G &&
