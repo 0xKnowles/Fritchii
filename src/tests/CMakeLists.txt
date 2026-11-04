@@ -34,6 +34,7 @@ add_executable(tests
     video_core/maxwell_numeric.cpp
     video_core/maxwell_permute_lod.cpp
     video_core/submission_policy.cpp
+    video_core/framebuffer_clear_layers.cpp
     video_core/fire_emblem_upscale.cpp
     video_core/dlss_contract.cpp
     video_core/ampere_fast_fusion.cpp
@@ -57,6 +58,7 @@ add_executable(tests
     video_core/ampere_ported_uniform_vote.cpp
     video_core/ampere_ported_textures.cpp
     video_core/ampere_tennis_i2f.cpp
+    video_core/ampere_tennis_tessellation.cpp
     video_core/pipeline_cache_files.cpp
     video_core/storage_binding_capacity.cpp
     video_core/native_indirect_reset.cpp

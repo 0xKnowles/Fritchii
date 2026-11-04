@@ -176,6 +176,8 @@ private:
 
     void FlushWork();
 
+    void TraceRenderState(bool is_indexed, const char* outcome, const Framebuffer* framebuffer);
+
     bool TryNativeIndirectReset(bool is_indexed, u32 instance_count);
     /// Records the copies of the command list pages the work just recorded wrote and submits, so
     /// the GPU makes them now (BufferCache::Nx2CopyListPages).
@@ -251,6 +253,9 @@ private:
     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
 
     u32 draw_counter = 0;
+    u64 render_trace_frame = 0;
+    u32 render_trace_draws = 0;
+    u32 render_trace_clears = 0;
     bool pending_native_work{};
     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
 };

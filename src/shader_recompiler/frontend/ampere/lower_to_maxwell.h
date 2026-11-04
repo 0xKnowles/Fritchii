@@ -19,6 +19,12 @@
 
 namespace Shader::Ampere {
 
+enum class TessellationStage {
+    None,
+    Control,
+    Evaluation,
+};
+
 struct LoweredProgram {
     std::vector<u64> instructions;
     std::vector<u32> source_instruction_offsets;
@@ -38,7 +44,8 @@ struct LoweredProgram {
 // native bytes. Scheduling/control words are added by the environment adapter.
 inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 high_uniforms,
                                         bool geometry_stage, bool compact_matrix,
-                                        std::span<const u32> verified_traps = {}) {
+                                        std::span<const u32> verified_traps = {},
+                                        TessellationStage tessellation_stage = TessellationStage::None) {
     LoweredProgram result;
     // UR28 and up (when used) live just below R216: UR28 at R(216 - high_uniforms).
     const u32 high_uniform_base = 216 - high_uniforms;
@@ -2669,9 +2676,20 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         }
         case 0x321: // ALD
         case 0x322: { // AST
-            if (insn.Bits(76, 2) || insn.Bits(79, 1)) return fail(index, "native indexed/patch attribute access");
+            const bool patch = insn.Bits(76, 1) != 0;
+            const bool output = insn.Bits(79, 1) != 0;
             const u32 address = insn.Bits(40, 10);
             const u32 components = insn.Bits(74, 2) + 1;
+            const bool tessellation_coordinates =
+                tessellation_stage == TessellationStage::Evaluation && opcode == 0x321 &&
+                !patch && address >= 0x2f0 && address + components * 4 <= 0x2f8;
+            if (insn.Bits(77, 1) || (patch && tessellation_stage == TessellationStage::None) ||
+                (output && ((!patch && !tessellation_coordinates) || opcode != 0x321)) ||
+                (patch && opcode == 0x321 &&
+                 output != (tessellation_stage == TessellationStage::Control)) ||
+                (patch && opcode == 0x322 && tessellation_stage != TessellationStage::Control)) {
+                return fail(index, "native indexed/patch attribute access");
+            }
             if (address % 4 || address + components * 4 > 0x400 || insn.Bits(24, 8) != 255) {
                 return fail(index, "native attribute address or indexing");
             }
@@ -2689,6 +2707,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const u32 vertex = opcode == 0x321 ? insn.Bits(32, 8) : insn.Bits(64, 8);
             const u64 translated = (opcode == 0x321 ? 0xefd8000000000000ULL : 0xeff0000000000000ULL) |
                 predicate | value_reg | (u64{255} << 8) | (u64{address} << 20) |
+                (u64{patch} << 31) | (u64{output} << 32) |
                 (u64{vertex} << 39) | (u64{components - 1} << 47);
             result.instructions.push_back(translated);
             break;
@@ -3541,10 +3560,12 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             break;
         }
         case 0x923: case 0x927: { // ISBERD / ISBEWR: task and mesh programs' stage buffer.
-            if (geometry_stage) {
+            if (geometry_stage || tessellation_stage != TessellationStage::None) {
                 if (opcode != 0x923 || insn.words[1] || insn.words[2] ||
                     insn.Bits(24, 8) == 255)
-                    return fail(index, "native geometry stage buffer read mode");
+                    return fail(index, tessellation_stage != TessellationStage::None
+                                           ? "native tessellation stage buffer read mode"
+                                           : "native geometry stage buffer read mode");
                 emit(base(0x5c98000000000000ULL) | (u64{15} << 39) |
                      (u64{insn.Bits(24, 8)} << 20));
                 break;
@@ -3645,12 +3666,13 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
 
 inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code, bool geometry_stage = false,
                                     bool compact_matrix = false,
-                                    std::span<const u32> verified_traps = {}) {
+                                    std::span<const u32> verified_traps = {},
+                                    TessellationStage tessellation_stage = TessellationStage::None) {
     // Programs using uniform registers above UR27 are lowered again with mirrors for them.
     u32 high_uniforms = 0;
     for (;;) {
         LoweredProgram lowered = LowerToMaxwellWith(code, high_uniforms, geometry_stage, compact_matrix,
-                                                  verified_traps);
+                                                  verified_traps, tessellation_stage);
         if (lowered || lowered.high_uniform_registers <= high_uniforms) return lowered;
         high_uniforms = lowered.high_uniform_registers;
     }
