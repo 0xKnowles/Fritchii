@@ -1126,9 +1126,27 @@ TEST_CASE("Fast Fusion captured immediate unsigned conversions preserve rounding
         }
         for (u32 bit : {24U, 31U, 64U, 72U, 74U, 75U, 76U, 78U, 79U, 81U, 84U, 85U, 91U, 96U, 104U,
                         126U, 127U}) {
+            CAPTURE(bit);
             auto invalid = original;
             invalid.words[bit / 32] ^= 1U << (bit % 32);
-            CHECK_FALSE(LowerToMaxwell(std::array{invalid, Exit}));
+            const auto modified = LowerToMaxwell(std::array{invalid, Exit});
+            if (bit == 74 || bit == 78 || bit == 79) {
+                REQUIRE(modified);
+                REQUIRE(modified.instructions.size() == 3);
+                CHECK(modified.instructions[0] ==
+                      (0x010000000007f0faULL | (u64{original.words[1]} << 20)));
+                CHECK(modified.instructions[1] ==
+                      (0x5cb800000fa70a00ULL | original.Bits(16, 8) |
+                       (u64{invalid.Bits(74, 1)} << 13) | (u64{invalid.Bits(78, 2)} << 39)));
+                HalfIR translation{modified.instructions};
+                REQUIRE_FALSE(translation.block.Instructions().empty());
+                if (bit == 74) {
+                    CHECK(translation.Run(0, 0, original.Bits(16, 8)) ==
+                          (round_up ? 0x42000000U : 0x43800000U));
+                }
+            } else {
+                CHECK_FALSE(modified);
+            }
         }
         auto scratch = original;
         scratch.words[0] = (scratch.words[0] & ~0xff0000U) | (250U << 16);
@@ -1545,7 +1563,13 @@ TEST_CASE("Fast Fusion logged opcode support keeps nearby unsupported modes reje
     copy.words[0] = (copy.words[0] & ~0xff000000U) | (246U << 24);
     CHECK_FALSE(LowerToMaxwell(std::array{copy, Exit}));
     const Instruction masked_wait{{0x0000791a, 0x00008001, 0, 0}};
-    CHECK_FALSE(LowerToMaxwell(std::array{masked_wait, Exit}));
+    const auto ordered = LowerToMaxwell(std::array{masked_wait, Exit});
+    REQUIRE(ordered);
+    REQUIRE(ordered.instructions.size() == 2);
+    CHECK(ordered.instructions.front() == 0xef98000000070000ULL);
+    auto invalid_wait = masked_wait;
+    invalid_wait.words[1] |= 1U << 16;
+    CHECK_FALSE(LowerToMaxwell(std::array{invalid_wait, Exit}));
     CHECK_FALSE(Shader::Ampere::LowerToMaxwellWith(std::array{UniformBank, LoggedMove, Exit}, 2,
                                                    false, false));
     for (u32 bit : {12U, 13U, 14U, 15U}) {
