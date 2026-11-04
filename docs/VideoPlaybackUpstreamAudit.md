@@ -16,7 +16,7 @@ The complete search result list is in [the inventory](VideoPlaybackUpstreamInven
 | #123 | `9332056123` | Apply collected CPU writes before downloading GPU data. |
 | #123 | `1e6cfd5b4e` | Port the bounded synchronous-submit wait as an opt-in diagnostic. Do not enable the old Yoshi-specific default. This fork already snapshots submitted command words and has newer GPU-write synchronization. |
 | #118 | `2d3b628b2f` | Port only queued-EOS ready-event suppression. Keep the later #356 fence policy and this fork's existing stop/finalize and Mario Kart synthetic-EOS behavior. Do not port immediate release-fence completion. |
-| #472 | `33ebba968f` | Port only video input backpressure. Reject a ninth queued input with 0x1c266f instead of allowing an unbounded queue. |
+| #472 | `33ebba968f` | Initially ported the eight-packet admission limit. Reverted after the Mario Tennis CPU trace showed 606 rejected packets with no retry in one small-video session. The queue now retains all submitted packets and uses eight only as the readiness watermark. |
 | #24 | `896af9f676`, `71630ffba8`, `bcaeef479d` | Decoder sessions, syncpoint cancellation, and the FFmpeg service implementation already exist. |
 | #356 | `8d6cb5c0d4`, `701c91b402`, `3ffa971337`, `031e58e930`, `873cae5569` | VP9, H.264 detection, GPU invalidation, default pending EOS fences, and direct NV12 copies already exist. |
 | #218 | `6f33896d8c`, `959973a76a` | AV1 codec and MSVC/Linux AV1 package selection already exist. |

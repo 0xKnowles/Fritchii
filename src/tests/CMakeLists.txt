@@ -88,6 +88,7 @@ add_executable(tests
     core/nup_writer.cpp
     core/nup_metadata.cpp
     core/nx2_image_layout.cpp
+    core/nx2_video_input_queue.cpp
     core/ldn.cpp
     core/internal_network/socket_proxy.cpp
     core/priority_queue.cpp
