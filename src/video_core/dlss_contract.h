@@ -5,8 +5,17 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include "video_core/surface.h"
 
 namespace VideoCommon::DlssContract {
+
+constexpr bool ValidColorFormats(VideoCore::Surface::PixelFormat input,
+                                  VideoCore::Surface::PixelFormat output, bool use_history) {
+    using VideoCore::Surface::PixelFormat;
+    return (input == PixelFormat::B10G11R11_FLOAT && output == input) ||
+           (!use_history && input == PixelFormat::A8B8G8R8_SRGB &&
+            output == PixelFormat::R16G16B16A16_FLOAT);
+}
 
 constexpr std::uint64_t FastFusionProgramId = 0x040041E0212AE000ULL;
 constexpr std::array FastFusionCandidates{0xb8ed9b1cd5c24e6dULL, 0x7f0f03c0529ca569ULL,

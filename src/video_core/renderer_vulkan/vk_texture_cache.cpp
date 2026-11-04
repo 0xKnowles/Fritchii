@@ -1987,7 +1987,7 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
     const VkExtent2D output_extent = dst_framebuffer->RenderArea();
     if (!plain(dst) || !plain(input_color) || !fits(input_color, render_size) ||
         !fits(dst, {output_extent.width, output_extent.height}) ||
-        input_color.format != PixelFormat::B10G11R11_FLOAT || dst.format != input_color.format ||
+        !VideoCommon::DlssContract::ValidColorFormats(input_color.format, dst.format, use_history) ||
         input_color.ImageHandle() == dst.ImageHandle() ||
         !VideoCommon::DlssContract::ValidGeometry(render_size,
                                                  {output_extent.width, output_extent.height},

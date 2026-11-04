@@ -624,9 +624,9 @@ bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
         TraceDlssContract(native_key, false);
     }
     if (native_key == passes->prepass) {
+        dlss_chain.spatial_only = passes->spatial_only;
         CaptureFireEmblemJitter();
         dlss_chain.active = true;
-        dlss_chain.spatial_only = passes->spatial_only;
         dlss_chain.rejected = 0;
         dlss_chain.dispatches = 0;
         dlss_chain.pending.clear();
@@ -941,13 +941,15 @@ void KeplerCompute::CaptureFireEmblemJitter() {
         return;
     }
     const auto color = GetTICEntry(index);
-    if (color.format != Texture::TextureFormat::B10G11R11 || !color.IsBlockLinear()) {
+    if (!ValidInput(color, dlss_chain.spatial_only)) {
         return;
     }
     fe_upscale_jitter.Capture(color.Address(), color.Width(), color.Height(),
         {std::bit_cast<f32>(memory_manager.Read<u32>(address + JitterOffset)),
          std::bit_cast<f32>(memory_manager.Read<u32>(address + JitterOffset + sizeof(f32)))});
-    RememberDlssMotionVectors();
+    if (!dlss_chain.spatial_only) {
+        RememberDlssMotionVectors();
+    }
 }
 
 void KeplerCompute::TraceDlssContract(u64 native_key, bool warn_unvalidated) {
@@ -1038,7 +1040,7 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
     };
     const auto input = image(OutputColorInputOffset);
     const auto output = image(OutputColorOffset);
-    if (!input || !output || !VideoCommon::FireEmblemUpscale::ValidPair(*input, *output) ||
+    if (!input || !output || !ValidPair(*input, *output, dlss_chain.spatial_only) ||
         jitter->color != input->Address() || (use_history && dlss_motion_color != input->Address()) ||
         jitter->width != input->Width() || jitter->height != input->Height()) {
         return false;
@@ -1057,9 +1059,12 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
         result.addr_lower = static_cast<u32>(tic.Address());
         return result;
     };
+    const auto input_format = dlss_chain.spatial_only ? Tegra::RenderTargetFormat::A8B8G8R8_SRGB
+                                                     : Tegra::RenderTargetFormat::B10G11R11_FLOAT;
+    const auto output_format = dlss_chain.spatial_only ? Tegra::RenderTargetFormat::R16G16B16A16_FLOAT
+                                                      : Tegra::RenderTargetFormat::B10G11R11_FLOAT;
     const bool done = rasterizer->AccelerateTemporalUpscale(
-        surface(*input, Tegra::RenderTargetFormat::B10G11R11_FLOAT),
-        surface(*output, Tegra::RenderTargetFormat::B10G11R11_FLOAT),
+        surface(*input, input_format), surface(*output, output_format),
         use_history ? surface(*motion, Tegra::RenderTargetFormat::R16G16_FLOAT) : Fermi2D::Surface{},
         use_history ? &*depth : nullptr, jitter->offset,
         use_history ? std::array{1.0f, 1.0f} : std::array{0.0f, 0.0f}, use_history);

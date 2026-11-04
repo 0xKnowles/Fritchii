@@ -73,17 +73,47 @@ inline bool UseReplacement(u64 program_id, u64 native_key, const char* option) {
            (option == nullptr || (std::string_view{option} == "fsr" || std::string_view{option} == "dlss"));
 }
 
-inline bool ValidPair(const Tegra::Texture::TICEntry& input,
-                      const Tegra::Texture::TICEntry& output) {
+inline bool PlainImage(const Tegra::Texture::TICEntry& image) {
     using namespace Tegra::Texture;
-    const auto plain_image = [](const TICEntry& image) {
-        return (image.texture_type == TextureType::Texture2D ||
-                image.texture_type == TextureType::Texture2DNoMipmap) &&
-               image.format == TextureFormat::B10G11R11 && image.IsBlockLinear() &&
-               image.Depth() == 1 && image.BaseLayer() == 0 &&
-               image.max_mip_level == 0 && image.Address() != 0;
-    };
-    return plain_image(input) && plain_image(output) &&
+    return (image.texture_type == TextureType::Texture2D ||
+            image.texture_type == TextureType::Texture2DNoMipmap) && image.IsBlockLinear() &&
+           image.Depth() == 1 && image.BaseLayer() == 0 &&
+           image.max_mip_level == 0 && image.Address() != 0;
+}
+
+inline bool StarFoxColor(const Tegra::Texture::TICEntry& image,
+                         Tegra::Texture::TextureFormat format,
+                         Tegra::Texture::ComponentType component, bool srgb) {
+    using namespace Tegra::Texture;
+    return PlainImage(image) && image.format == format && image.srgb_conversion == srgb &&
+           image.r_type == component && image.g_type == component &&
+           image.b_type == component && image.a_type == component &&
+           image.x_source == SwizzleSource::R && image.y_source == SwizzleSource::G &&
+           image.z_source == SwizzleSource::B && image.w_source == SwizzleSource::A &&
+           image.res_min_mip_level == 0 && image.res_max_mip_level == 0 &&
+           image.msaa_mode == MsaaMode::Msaa1x1 && image.block_width == 0 &&
+           image.block_depth == 0 && image.is_sparse == 0;
+}
+
+inline bool ValidInput(const Tegra::Texture::TICEntry& input, bool spatial_only = false) {
+    using namespace Tegra::Texture;
+    if (spatial_only) {
+        return StarFoxColor(input, TextureFormat::A8B8G8R8, ComponentType::UNORM, true);
+    }
+    return input.format == TextureFormat::B10G11R11 && input.IsBlockLinear();
+}
+
+inline bool ValidPair(const Tegra::Texture::TICEntry& input,
+                      const Tegra::Texture::TICEntry& output, bool spatial_only = false) {
+    using namespace Tegra::Texture;
+    if (spatial_only) {
+        return ValidInput(input, true) &&
+               StarFoxColor(output, TextureFormat::R16G16B16A16, ComponentType::FLOAT, false) &&
+               input.Address() != output.Address() && input.Width() == output.Width() &&
+               input.Height() == output.Height();
+    }
+    return PlainImage(input) && PlainImage(output) &&
+           input.format == TextureFormat::B10G11R11 && output.format == TextureFormat::B10G11R11 &&
            input.Address() != output.Address() && output.Width() > input.Width() &&
            output.Height() > input.Height();
 }

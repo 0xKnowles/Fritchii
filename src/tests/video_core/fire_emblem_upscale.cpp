@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <type_traits>
+#include <bit>
 #include <limits>
 #include <catch2/catch_test_macros.hpp>
 #include "shader_recompiler/exception.h"
@@ -172,4 +173,61 @@ TEST_CASE("Star Fox captured passes use the validated colour and jitter slots", 
     REQUIRE(fire_emblem);
     REQUIRE_FALSE(fire_emblem->spatial_only);
     REQUIRE_FALSE(FE::CapturedPasses(0x040074A01BF12000ULL));
+}
+
+TEST_CASE("Star Fox logged native-resolution cutscene colour pair is accepted", "[starfox_upscale]") {
+    const auto input = std::bit_cast<TICEntry>(std::array<u32, 8>{
+        0x58d24908, 0x26f62000, 0x00600081, 0x00070020,
+        0xe8c0077f, 0x80000437, 0x03000000, 0x00000000});
+    const auto output = std::bit_cast<TICEntry>(std::array<u32, 8>{
+        0x58d7ff83, 0x352f1000, 0x00600081, 0x00070020,
+        0xe880077f, 0x80000437, 0x03000000, 0x00000000});
+    REQUIRE(input.Width() == 1920);
+    REQUIRE(input.Height() == 1080);
+    REQUIRE(output.Width() == input.Width());
+    REQUIRE(output.Height() == input.Height());
+    REQUIRE_FALSE(FE::ValidInput(input));
+    REQUIRE_FALSE(FE::ValidPair(input, output));
+    REQUIRE(FE::ValidInput(input, true));
+    REQUIRE(FE::ValidPair(input, output, true));
+    FE::FrameJitter state;
+    state.Capture(input.Address(), input.Width(), input.Height(),
+                  {std::bit_cast<f32>(0x3ec00000U), std::bit_cast<f32>(0x3d638e40U)});
+    const auto sample = state.Take();
+    REQUIRE(sample);
+    REQUIRE(sample->color == input.Address());
+    REQUIRE(sample->offset[0] == 0.375f);
+    REQUIRE_FALSE(state.Take());
+
+    for (const bool alter_input : {false, true}) {
+        const auto rejected = [&](auto mutate) {
+            auto from = input;
+            auto to = output;
+            mutate(alter_input ? from : to);
+            REQUIRE_FALSE(FE::ValidPair(from, to, true));
+        };
+        rejected([](auto& image) { image.srgb_conversion.Assign(!image.srgb_conversion); });
+        rejected([](auto& image) { image.r_type.Assign(ComponentType::UINT); });
+        rejected([](auto& image) { image.a_type.Assign(ComponentType::UNORM_FORCE_FP16); });
+        rejected([](auto& image) { image.x_source.Assign(SwizzleSource::B); });
+        rejected([](auto& image) { image.w_source.Assign(SwizzleSource::OneFloat); });
+        rejected([](auto& image) { image.format.Assign(TextureFormat::B10G11R11); });
+        rejected([](auto& image) { image.texture_type.Assign(TextureType::Texture2DArray); });
+        rejected([](auto& image) { image.header_version.Assign(TICHeaderVersion::Pitch); });
+        rejected([](auto& image) { image.depth_minus_1.Assign(1); });
+        rejected([](auto& image) { image.max_mip_level.Assign(1); });
+        rejected([](auto& image) { image.res_min_mip_level.Assign(1); });
+        rejected([](auto& image) { image.res_max_mip_level.Assign(1); });
+        rejected([](auto& image) { image.layer_base_3_7.Assign(4); });
+        rejected([](auto& image) { image.width_minus_one.Assign(1279); });
+        rejected([](auto& image) { image.height_minus_1.Assign(719); });
+        rejected([](auto& image) { image.msaa_mode.Assign(MsaaMode::Msaa2x2); });
+        rejected([](auto& image) { image.block_depth.Assign(1); });
+        rejected([](auto& image) { image.is_sparse.Assign(1); });
+        rejected([](auto& image) { image.address_low = 0; image.address_high.Assign(0); });
+    }
+    auto alias = output;
+    alias.address_low = input.address_low;
+    alias.address_high.Assign(input.address_high);
+    REQUIRE_FALSE(FE::ValidPair(input, alias, true));
 }

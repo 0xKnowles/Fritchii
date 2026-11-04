@@ -44,6 +44,30 @@ size checks. Missing or inconsistent inputs leave the native result untouched.
 Samples are consumed once, and incomplete chains expire after 64 dispatches.
 Fire Emblem's existing behavior is unchanged.
 
+## Native-resolution cutscene capture
+
+The next log, from `2c1314aa04`, reaches both of the same fingerprints twelve
+times in its bounded trace. At 46.951708 seconds it reports
+`Star Fox replacement lacks current inputs: jitter=false`. There is no
+`Star Fox DLSS replacement: applied` message anywhere in that log. The reported
+gameplay improvement cannot be attributed to an applied spatial replacement.
+
+The rejected contract is the colour format and extent, not a different shader
+variant or different slots. The input at `0x278`/`0x328` is a 1920x1080 RGBA8
+UNORM image with sRGB sampling; the output at `0x348` is a different 1920x1080
+RGBA16-float image. The old Fire Emblem checks require B10G11R11 at both ends
+and a strictly larger output. The first check discards the otherwise valid
+captured jitter, and the output and Vulkan format checks would also reject it.
+
+Star Fox now accepts only this logged, equal-resolution format pair, with
+identity RGBA swizzles and the recorded component types. Mipmapped, multisampled,
+sparse, layered, aliasing or unequal-sized images are rejected. The source is
+bound through an sRGB view, so sampling decodes it to linear colour before writing
+the float output. The spatial and sharpening passes write only RGB, preserving
+the alpha produced by the native pass and its separate output at `0x350`.
+Fire Emblem keeps its original format and upscale restrictions. No new shader
+fingerprints or slot-search heuristics are added.
+
 ## Owner-side comparison
 
 Start a fresh process with `EDEN_NX2_DLSS_CONTRACT_TRACE=1` and log filter
