@@ -109,6 +109,7 @@ constexpr std::array<Instruction, 79> TennisControl{{
     {{0x0000794d, 0x00000000, 0x03800000, 0x000fea00}},
 }};
 
+// Run3 logged only these five header words; the test environment zero-fills the unknown remainder.
 constexpr std::array<u32, 5> TennisEvaluationHeaderPrefix{0x000c0c81, 0, 0, 0, 0xbd0bc000};
 
 constexpr std::array<Instruction, 47> TennisEvaluation{{
@@ -354,6 +355,7 @@ TEST_CASE("Captured Mario Tennis Fever evaluation shader reads both tessellation
     Shader::Profile profile{};
     profile.supported_spirv = 0x00010300;
     Shader::RuntimeInfo runtime{};
+    // The capture has no runtime tessellation state; quads are a synthetic test context.
     runtime.tess_primitive = Shader::TessPrimitive::Quads;
     Shader::Backend::Bindings bindings{};
     const auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime, program, bindings);
