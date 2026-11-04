@@ -21,6 +21,7 @@
 #include "shader_recompiler/environment.h"
 #include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
 #include "shader_recompiler/frontend/ampere/program_address_map.h"
+#include "shader_recompiler/frontend/ampere/program_capture.h"
 #include "shader_recompiler/frontend/ampere/trap_guards.h"
 #include "shader_recompiler/frontend/maxwell/structured_control_flow.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
@@ -523,6 +524,7 @@ int main(int argc, char** argv) {
         std::optional<Stage> requested_stage;
         u32 version{};
         bool lower_only{};
+        bool capture_extent{};
         for (int i = 1; i < argc; ++i) {
             const std::string arg{argv[i]};
             if (arg == "--help") {
@@ -530,13 +532,18 @@ int main(int argc, char** argv) {
                              "vertex|tess-control|tess-eval|geometry|fragment|compute]\n"
                              "  [--format instructions|native-header] [--environment FILE "
                              "--cache-version 46|47|48|49]\n"
-                             "  [--pipeline-key FILE] (--output SPV | --lower-only WORDS)\n";
+                             "  [--pipeline-key FILE] [--capture-extent] "
+                             "(--output SPV | --lower-only WORDS)\n";
                 return 0;
             }
             if (!arg.starts_with("--")) {
                 if (!input.empty())
                     throw std::runtime_error("Multiple input files");
                 input = arg;
+                continue;
+            }
+            if (arg == "--capture-extent") {
+                capture_extent = true;
                 continue;
             }
             if (++i == argc)
@@ -563,7 +570,8 @@ int main(int argc, char** argv) {
                 throw std::runtime_error("Unknown option " + arg);
         }
         if (output.empty() || (input.empty() && environment.empty()) ||
-            (environment.empty() != (version == 0)) || (lower_only && input.empty())) {
+            (environment.empty() != (version == 0)) || (lower_only && input.empty()) ||
+            (capture_extent && input.empty())) {
             throw std::runtime_error("Invalid arguments; see --help");
         }
         if (format != "instructions" && format != "native-header")
@@ -615,6 +623,27 @@ int main(int argc, char** argv) {
             std::vector<Instruction> native((bytes.size() - header_size) / sizeof(Instruction));
             std::memcpy(native.data(), bytes.data() + header_size,
                         native.size() * sizeof(Instruction));
+            if (capture_extent) {
+                diagnostic["phase"] = "capture";
+                diagnostic["allocation_bytes"] = native.size() * sizeof(Instruction);
+                Shader::Ampere::ProgramCaptureState capture;
+                bool complete = false;
+                for (u32 index = 0; index < native.size(); ++index) {
+                    const auto result = capture.Observe(native[index], index);
+                    if (result == Shader::Ampere::ProgramCaptureState::Result::InvalidTarget) {
+                        throw MissingContext("Native allocation has an out-of-range branch target");
+                    }
+                    if (result == Shader::Ampere::ProgramCaptureState::Result::Complete) {
+                        native.resize(index + 1);
+                        complete = true;
+                        break;
+                    }
+                }
+                if (!complete) {
+                    throw MissingContext("Native allocation lacks a complete runtime capture");
+                }
+                diagnostic["source_bytes"] = native.size() * sizeof(Instruction);
+            }
             diagnostic["phase"] = "lower";
             std::vector<u32> traps;
             for (u32 i = 0; i < native.size(); ++i) {

@@ -19,6 +19,13 @@ Users report game bugs with Lichii logs (`eden_log.txt`, `eden_log.txt.old`). Ea
 | 0400C3F00006E000 | Mario Kart World |
 | 04008E001F098000 | Nintendo Switch Sports Resort |
 | 0400A3A01EE4C000 | Pokémon Pokopia |
+| 0400A4802437E000 | Drag x Drive Global Jam |
+| 040041E0212AE000 | Fast Fusion |
+| 04005B902517C000 | Kirby Air Riders Global Test Ride |
+| 040057C02159A000 | Nintendo Switch 2 Welcome Tour |
+| 040004F027560000 | Orbitals Global Friends Pass |
+| 0400380020056000 | Raiders |
+| 0400D1D02399A000 | The Duskbloods network test |
 
 Add ids here when a report identifies a new game.
 

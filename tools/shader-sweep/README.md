@@ -103,3 +103,87 @@ by the caller. Compilation failures do not overwrite the requested output.
 ```sh
 spirv-val --target-env vulkan1.2 shader.spv
 ```
+
+## Static archive inputs
+
+`--capture-extent` accepts an allocated native code region and uses the runtime's
+capture state machine to find its complete instruction extent. Padding is retained
+in the extraction artifact, not treated as executable instructions. Missing
+completion or invalid branch targets remain context failures.
+
+The [all-library sweep report](../../docs/shader-sweep-all-games-20261104.md)
+describes read-only inventory, NUP export, bounded archive extraction, preserved
+control blobs, and static replay. Its cache associations are inferred, and its
+synthetic-context validations are explicitly partial. Neither is a substitute for
+capturing the original pipeline state.
+
+## Replay extracted library shaders
+
+Run inventory and extraction on the machine holding the library. Re-list it before
+each source operation and skip files that disappeared. Use a fresh output directory
+outside the library for every extraction. Examples use Bash variables.
+
+```sh
+python3 tools/nx2/inventory_games.py "$LIBRARY" --output "$WORK/inventory.json"
+python3 tools/nx2/extract_static_shaders.py \
+  --inventory "$WORK/inventory.json" --read-only-root "$LIBRARY" \
+  --output "$WORK/static"
+```
+
+The Windows command is `py -3`; Python 3.14 supplies the zstd decoder there. Linux
+uses the system `libzstd`. The bounded readers support NVN2 BNSH/BFSHA/SARC,
+SHN/LZ4/SHDROUNC, and the observed DCX/BND4/CGSB layouts. They preserve complete
+code and control allocations, SHA256s, container/member offsets and all origins.
+Missing formats, unreadable sources and omitted inventory entries are errors.
+
+The tools do not apply production fixes. To reproduce the coverage report's after column, build a
+revision containing all three fixes listed in that report; the tooling branch keeps their code in
+separate PRs.
+
+Build the standalone compiler and exporter on Linux with clang and Ninja:
+
+```sh
+cmake -S tools/shader-sweep -B "$WORK/build" -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang \
+  -DCMAKE_CXX_COMPILER=clang++ -DBUILD_TESTING=ON
+cmake --build "$WORK/build" --parallel 8
+ctest --test-dir "$WORK/build" --output-on-failure
+```
+
+The exporter can catalog a NUP without exporting its asset payloads. Explicit
+selectors include the package index; inspect the catalog before choosing them.
+The broad `--candidates` heuristic can include large non-shader archives, so it
+is not a claim that every candidate is a shader.
+
+```sh
+"$WORK/build/nup-shader-export" --input "$GAME_NUP" \
+  --read-only-root "$LIBRARY" --output "$WORK/catalog" --list
+"$WORK/build/nup-shader-export" --input "$GAME_NUP" \
+  --read-only-root "$LIBRARY" --output "$WORK/export" \
+  --path '0:/Shader/example.bfsha'
+```
+
+`tools/shader-sweep/build_nup_windows.py` builds this exporter into scratch using
+an already configured clang-cl build's headers and libraries read-only. Its six
+compile jobs and all object, PDB and executable outputs stay under `--work-dir`.
+
+Transfer only the extracted shader corpus to the compiler machine, then run:
+
+```sh
+python3 tools/nx2/sweep_static_shaders.py "$CORPUS/manifest.json" \
+  --read-only-root "$CORPUS" --compiler "$WORK/build/shader-sweep" \
+  --cache-directory "$CACHES" --output "$WORK/replay" --jobs 8
+```
+
+The replay requires `spirv-val`. Its output directory must be new and outside all
+declared read-only roots, input manifests and cache directories. It checks artifact
+hashes, retains distinct control blobs, and writes `run.json`, `results.jsonl`,
+`results.json`, `archive-errors.json`, and `summary.md`. `run.json` records executable,
+runner and manifest hashes. Any failed or partial coverage returns a nonzero exit.
+
+`--capture-extent` uses the runtime's `ProgramCaptureState`; it does not search for
+an arbitrary EXIT or invent a missing header. Compute input is bounded by the
+observed c9 control record's declared code region before runtime extent discovery.
+All 683 complete compute captures in this corpus fit that bound. The other eight
+remain incomplete. Workgroup dimensions, resource descriptors and mesh launch
+state are not guessed.

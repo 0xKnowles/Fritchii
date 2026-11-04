@@ -238,6 +238,21 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result["phase"], "context")
         self.assertIn("constant buffer", result["error"]["message"])
 
+    def test_static_allocation_uses_runtime_capture_boundary(self):
+        source = self.write("allocation.bin", header(0) + bytes(48) + NATIVE_EXIT + bytes(256))
+        result = self.run_cli(source, "--format", "native-header", "--capture-extent",
+                              "--lower-only", self.output)
+        self.assertEqual(result["source_bytes"], 16)
+        self.assertEqual(result["allocation_bytes"], 272)
+
+    def test_static_allocation_does_not_guess_a_missing_branch_target(self):
+        branch = struct.pack("<4I", 0x7947, 0x80, 0x03800000, 0)
+        source = self.write("allocation.bin", header(0) + bytes(48) + branch + NATIVE_EXIT)
+        result = self.run_cli(source, "--format", "native-header", "--capture-extent",
+                              "--lower-only", self.output, code=1)
+        self.assertEqual(result["phase"], "context")
+        self.assertIn("complete runtime capture", result["error"]["message"])
+
 
 if __name__ == "__main__":
     unittest.main()

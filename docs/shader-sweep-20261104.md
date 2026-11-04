@@ -10,7 +10,7 @@ not passed. This does not establish correct in-game rendering.
 - Mario Tennis Fever provided 667 `mtf-shaders-run2` files and 663 `mtf-shaders` files. The
   1,330 files contain 482 distinct byte sequences, including one header-bearing rejection dump.
 - Twelve serialized Vulkan cache files cover ten title IDs, including Bananza, Star Fox,
-  Kirby Air Riders, Yoshi, Mario Tennis and Fire Emblem. They contain 12,598 environments.
+  Kirby Air Riders, Yoshi, Mario Tennis, Mario Kart World and Fire Emblem. They contain 12,598 environments.
   Nine driver blobs or used-pipeline indexes were not shader-environment inputs.
 - Native-to-cache matching supplied captured headers, stages and resource specialization
   data for 1,325 native files. The five unmatched files belong to the previously rejected

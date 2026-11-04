@@ -52,10 +52,24 @@ target_link_libraries(shader-sweep PRIVATE common shader_recompiler)
 target_include_directories(shader-sweep PRIVATE ${REPOSITORY_ROOT}/src)
 create_target_directory_groups(shader-sweep)
 
+add_executable(nup-shader-export
+    nup_export.cpp
+    ${REPOSITORY_ROOT}/src/core/file_sys/nup_container.cpp
+    ${REPOSITORY_ROOT}/src/core/file_sys/vfs/vfs.cpp
+    ${REPOSITORY_ROOT}/src/core/file_sys/vfs/vfs_real.cpp
+    ${REPOSITORY_ROOT}/src/core/file_sys/vfs/vfs_vector.cpp
+    ${REPOSITORY_ROOT}/src/core/file_sys/vfs/vfs_offset.cpp)
+target_link_libraries(nup-shader-export PRIVATE common OpenSSL::Crypto zstd::zstd)
+target_include_directories(nup-shader-export PRIVATE ${REPOSITORY_ROOT}/src)
+create_target_directory_groups(nup-shader-export)
+
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     include(CTest)
     if(BUILD_TESTING)
         find_package(Python3 REQUIRED COMPONENTS Interpreter)
+        add_test(NAME nup-shader-export-cli
+            COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_nup_export.py"
+                    $<TARGET_FILE:nup-shader-export>)
         add_test(NAME shader-sweep-cli
             COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test_cli.py" $<TARGET_FILE:shader-sweep>)
         find_program(SPIRV_VAL_EXECUTABLE spirv-val REQUIRED)
@@ -64,6 +78,6 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
                     $<TARGET_FILE:shader-sweep> --spirv-val "${SPIRV_VAL_EXECUTABLE}")
         add_test(NAME shader-sweep-cache-parser
             COMMAND Python3::Interpreter -m unittest discover
-                    -s "${REPOSITORY_ROOT}/tools/nx2" -p test_shader_sweep.py)
+                    -s "${REPOSITORY_ROOT}/tools/nx2" -p "test_shader_*.py")
     endif()
 endif()
