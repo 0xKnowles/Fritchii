@@ -5,6 +5,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 add_executable(tests
+    video_core/aftermath_dump.cpp
     core/nx2_streamplay.cpp
     core/nx2_video_ready.cpp
     core/nx2_present_pacer.cpp
