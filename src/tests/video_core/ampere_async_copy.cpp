@@ -432,12 +432,31 @@ TEST_CASE("Ampere global to shared copy guards reads and zero fills disabled sou
 TEST_CASE("Ampere global to shared copy rejects unsupported addressing and modes",
           "[video_core][ampere][async_copy][fire_emblem]") {
     const auto valid = Copy(7, 7, 0, 0);
-    REQUIRE(Shader::Ampere::LowerToMaxwell(std::array{valid, Exit}));
+    const auto reference = Shader::Ampere::LowerToMaxwell(std::array{valid, Exit});
+    REQUIRE(reference);
+    for (u32 descriptor = 0; descriptor < 64; ++descriptor) {
+        CAPTURE(descriptor);
+        auto copy = valid;
+        copy.words[2] = (copy.words[2] & ~0x3fU) | descriptor;
+        const auto lowered = Shader::Ampere::LowerToMaxwell(std::array{copy, Exit});
+        if (descriptor & 1) {
+            REQUIRE_FALSE(lowered);
+        } else {
+            REQUIRE(lowered);
+            CHECK(lowered.instructions == reference.instructions);
+        }
+    }
     for (const u32 bit :
          {0U, 3U, 7U, 8U, 9U, 10U, 11U, 12U, 13U, 20U, 21U, 22U, 26U, 27U, 28U, 31U}) {
         auto invalid = valid;
         invalid.words[2] ^= 1U << bit;
-        REQUIRE_FALSE(Shader::Ampere::LowerToMaxwell(std::array{invalid, Exit}));
+        const auto lowered = Shader::Ampere::LowerToMaxwell(std::array{invalid, Exit});
+        if (bit == 3) {
+            REQUIRE(lowered);
+            CHECK(lowered.instructions == reference.instructions);
+        } else {
+            REQUIRE_FALSE(lowered);
+        }
     }
     for (const u32 bit : {12U, 13U, 14U, 15U}) {
         auto invalid = valid;

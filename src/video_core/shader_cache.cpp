@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstring>
 #include <cstdlib>
+#include <exception>
 #include <functional>
 #include <string>
 #include <unordered_set>
@@ -146,6 +147,36 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
                     LOG_ERROR(HW_GPU, "Rejected program {:#x} is bound to stage {}: header {:08x}, slot {:08x}",
                               shader_addr, index, fmt::join(header, " "), fmt::join(config, " "));
                 }
+                if (native && std::getenv("EDEN_NX2_SHADER_DUMP")) {
+                    for (size_t next = index + 1; next < unique_hashes.size(); ++next) {
+                        const auto next_program =
+                            static_cast<Tegra::Engines::Maxwell3D::Regs::ShaderType>(next);
+                        if (!maxwell3d->regs.IsShaderConfigEnabled(next) ||
+                            (mesh && next_program == Tegra::Engines::Maxwell3D::Regs::ShaderType::Geometry) ||
+                            (!maxwell3d->regs.rasterize_enable &&
+                             next_program == Tegra::Engines::Maxwell3D::Regs::ShaderType::Pixel)) {
+                            continue;
+                        }
+                        const auto& next_config = maxwell3d->regs.pipelines[next];
+                        const GPUVAddr next_address =
+                            (static_cast<u64>(next_config.reserved[0] & 0xff) << 32) |
+                            next_config.reserved[1];
+                        if (!gpu_memory->IsFullyMappedRange(next_address, 128)) {
+                            LOG_WARNING(HW_GPU, "Downstream native stage {} at {:#x} is unmapped",
+                                        next, next_address);
+                            continue;
+                        }
+                        try {
+                            GraphicsEnvironment capture{*maxwell3d, *gpu_memory, next_program,
+                                                        next_address, 0};
+                            LOG_INFO(HW_GPU, "Preflighted downstream native stage {} at {:#x}",
+                                     next, next_address);
+                        } catch (const std::exception& error) {
+                            LOG_ERROR(HW_GPU, "Downstream native stage {} at {:#x} rejected: {}",
+                                      next, next_address, error.what());
+                        }
+                    }
+                }
                 throw;
             }
         }
@@ -220,7 +251,6 @@ const ShaderInfo* ShaderCache::ComputeShader() {
     }
     // Check both warm and cold shader paths, before selecting a disk-cached pipeline.
     // EDEN_NX2_DLSS_REPLACEMENT=native retains the native network for comparisons.
-    static const char* const replacement_option = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
     if (kepler_compute->IsNativeMode() && shader->lowered_native &&
         DlssContract::IsFastFusionCandidate(program_id,
                                             shader->lowered_native->native_program_key)) {
@@ -228,13 +258,7 @@ const ShaderInfo* ShaderCache::ComputeShader() {
     }
     if (kepler_compute->IsNativeMode() && shader->lowered_native &&
         program_id == FireEmblemUpscale::ProgramId &&
-        shader->lowered_native->native_program_key == FireEmblemUpscale::PrepassProgramKey) {
-        kepler_compute->CaptureFireEmblemJitter();
-    }
-    if (kepler_compute->IsNativeMode() && shader->lowered_native &&
-        FireEmblemUpscale::UseReplacement(
-            program_id, shader->lowered_native->native_program_key, replacement_option) &&
-        kepler_compute->TryFireEmblemUpscale()) {
+        kepler_compute->ProcessFireEmblemDlss(shader->lowered_native->native_program_key)) {
         throw FireEmblemUpscale::DispatchReplaced{};
     }
     return shader;

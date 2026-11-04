@@ -9,7 +9,9 @@
 #include <array>
 #include <cstdlib>
 #include <optional>
+#include <set>
 #include <span>
+#include <tuple>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -26,6 +28,7 @@
 
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/nx2.h"
+#include "video_core/render_trace.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 
 #include "video_core/engines/fermi_2d.h"
@@ -1196,12 +1199,12 @@ void UseBc3ForSwitch2OnSmallCards(const Device& device) {
     const u64 budget = device.GetDeviceMemoryBudget();
     const u64 memory = budget != 0 ? budget : device.GetDeviceLocalMemory();
     const char* keep = std::getenv("EDEN_NX2_KEEP_ASTC");
-    if (memory >= 12_GiB || (keep != nullptr && keep[0] == '1')) {
+    if (memory >= 20_GiB || (keep != nullptr && keep[0] == '1')) {
         return;
     }
     LOG_WARNING(Render_Vulkan,
                 "Switch 2 program with a {} MiB video memory budget: ASTC textures are "
-                "re-compressed to BC3 for this session (uncompressed ASTC needs a 12 GiB budget). "
+                "re-compressed to BC3 for this session (uncompressed ASTC needs a 20 GiB budget). "
                 "Set EDEN_NX2_KEEP_ASTC=1 to keep them uncompressed",
                 memory >> 20);
     Settings::SetAstcRecompressionOverride(Settings::AstcRecompression::Bc3);
@@ -1728,6 +1731,28 @@ bool TextureCacheRuntime::WantsTemporalUpscaleDepth() const {
     }
 #endif
     return !fsr3_unsupported;
+}
+
+bool TextureCacheRuntime::UsesNvidiaDlss() const {
+#ifdef EGLANTINE_STREAMLINE
+    static const bool force_fsr = [] {
+        const char* const value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
+        return value && std::string_view{value} == "fsr";
+    }();
+    return !force_fsr && !dlss_unsupported && Streamline::IsDlssAvailable();
+#else
+    return false;
+#endif
+}
+
+std::optional<VideoCore::GameDlssProbe> TextureCacheRuntime::ProbeGameDlssOutput(
+    ImageView& input, ImageView& output) {
+    if (!dlss_network_probe) {
+        dlss_network_probe = std::make_unique<DlssNetworkProbe>(
+            device, scheduler, descriptor_pool, compute_pass_descriptor_queue, memory_allocator);
+    }
+    return dlss_network_probe->Probe(input.Handle(Shader::TextureType::Color2D),
+                                     output.Handle(Shader::TextureType::Color2D));
 }
 
 bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageView& input_color,
@@ -4174,6 +4199,18 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
             (device->GetPhysical().GetFormatProperties(format_info.format).optimalTilingFeatures &
              VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT) != 0;
     }
+    if (VideoCommon::RenderTrace::Enabled() &&
+        (aspect_mask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0) {
+        LOG_DEBUG(Render_Vulkan,
+                  "Render trace depth view: docked={} address={:#x} guest_format={} vk_format={} "
+                  "image={}x{} layers={} view={}x{} base_level={} base_layer={} layers={} "
+                  "aspects={:#x} compare_supported={} render_target={}",
+                  Settings::IsDockedMode(), image.gpu_addr, info.format,
+                  static_cast<u32>(format_info.format), image.info.size.width, image.info.size.height,
+                  image.info.resources.layers, size.width, size.height, range.base.level,
+                  range.base.layer, range.extent.layers, aspect_mask, supports_depth_comparison,
+                  info.IsRenderTarget());
+    }
     requires_border_color_format = NeedsExplicitBorderColorFormat(format_info.format);
     swizzle_mapping = VkComponentMapping{
         .r = ComponentSwizzle(swizzle[0]),
@@ -4618,10 +4655,32 @@ VkSampler Sampler::HandleFor(const ImageView& image_view, bool is_depth) {
         key.srgb_border = false;
         key.swizzle = {};
     }
-    if (const VkSampler existing = Find(key); existing != VK_NULL_HANDLE) {
-        return existing;
+    VkSampler handle = Find(key);
+    if (handle == VK_NULL_HANDLE) {
+        handle = Emplace(key);
     }
-    return Emplace(key);
+    if (VideoCommon::RenderTrace::Enabled() && (is_depth || has_depth_comparison)) {
+        static thread_local std::set<std::tuple<VkSampler, VkImage, s32, s32, s32, bool, bool>> seen;
+        if (seen.size() < 4096 &&
+            seen.emplace(handle, image_view.ImageHandle(), image_view.range.base.level,
+                         image_view.range.base.layer, image_view.range.extent.layers,
+                         is_depth, Settings::IsDockedMode()).second) {
+            LOG_DEBUG(Render_Vulkan,
+                      "Render trace depth sampler: docked={} address={:#x} format={} {}x{} "
+                      "base_level={} base_layer={} layers={} shader_depth={} compare_enable={} compare_op={} "
+                      "compare_supported={} min_filter={} mag_filter={} border={} address_modes={}/{}/{}",
+                      Settings::IsDockedMode(), image_view.GpuAddr(), image_view.format,
+                      image_view.size.width, image_view.size.height, image_view.range.base.level,
+                      image_view.range.base.layer,
+                      image_view.range.extent.layers, is_depth, base_ci.compareEnable,
+                      static_cast<u32>(base_ci.compareOp), image_view.SupportsDepthComparison(),
+                      static_cast<u32>(key.force_nearest ? VK_FILTER_NEAREST : base_ci.minFilter),
+                      static_cast<u32>(key.force_nearest ? VK_FILTER_NEAREST : base_ci.magFilter),
+                      static_cast<u32>(base_ci.borderColor), static_cast<u32>(base_ci.addressModeU),
+                      static_cast<u32>(base_ci.addressModeV), static_cast<u32>(base_ci.addressModeW));
+        }
+    }
+    return handle;
 }
 
 Framebuffer::Framebuffer(TextureCacheRuntime& runtime, std::span<ImageView*, NUM_RT> color_buffers,
@@ -4650,7 +4709,9 @@ void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
                                     ImageView* depth_buffer, bool is_rescaled_) {
     boost::container::small_vector<VkImageView, NUM_RT * 2 + 2> attachments;
     RenderPassKey renderpass_key{};
-    s32 num_layers = 1;
+    // A framebuffer can't have more layers than any of its attachments: one with more layers
+    // than a color target makes the driver write the extra layers past that image's memory.
+    s32 num_layers = (std::numeric_limits<s32>::max)();
 
     is_rescaled = is_rescaled_;
     const auto& resolution = runtime.resolution;
@@ -4669,7 +4730,7 @@ void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
                                               : color_buffer->size.height);
         attachments.push_back(color_buffer->RenderTarget());
         renderpass_key.color_formats[index] = color_buffer->format;
-        num_layers = (std::max)(num_layers, color_buffer->range.extent.layers);
+        num_layers = (std::min)(num_layers, color_buffer->range.extent.layers);
         images[num_images] = color_buffer->ImageHandle();
         image_ranges[num_images] = MakeSubresourceRange(color_buffer);
         rt_map[index] = num_images;
@@ -4686,7 +4747,7 @@ void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
                                               : depth_buffer->size.height);
         attachments.push_back(depth_buffer->RenderTarget());
         renderpass_key.depth_format = depth_buffer->format;
-        num_layers = (std::max)(num_layers, depth_buffer->range.extent.layers);
+        num_layers = (std::min)(num_layers, depth_buffer->range.extent.layers);
         images[num_images] = depth_buffer->ImageHandle();
         const VkImageSubresourceRange subresource_range = MakeSubresourceRange(depth_buffer);
         image_ranges[num_images] = subresource_range;
@@ -4699,6 +4760,14 @@ void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
     } else {
         renderpass_key.depth_format = PixelFormat::Invalid;
     }
+    if (num_layers == (std::numeric_limits<s32>::max)()) {
+        num_layers = 1;
+    }
+    layers = static_cast<u32>((std::max)(num_layers, 1));
+    LOG_DEBUG(Render_Vulkan,
+              "Framebuffer layers: layers={}, color0_layers={}, depth_layers={}, attachments={}",
+              layers, color_buffers[0] ? color_buffers[0]->range.extent.layers : 0,
+              depth_buffer ? depth_buffer->range.extent.layers : 0, attachments.size());
     renderpass_key.samples = samples;
     const bool do_resolve_color = ENABLE_MSAA_TILER_RESOLVE &&
         samples != VK_SAMPLE_COUNT_1_BIT && num_colors > 0 && runtime.device.IsTiler();
@@ -4723,7 +4792,6 @@ void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
     render_area.height = (std::min)(render_area.height, height);
 
     if (do_resolve_color) {
-        const u32 layers = static_cast<u32>((std::max)(num_layers, 1));
         for (size_t index = 0; index < NUM_RT; ++index) {
             const PixelFormat format = renderpass_key.color_formats[index];
             if (format == PixelFormat::Invalid) {
@@ -4739,7 +4807,6 @@ void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
     }
 
     if (do_resolve_depth_stencil) {
-        const u32 layers = static_cast<u32>((std::max)(num_layers, 1));
         const VkFormat vk_format =
             MaxwellToVK::SurfaceFormat(runtime.device, FormatType::Optimal, true,
                                        renderpass_key.depth_format)
@@ -4759,7 +4826,7 @@ void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
         .pAttachments = attachments.data(),
         .width = render_area.width,
         .height = render_area.height,
-        .layers = static_cast<u32>((std::max)(num_layers, 1)),
+        .layers = layers,
     });
 }
 

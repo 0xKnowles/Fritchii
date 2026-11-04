@@ -291,6 +291,14 @@ public:
         m_last_scheduled_tick = tick;
     }
 
+    bool HasEnteredKernel() const {
+        return m_entered_kernel.load(std::memory_order_acquire);
+    }
+
+    void SetEnteredKernel() {
+        m_entered_kernel.store(true, std::memory_order_release);
+    }
+
     void AddCpuTime(s32 core_id, s64 amount) {
         m_cpu_time += amount;
         // TODO(bunnei): Debug kernels track per-core tick counts. Should we?
@@ -894,6 +902,7 @@ private:
     s64 m_schedule_count{};
     s64 m_last_scheduled_tick{};
     std::vector<KThread*> m_pending_started_threads;
+    std::atomic<bool> m_entered_kernel{false};
     std::array<QueueEntry, Core::Hardware::NUM_CPU_CORES> m_per_core_priority_queue_entry{};
     KThreadQueue* m_wait_queue{};
     LockWithPriorityInheritanceInfoList m_held_lock_info_list{};

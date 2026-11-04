@@ -30,12 +30,14 @@
 #include "video_core/control/channel_state.h"
 #include "video_core/native_query_trace.h"
 #include "video_core/native_indirect_reset.h"
+#include "video_core/render_trace.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/renderer_vulkan/blit_image.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+#include "video_core/renderer_vulkan/framebuffer_clear_layers.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/submission_policy.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -255,7 +257,13 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         auto& native = maxwell3d->GetNativeMacroEngine();
         if (native.native_turing && !submitted) {
             native.native_execution_failed = true;
-            LOG_DEBUG(HW_GPU, "Native graphics draw failed; refusing submission completion");
+            const auto& regs = maxwell3d->regs;
+            const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) |
+                           regs.pipelines[1].reserved[1];
+            const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) |
+                           regs.pipelines[5].reserved[1];
+            LOG_DEBUG(HW_GPU, "Native graphics draw not recorded: frame={} vs={:#x} ps={:#x}",
+                      render_trace_frame, vs, ps);
         }
     };
     namespace Profile = VideoCommon::Nx2Profile;
@@ -281,6 +289,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     }()};
     if (!pipeline) {
         report_failure("no pipeline");
+        TraceRenderState(is_indexed, "no-pipeline", nullptr);
         return;
     }
     // Task/mesh pipelines: the draw's vertex count is the number of task workgroups.
@@ -297,6 +306,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     }
     if (mesh_draw && (no_mesh || !device.IsExtMeshShaderSupported())) {
         report_failure(no_mesh ? "EDEN_NX2_NO_MESH" : "no VK_EXT_mesh_shader");
+        TraceRenderState(is_indexed, "mesh-skipped", nullptr);
         return;
     }
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
@@ -316,7 +326,16 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     }
     if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->Configure(is_indexed)) {
         report_failure("configure failed");
+        TraceRenderState(is_indexed, "configure-failed", nullptr);
         return;
+    }
+
+    TraceRenderState(is_indexed, "configured", texture_cache.GetFramebuffer());
+    if (VideoCommon::RenderTrace::SampleFrame(render_trace_frame) && render_trace_draws <= 2048) {
+        LOG_DEBUG(Render_Vulkan,
+                  "Render trace pipeline: frame={} draw={} hashes={:016x} dynamic_vertex_input={}",
+                  render_trace_frame, render_trace_draws, fmt::join(pipeline->ShaderHashes(), ","),
+                  pipeline->HasDynamicVertexInput());
     }
 
     {
@@ -634,6 +653,14 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
         const auto& draw_state = maxwell3d->draw_manager.draw_state;
         const u32 num_instances{instance_count};
         const DrawParams draw_params{MakeDrawParams(draw_state, num_instances, is_indexed)};
+        if (VideoCommon::RenderTrace::SampleFrame(render_trace_frame) && render_trace_draws <= 2048) {
+            LOG_DEBUG(Render_Vulkan,
+                      "Render trace direct: frame={} draw={} count={} instances={} first_index={} "
+                      "base_vertex={} base_instance={} mesh={}",
+                      render_trace_frame, render_trace_draws, draw_params.num_vertices,
+                      draw_params.num_instances, draw_params.first_index, draw_params.base_vertex,
+                      draw_params.base_instance, mesh_draw);
+        }
 
         if (mesh_draw) {
             scheduler.Record([groups = draw_params.num_vertices](vk::CommandBuffer cmdbuf) {
@@ -673,6 +700,14 @@ void RasterizerVulkan::DrawIndirect() {
     const auto& params = maxwell3d->draw_manager.indirect_state;
     buffer_cache.SetDrawIndirect(&params);
     PrepareDraw(params.is_indexed, [this, &params] {
+        if (VideoCommon::RenderTrace::SampleFrame(render_trace_frame) && render_trace_draws <= 2048) {
+            LOG_DEBUG(Render_Vulkan,
+                      "Render trace indirect: frame={} draw={} address={:#x} count_address={:#x} "
+                      "bytes={} max_draws={} stride={} include_count={} byte_count={} mesh={}",
+                      render_trace_frame, render_trace_draws, params.indirect_start_address,
+                      params.count_start_address, params.buffer_size, params.max_draw_counts,
+                      params.stride, params.include_count, params.is_byte_count, mesh_draw);
+        }
         if (mesh_draw) {
             // Indirect task/mesh draws would need vkCmdDrawMeshTasksIndirectEXT's layout.
             static bool logged{};
@@ -808,6 +843,17 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     texture_cache.UpdateRenderTargets(true);
     const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
     const VkExtent2D render_area = framebuffer->RenderArea();
+    const u32 base_array_layer = regs.clear_surface.layer;
+    const auto clear_layers =
+        GetFramebufferClearLayers(base_array_layer, layer_count, framebuffer->Layers());
+    if (clear_layers.count != layer_count) {
+        LOG_DEBUG(Render_Vulkan,
+                  "Framebuffer clear layers: base={}, requested={}, clipped={}, framebuffer={}",
+                  base_array_layer, layer_count, clear_layers.count, framebuffer->Layers());
+    }
+    if (clear_layers.count == 0) {
+        return;
+    }
 
     constexpr bool ENABLE_DEFERRED_CLEAR = true;
     const bool color_full_channels = regs.clear_surface.R && regs.clear_surface.G &&
@@ -833,8 +879,8 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     VkClearRect clear_rect{
         .rect = regs.clear_control.use_scissor ? GetScissorState(regs, 0, up_scale, down_shift)
                                                : default_scissor,
-        .baseArrayLayer = regs.clear_surface.layer,
-        .layerCount = layer_count,
+        .baseArrayLayer = base_array_layer,
+        .layerCount = clear_layers.count,
     };
     const auto clamp_rect_to_render_area = [render_area](VkRect2D& rect) -> bool {
         const auto clamp_axis = [](s32& offset, u32& extent, u32 limit) {
@@ -879,12 +925,26 @@ void RasterizerVulkan::Clear(u32 layer_count) {
         return;
     }
 
+    if (VideoCommon::RenderTrace::SampleFrame(render_trace_frame) && render_trace_clears++ < 2048) {
+        const u32 target = regs.clear_surface.RT;
+        LOG_DEBUG(Render_Vulkan,
+                  "Render trace clear: frame={} docked={} color={} depth={} stencil={} "
+                  "color_target={} color_address={:#x} depth_address={:#x} depth_value={} base_layer={} layers={} "
+                  "framebuffer_layers={} rect=({},{} {}x{})",
+                  render_trace_frame, Settings::IsDockedMode(), use_color, use_depth, use_stencil,
+                  target, target < regs.rt.size() ? regs.rt[target].Address() : 0,
+                  regs.zeta.Address(), regs.clear_depth,
+                  clear_rect.baseArrayLayer, clear_rect.layerCount, framebuffer->Layers(),
+                  clear_rect.rect.offset.x, clear_rect.rect.offset.y,
+                  clear_rect.rect.extent.width, clear_rect.rect.extent.height);
+    }
+
     const bool clear_covers_render_area =
         clear_rect.rect.offset.x == 0 && clear_rect.rect.offset.y == 0 &&
         clear_rect.rect.extent.width >= render_area.width &&
         clear_rect.rect.extent.height >= render_area.height;
     const bool can_defer_clear = ENABLE_DEFERRED_CLEAR && (!regs.clear_control.use_scissor || clear_covers_render_area) &&
-                                 regs.clear_surface.layer == 0 &&
+                                 clear_layers.covers_all_layers &&
                                  !scheduler.IsRenderPassActive() &&
                                  (!use_color || color_full_channels) && ds_deferrable;
     if (!can_defer_clear) {
@@ -1356,7 +1416,80 @@ void RasterizerVulkan::FlushCommands() {
     scheduler.Flush();
 }
 
+void RasterizerVulkan::TraceRenderState(bool is_indexed, const char* outcome,
+                                        const Framebuffer* framebuffer) {
+    if (!VideoCommon::RenderTrace::SampleFrame(render_trace_frame)) {
+        return;
+    }
+    if (render_trace_draws++ >= 2048) {
+        if (render_trace_draws == 2049) {
+            LOG_DEBUG(Render_Vulkan, "Render trace frame={} truncated after 2048 draws",
+                      render_trace_frame);
+        }
+        return;
+    }
+    const auto& regs = maxwell3d->regs;
+    const auto& draw = maxwell3d->draw_manager.draw_state;
+    std::array<u64, 6> shaders{};
+    u32 stages{};
+    for (size_t stage = 0; stage < shaders.size(); ++stage) {
+        shaders[stage] = (u64{regs.pipelines[stage].reserved[0] & 0xff} << 32) |
+                         regs.pipelines[stage].reserved[1];
+        stages |= static_cast<u32>(regs.IsShaderConfigEnabled(stage)) << stage;
+    }
+    const auto extent = framebuffer ? framebuffer->RenderArea() : VkExtent2D{};
+    LOG_DEBUG(Render_Vulkan,
+              "Render trace frame={} draw={} docked={} outcome={} indexed={} stages={:#x} "
+              "shaders={:x} guest_count={} guest_instances={} framebuffer={}x{} layers={}",
+              render_trace_frame, render_trace_draws, Settings::IsDockedMode(), outcome, is_indexed,
+              stages, fmt::join(shaders, ","),
+              is_indexed ? draw.index_buffer.count : draw.vertex_buffer.count, draw.instance_count,
+              extent.width, extent.height, framebuffer ? framebuffer->Layers() : 0);
+    LOG_DEBUG(Render_Vulkan,
+              "Render trace targets: color={:#x} {}x{} layers={} format={:#x} depth={:#x} "
+              "{}x{} layers={} format={:#x} enabled={} clip={}x{}",
+              regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height, regs.rt[0].depth.Value(),
+              static_cast<u32>(regs.rt[0].format), regs.zeta.Address(), regs.zeta_size.width,
+              regs.zeta_size.height, regs.zeta_size.depth.Value(), static_cast<u32>(regs.zeta.format),
+              regs.zeta_enable, regs.surface_clip.width.Value(), regs.surface_clip.height.Value());
+    const auto& viewport = regs.viewport_transform[0];
+    const auto& scissor = regs.scissor_test[0];
+    LOG_DEBUG(Render_Vulkan,
+              "Render trace tests: raster={} depth_test={} depth_write={} depth_func={} "
+              "cull={} face={} alpha={} func={} ref={} color_mask={:#x} "
+              "viewport_scale=({},{},{}) translate=({},{},{}) scissor={} {}..{} {}..{}",
+              regs.rasterize_enable, regs.depth_test_enable, regs.depth_write_enabled,
+              static_cast<u32>(regs.depth_test_func), regs.gl_cull_test_enabled,
+              static_cast<u32>(regs.gl_cull_face), regs.alpha_test_enabled,
+              static_cast<u32>(regs.alpha_test_func), regs.alpha_test_ref, regs.color_mask[0].raw,
+              viewport.scale_x, viewport.scale_y, viewport.scale_z, viewport.translate_x,
+              viewport.translate_y, viewport.translate_z, scissor.enable, scissor.min_x.Value(),
+              scissor.max_x.Value(), scissor.min_y.Value(), scissor.max_y.Value());
+    for (size_t binding = 0; binding < regs.vertex_streams.size(); ++binding) {
+        const auto& stream = regs.vertex_streams[binding];
+        if (stream.IsEnabled()) {
+            LOG_DEBUG(Render_Vulkan,
+                      "Render trace vertex: binding={} address={:#x} limit={:#x} stride={} "
+                      "frequency={} repacked={}",
+                      binding, stream.Address(), regs.vertex_stream_limits[binding].Address(),
+                      stream.stride.Value(), stream.frequency,
+                      buffer_cache_runtime.IsVertexRepacked(static_cast<u32>(binding)));
+        }
+    }
+    if (is_indexed) {
+        LOG_DEBUG(Render_Vulkan, "Render trace index: address={:#x} limit={:#x} format={} first={}",
+                  regs.index_buffer.StartAddress(), regs.index_buffer.EndAddress(),
+                  static_cast<u32>(regs.index_buffer.format), draw.index_buffer.first);
+    }
+    LOG_DEBUG(Render_Vulkan, "Render trace condition: address={:#x} mode={} override={}",
+              regs.render_enable.Address(), static_cast<u32>(regs.render_enable.mode),
+              static_cast<u32>(regs.render_enable_override));
+}
+
 void RasterizerVulkan::TickFrame() {
+    ++render_trace_frame;
+    render_trace_draws = 0;
+    render_trace_clears = 0;
     ComputePipeline::TickUpscalerTrace();
     draw_counter = 0;
     pending_native_work = false;
@@ -1390,6 +1523,21 @@ bool RasterizerVulkan::AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surf
                                              const Tegra::Engines::Fermi2D::Config& copy_config) {
     std::scoped_lock lock{texture_cache.mutex};
     return texture_cache.BlitImage(dst, src, copy_config);
+}
+
+bool RasterizerVulkan::UsesNvidiaDlss() const {
+    return texture_cache_runtime.UsesNvidiaDlss();
+}
+
+bool RasterizerVulkan::SupportsGameDlssNetwork() const {
+    // Compute pipelines are created 32 threads wide where the device can be told to.
+    return device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT);
+}
+
+std::optional<VideoCore::GameDlssProbe> RasterizerVulkan::ProbeGameDlssOutput(
+    const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst) {
+    std::scoped_lock lock{texture_cache.mutex};
+    return texture_cache.ProbeGameDlssOutput(dst, src);
 }
 
 bool RasterizerVulkan::AccelerateTemporalUpscale(

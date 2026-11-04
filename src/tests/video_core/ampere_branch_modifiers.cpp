@@ -26,9 +26,21 @@ TEST_CASE("Ampere branch convergence flags are not address bits", "[ampere][fast
         }
         const auto lowered = Shader::Ampere::LowerToMaxwell(code);
         INFO(lowered.error);
+        if (modifier == 1) {
+            REQUIRE_FALSE(lowered);
+            CHECK(lowered.error == "native branch convergence mode");
+            CHECK(lowered.error_offset == 0);
+            continue;
+        }
         REQUIRE(lowered);
         CHECK(lowered.source_size == sizeof(code));
-        CHECK(lowered.instructions.front() == (0xe24000000007000fULL | (0x30ULL << 20)));
+        if (modifier == 2) {
+            REQUIRE(lowered.instructions.size() == 5);
+            CHECK(lowered.source_instruction_offsets[0] == lowered.source_instruction_offsets[1]);
+            CHECK(lowered.instructions.front() == 0x50b0000000070f00ULL);
+        } else {
+            CHECK(lowered.instructions.front() == (0xe24000000007000fULL | (0x30ULL << 20)));
+        }
     }
 }
 
