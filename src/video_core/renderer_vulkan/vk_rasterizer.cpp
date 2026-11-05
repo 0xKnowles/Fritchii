@@ -242,7 +242,7 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
                      gpu.ShaderNotify()),
       accelerate_dma(buffer_cache, texture_cache, scheduler),
       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler),
-      frame_dump(memory_allocator, scheduler), wfi_event(device.GetLogical().CreateEvent()) {
+      frame_dump(device, memory_allocator, scheduler), wfi_event(device.GetLogical().CreateEvent()) {
     scheduler.SetQueryCache(query_cache);
     VideoCommon::GpuSplit::Get().SetIdleHook(
         [](void* argument) { static_cast<Scheduler*>(argument)->FlushDeferred(); },
@@ -437,6 +437,15 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     if (frame_dump.Capturing()) {
         FrameDumpPass(texture_cache.GetFramebuffer());
         frame_dump.NoteDraw(pipeline->ShaderHashes());
+        if (frame_dump.CapturingSampled()) {
+            boost::container::small_vector<FrameDump::Sampled, 16> sampled;
+            for (const auto& image : pipeline->SampledImages()) {
+                sampled.push_back({image.stage, image.tic, &texture_cache.GetImageView(image.id)});
+            }
+            if (frame_dump.NoteSampled(sampled)) {
+                scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
+            }
+        }
     }
     if (VideoCommon::RenderTrace::SampleFrame(render_trace_frame) && render_trace_draws <= 2048) {
         LOG_DEBUG(Render_Vulkan,
@@ -1328,6 +1337,13 @@ void RasterizerVulkan::DispatchCompute() {
         }
         frame_dump.CaptureDispatch(pipeline->ShaderHash(), written);
     };
+    if (frame_dump.CapturingSampled()) {
+        boost::container::small_vector<FrameDump::Sampled, 16> sampled;
+        for (const auto& image : pipeline->SampledImages()) {
+            sampled.push_back({5, image.tic, &texture_cache.GetImageView(image.id)});
+        }
+        frame_dump.NoteDispatchSampled(pipeline->ShaderHash(), sampled);
+    }
 
     const auto& qmd{kepler_compute->launch_description};
     auto indirect_address = kepler_compute->GetIndirectComputeAddress();
