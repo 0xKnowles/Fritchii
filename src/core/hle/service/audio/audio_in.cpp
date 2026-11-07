@@ -42,10 +42,12 @@ IAudioIn::IAudioIn(Core::System& system_, Manager& manager, size_t session_id,
 
     process->Open(system.Kernel());
 
-    if (impl->GetSystem()
-            .Initialize(device_name, in_params, handle, applet_resource_user_id)
-            .IsError()) {
-        LOG_ERROR(Service_Audio, "Failed to initialize the AudioIn System!");
+    initialize_result =
+        impl->GetSystem().Initialize(device_name, in_params, handle, applet_resource_user_id);
+    if (initialize_result.IsError()) {
+        LOG_ERROR(Service_Audio,
+                  "Failed to initialize the AudioIn System! device={} sample_rate={} channels={}",
+                  device_name, in_params.sample_rate, in_params.channel_count);
     }
 }
 

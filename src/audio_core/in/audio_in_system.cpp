@@ -47,8 +47,10 @@ std::string_view System::GetDefaultUacDeviceName() const {
 
 Result System::IsConfigValid(const std::string_view device_name,
                              const AudioInParameter& in_params) const {
+    // OpenAudioIn hands back DeviceIn/UacIn as the opened name, and games reopen with it.
     if ((device_name.size() > 0) &&
-        (device_name != GetDefaultDeviceName() && device_name != GetDefaultUacDeviceName())) {
+        (device_name != GetDefaultDeviceName() && device_name != GetDefaultUacDeviceName() &&
+         device_name != "DeviceIn" && device_name != "UacIn")) {
         return Service::Audio::ResultNotFound;
     }
 
@@ -68,8 +70,10 @@ Result System::Initialize(std::string device_name, const AudioInParameter& in_pa
 
     handle = handle_;
     applet_resource_user_id = applet_resource_user_id_;
-    if (device_name.empty() || device_name[0] == '\0') {
+    if (device_name.empty() || device_name[0] == '\0' || device_name == "DeviceIn") {
         name = std::string(GetDefaultDeviceName());
+    } else if (device_name == "UacIn") {
+        name = std::string(GetDefaultUacDeviceName());
     } else {
         name = std::move(device_name);
     }
@@ -116,7 +120,7 @@ Result System::Stop() {
 }
 
 bool System::AppendBuffer(const AudioInBuffer& buffer, const u64 tag) {
-    if (buffers.GetTotalBufferCount() == BufferCount) {
+    if (channel_count == 0 || buffers.GetTotalBufferCount() == BufferCount) {
         return false;
     }
 

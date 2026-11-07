@@ -100,8 +100,11 @@ Result IAudioInManager::OpenAudioInProtocolSpecified(
               impl->num_free_sessions);
 
     const auto device_name = Common::StringFromBuffer(name[0].name);
-    *out_audio_in = std::make_shared<IAudioIn>(system, *impl, new_session_id, device_name,
+    auto audio_in = std::make_shared<IAudioIn>(system, *impl, new_session_id, device_name,
                                                parameter, process_handle.Get(), aruid.pid);
+    // A session that failed to initialize has no channels; report the error like hardware does.
+    R_TRY(audio_in->GetInitializeResult());
+    *out_audio_in = std::move(audio_in);
     impl->sessions[new_session_id] = (*out_audio_in)->GetImpl();
     impl->applet_resource_user_ids[new_session_id] = aruid.pid;
 

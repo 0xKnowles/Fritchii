@@ -48,6 +48,10 @@ public:
         name = name_;
         device_channels = device_channels_;
         system_channels = system_channels_;
+        // The output device's channel count means nothing for a mic; capture in the guest's layout.
+        if (type == StreamType::In) {
+            device_channels = system_channels;
+        }
 
         if (!ctx) {
             return;

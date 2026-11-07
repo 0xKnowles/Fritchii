@@ -25,6 +25,10 @@ public:
         return impl;
     }
 
+    Result GetInitializeResult() const {
+        return initialize_result;
+    }
+
     Result GetAudioInState(Out<u32> out_state);
     Result Start();
     Result Stop();
@@ -51,6 +55,7 @@ private:
     Kernel::KEvent* event;
     std::shared_ptr<AudioCore::AudioIn::In> impl;
     Common::ScratchBuffer<u64> released_buffer;
+    Result initialize_result{ResultSuccess};
 };
 
 } // namespace Service::Audio
