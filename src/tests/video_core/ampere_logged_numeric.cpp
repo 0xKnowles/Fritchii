@@ -176,8 +176,7 @@ TEST_CASE("Logged Pokopia F2I preserves guards and rejects unrelated modifiers",
         for (size_t index = 0; index + 1 < lowered.instructions.size(); ++index)
             CHECK(((lowered.instructions[index] >> 16) & 15) == guard);
     }
-    for (const u32 source : {0x80c03400U, 0xc0c03400U, 0x44c03400U, 0x40c03440U,
-                             0x48c03400U, 0x50c03400U, 0x60c03400U}) {
+    for (const u32 source : {0x44c03400U, 0x40c03440U, 0x48c03400U, 0x50c03400U, 0x60c03400U}) {
         auto invalid = LoggedF2I;
         invalid.words[1] = source;
         CHECK_FALSE(LowerToMaxwell(std::array{invalid, Exit}));
@@ -193,7 +192,7 @@ TEST_CASE("Logged Pokopia F2I preserves guards and rejects unrelated modifiers",
     invalid = LoggedF2I;
     invalid.words[2] |= 1U << 27;
     CHECK_FALSE(LowerToMaxwell(std::array{invalid, Exit}));
-    invalid.words = {0x00157b05, 0x40400400, 0x0021e100, 0x0001e400};
+    invalid.words = {0x00157b05, 0x00400440, 0x0021e100, 0x0001e400};
     CHECK_FALSE(LowerToMaxwell(std::array{invalid, Exit}));
 }
 
@@ -439,4 +438,22 @@ TEST_CASE("Logged Pokopia masked dependency barrier fences shared memory and rej
     const auto rejected = LowerToMaxwell(std::array{invalid, Exit});
     REQUIRE_FALSE(rejected);
     CHECK(rejected.error == "native dependency barrier mode");
+}
+
+TEST_CASE("Ocarina mesh attribute stores read shadowed high registers",
+          "[video_core][ampere][logged_numeric][oot]") {
+    // Ocarina mesh 8159e91e0097876a at 0x83c0: ISBEWR.32.ATTR.SKEW.O [R197 + 0x780], R240. R240 is
+    // UR22's mirror once the uniform bank is in use, so the data must come from the shadow bank.
+    const Instruction uniform_marker{{0x0000fc02, 0, 0, 0}};
+    const Instruction store{{0xc5007927, 0x000780f0, 0x0000f800, 0x000fe200}};
+    const auto lowered = LowerToMaxwell(std::array{uniform_marker, store, Exit});
+    INFO(lowered.error);
+    REQUIRE(lowered);
+    const auto begin = lowered.instructions.begin() + lowered.source_instruction_offsets[1];
+    const auto end = lowered.instructions.begin() + lowered.source_instruction_offsets[2];
+    const auto pseudo = std::find_if(begin, end, [](u64 word) { return (word >> 52) == 0xefc; });
+    REQUIRE(pseudo != end);
+    const u32 data = static_cast<u32>(*pseudo & 0xff);
+    CHECK(data < 216);
+    CHECK(std::find(begin, pseudo, Shader::Ampere::NativeRegisterCopy(0, data, 1, 240)) != pseudo);
 }

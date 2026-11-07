@@ -261,6 +261,13 @@ void RemoveTransferableShaderCache(u64 program_id, GameListRemoveTarget target) 
                                     tr("A shader cache for this title does not exist."));
         return;
     }
+    if (target == GameListRemoveTarget::VkShaderCache) {
+        const auto mesh_file = VideoCommon::VersionedPipelineCachePath(
+            shader_cache_folder_path, "vulkan_mesh", VideoCommon::VulkanPipelineCacheVersion);
+        if (Common::FS::Exists(mesh_file)) {
+            Common::FS::RemoveFile(mesh_file);
+        }
+    }
     if (Common::FS::RemoveFile(target_file)) {
         QtCommon::Frontend::Information(tr("Successfully Removed"),
                                         tr("Successfully removed the transferable shader cache."));

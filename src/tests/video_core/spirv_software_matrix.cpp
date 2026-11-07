@@ -321,14 +321,47 @@ TEST_CASE("Native matrix lowering selects compact software helpers without legac
     for (const char* legacy : {"fast", "stub", "off"}) {
         TensorMode::Set(legacy);
         REQUIRE(Ampere::LowerToMaxwell(code, false, true).instructions == compact.instructions);
-        REQUIRE(Ampere::LowerToMaxwell(code).instructions == supported.instructions);
+        REQUIRE(Ampere::LowerToMaxwell(code, false, false).instructions == supported.instructions);
     }
-    code[0].words[0] &= ~0x7000U;
-    REQUIRE_FALSE(static_cast<bool>(Ampere::LowerToMaxwell(code, false, true)));
-    code[0].words[0] |= 0x7000;
     code[0].words[3] = 1;
     REQUIRE_FALSE(static_cast<bool>(Ampere::LowerToMaxwell(code, false, true)));
     code[0].words[3] = 0;
     code[0].words[0] += 1U << 24;
     REQUIRE_FALSE(static_cast<bool>(Ampere::LowerToMaxwell(code, false, true)));
+}
+
+TEST_CASE("Compact HMMA lowering emits one helper call per matrix multiply",
+          "[video_core][tensor][ampere]") {
+    // HMMA.16816.F16 R44, R16, R48, RZ (Donkey Kong Bananza capture) and EXIT.
+    constexpr Ampere::Instruction Hmma{{0x102c723c, 0x30, 0x8ff, 0x04aff000}};
+    constexpr Ampere::Instruction Exit{{0x0000794d, 0, 0x03800000, 0}};
+    const std::array code{Hmma, Exit};
+    const auto is_tensor = [](u64 word) { return (word >> 51) == (0x5d30000000000000ULL >> 51); };
+
+    const auto expanded = Ampere::LowerToMaxwell(code, {.tensor = true});
+    INFO(expanded.error);
+    REQUIRE(static_cast<bool>(expanded));
+    REQUIRE(std::ranges::none_of(expanded.instructions, is_tensor));
+
+    const auto compact = Ampere::LowerToMaxwell(code, {.tensor = true, .compact_tensor = true});
+    INFO(compact.error);
+    REQUIRE(static_cast<bool>(compact));
+    REQUIRE(std::ranges::count_if(compact.instructions, is_tensor) == 1);
+    const u64 word = *std::ranges::find_if(compact.instructions, is_tensor);
+    CHECK((word & 0xff) == 0x2c);
+    CHECK(((word >> 8) & 0xff) == 0x10);
+    CHECK(((word >> 20) & 0xff) == 0x30);
+    CHECK(((word >> 39) & 0xff) == 0xff);
+    CHECK(((word >> 48) & 1) == 1);
+    CHECK(((word >> 49) & 1) == 0);
+    CHECK(compact.instructions.size() * 4 < expanded.instructions.size());
+
+    // A guarded HMMA keeps the expansion: the helper shuffles across the whole warp.
+    auto guarded = code;
+    guarded[0].words[0] = (guarded[0].words[0] & ~0xf000U) | (1U << 12);
+    const auto guarded_lowered =
+        Ampere::LowerToMaxwell(guarded, {.tensor = true, .compact_tensor = true});
+    INFO(guarded_lowered.error);
+    REQUIRE(static_cast<bool>(guarded_lowered));
+    CHECK(std::ranges::none_of(guarded_lowered.instructions, is_tensor));
 }

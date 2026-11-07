@@ -11,6 +11,7 @@
 #include <functional>
 #include <mutex>
 #include <span>
+#include <vector>
 
 #include <boost/container/small_vector.hpp>
 
@@ -66,7 +67,13 @@ public:
         return shader_hash;
     }
 
-    /// Storage images written by the last configured dispatch
+    /// Native constant buffer pointer slots taken as storage buffers, and the ones left out
+    /// because they held null when this pipeline was built (rebuilt once one is filled).
+    std::vector<u64> pointer_slots;
+    std::vector<u64> null_pointer_slots;
+    u32 pointer_rebuilds{};
+
+    /// Storage images written by the last configured dispatch, kept while a frame dump runs.
     [[nodiscard]] std::span<const VideoCommon::ImageViewId> WrittenImages() const noexcept {
         return written_images;
     }
@@ -74,9 +81,10 @@ public:
     struct SampledImage {
         u32 tic;
         VideoCommon::ImageViewId id;
+        VideoCommon::SamplerId sampler;
     };
 
-    /// The textures sampled by the last configured dispatch, kept for EDEN_NX2_FRAME_DUMP_SAMPLED.
+    /// The textures sampled by the last configured dispatch, kept while a sampled frame dump runs.
     [[nodiscard]] std::span<const SampledImage> SampledImages() const noexcept {
         return sampled_images;
     }

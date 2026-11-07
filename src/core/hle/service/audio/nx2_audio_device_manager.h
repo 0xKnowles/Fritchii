@@ -73,9 +73,10 @@ struct Nx2SysmixStreams {
     std::shared_ptr<Core::Timing::EventType> timer;
 };
 
-// Switch 2 virtual output devices (nn::audio::ListVirtualOutputDevices and friends), reached through
-// the object auddmg:u command 0 returns. Eden plays everything through one stereo 48 kHz output, so
-// there is one virtual device. The nx2: name keeps the other commands auto-stubbed and logged.
+// Switch 2 virtual output devices (nn::audio::ListVirtualOutputDevices and friends), reached
+// through the object auddmg:u command 0 returns. Eden plays everything through one stereo 48 kHz
+// output, so there is one virtual device. The nx2: name keeps the other commands auto-stubbed and
+// logged.
 // - 0(u32): u32 count, the device names in the out buffer (0x100 bytes each).
 // - 100(u32): the default device's name in the out buffer.
 // - 300(16-byte stream format, name buffer): whether the format is supported (result only).

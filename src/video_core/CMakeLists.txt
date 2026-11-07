@@ -114,6 +114,9 @@ add_library(video_core STATIC
     native_query_trace.h
     nx2.h
     nx2_cmdpage_diag.h
+    nx2_debug_control.cpp
+    nx2_debug_control.h
+    nx2_diag.h
     nx2_profile.h
     present.h
     pte_kind.h
@@ -163,6 +166,7 @@ add_library(video_core STATIC
     renderer_vulkan/maxwell_to_vk.cpp
     renderer_vulkan/maxwell_to_vk.h
     renderer_vulkan/pipeline_helper.h
+    renderer_vulkan/pipeline_optimization.h
     renderer_vulkan/pipeline_statistics.cpp
     renderer_vulkan/pipeline_statistics.h
     renderer_vulkan/renderer_vulkan.h
